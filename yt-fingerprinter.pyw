@@ -280,6 +280,10 @@ class FingerprinterApp:
         # Queue control buttons stacked on the right.
         q_btns = ttk.Frame(q_inner)
         q_btns.pack(side="left", fill="y", padx=(8, 0))
+        self.queue_import_btn = ttk.Button(
+            q_btns, text="Import file...", width=14, command=self._import_queue_from_file,
+        )
+        self.queue_import_btn.pack(fill="x", pady=1)
         self.queue_remove_btn = ttk.Button(q_btns, text="Remove checked", width=14, command=self._queue_remove)
         self.queue_remove_btn.pack(fill="x", pady=1)
         self.queue_up_btn = ttk.Button(q_btns, text="Move up", width=14, command=lambda: self._queue_move(-1))
@@ -1020,6 +1024,91 @@ class FingerprinterApp:
         self.url_var.set("")  # clear the field for the next paste
         save_config(self._gather_config())
 
+    # Recognizes a bare YouTube channel ID, e.g. UCxN0K3hMnvgtsoz9NN0Iq_Q.
+    _CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+    # Recognizes a bare @handle, e.g. @Muzarkive.
+    _HANDLE_RE = re.compile(r"^@[A-Za-z0-9._-]{2,30}$")
+
+    @classmethod
+    def _normalize_queue_entry(cls, token: str) -> str | None:
+        """Turn one imported token into a usable queue URL, or None if it's
+        not recognized. Accepts full http(s)/www URLs as-is, bare channel IDs
+        (UCxxxxxxxxxxxxxxxxxxxxxx -> .../channel/<id>), and bare @handles
+        (-> .../<handle>)."""
+        token = token.strip()
+        if not token or len(token) > 200:
+            return None
+        if token.startswith(("http://", "https://", "www.")):
+            return token
+        if cls._CHANNEL_ID_RE.match(token):
+            return f"https://www.youtube.com/channel/{token}"
+        if cls._HANDLE_RE.match(token):
+            return f"https://www.youtube.com/{token}"
+        return None
+
+    def _import_queue_from_file(self) -> None:
+        """Bulk-add channels to the queue from a text file. Accepts one entry
+        per line (or multiple, separated by commas/semicolons/whitespace):
+        full YouTube URLs, bare channel IDs (UCxxxxxxxxxxxxxxxxxxxxxx), or
+        @handles. Blank lines and lines starting with '#' are ignored.
+        Duplicates (already queued, or repeated in the file) are skipped."""
+        path = filedialog.askopenfilename(
+            title="Import channel queue from file",
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("CSV files", "*.csv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            raw = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Could not read file", f"Failed to read:\n{path}\n\n{e}")
+            return
+
+        added = 0
+        dupes = 0
+        invalid: list[str] = []
+        seen_this_import: set[str] = set()
+
+        for lineno, raw_line in enumerate(raw.splitlines(), start=1):
+            line = raw_line.strip().strip("\"'")
+            if not line or line.startswith("#"):
+                continue
+            for token in re.split(r"[,;\s]+", line):
+                if not token:
+                    continue
+                url = self._normalize_queue_entry(token)
+                if url is None:
+                    invalid.append(f"line {lineno}: {token!r}")
+                    continue
+                if url in self.queue_urls or url in seen_this_import:
+                    dupes += 1
+                    continue
+                seen_this_import.add(url)
+                self.queue_urls.append(url)
+                self.queue_checks.append(tk.BooleanVar(value=True))
+                added += 1
+
+        if added:
+            self._refresh_queue(active_index=len(self.queue_urls) - 1)
+            save_config(self._gather_config())
+
+        summary = f"[+] Imported {added} url(s) from {Path(path).name}"
+        if dupes:
+            summary += f", {dupes} duplicate(s) skipped"
+        if invalid:
+            summary += f", {len(invalid)} unrecognized line(s) skipped"
+        self._log(summary)
+        for entry in invalid[:20]:
+            self._log(f"    not recognized - {entry}", tag="warning")
+        if len(invalid) > 20:
+            self._log(f"    ...and {len(invalid) - 20} more.", tag="warning")
+        if not added and not invalid and not dupes:
+            self._log("[!] File was empty; nothing imported.", tag="warning")
+
     def _queue_remove(self) -> None:
         """Remove all checked entries. If none are checked, remove the active row."""
         checked = [i for i, v in enumerate(self.queue_checks) if v.get()]
@@ -1067,8 +1156,8 @@ class FingerprinterApp:
     def _set_queue_controls_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         for btn in (
-            self.add_queue_btn, self.queue_remove_btn, self.queue_up_btn,
-            self.queue_down_btn, self.queue_clear_btn,
+            self.add_queue_btn, self.queue_import_btn, self.queue_remove_btn,
+            self.queue_up_btn, self.queue_down_btn, self.queue_clear_btn,
         ):
             btn.config(state=state)
 
