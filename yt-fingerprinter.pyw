@@ -2102,13 +2102,25 @@ class FingerprinterApp:
                 pass
 
         script = bat_dir / "audfprint" / "audfprint.py"
+
+        # Go through audfprint_quiet.py so that audfprint's own ffmpeg children
+        # are spawned hidden. CREATE_NO_WINDOW below only covers this child: a
+        # process without a console cannot lend one to its children, so every
+        # ffmpeg audfprint starts would otherwise be handed a fresh console
+        # window, which is the black box that blinks once per file. The wrapper
+        # sets the flag process-wide inside audfprint instead of us patching
+        # audfprint's source, which is a third-party checkout users download
+        # themselves. If it is missing, fall back to invoking audfprint
+        # directly: everything still works, it just flickers again.
+        wrapper = Path(__file__).with_name("audfprint_quiet.py")
+        launcher = [str(wrapper), str(script)] if wrapper.is_file() else [str(script)]
         cmd = [
             # -u matters: Python block-buffers stdout when it is a pipe rather
             # than a terminal, so audfprint's per-file lines would sit in the
             # child's buffer and arrive in one lump when the batch ended. Without
             # it the console shows a single line and then looks frozen for the
             # twenty minutes the batch actually takes.
-            sys.executable, "-u", str(script), "new",
+            sys.executable, "-u", *launcher, "new",
             "-C",                        # keep going when one file fails to read
             "--dbase", str(part_pklz),
             "--list", str(list_file),

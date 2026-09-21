@@ -101,6 +101,7 @@ Download ZIP on [its page](https://github.com/dpwe/audfprint)).
 ```
 C:\fingerprints\Fingerprinter\
 ├── yt-fingerprinter.pyw
+├── audfprint_quiet.py
 ├── requirements.txt
 └── audfprint\
     └── audfprint.py      <-- this file must be right here
@@ -259,7 +260,6 @@ whichever is missing, which usually answers the question on its own.
 | A queue produced far fewer results than expected | **Move pklzs to** was not set, so each channel overwrote the previous one. |
 | My downloaded audio vanished | Expected — it is deleted once a channel is fingerprinted. See the warnings near the top. |
 | A run seems frozen | Big channels take a while to list before anything visible happens. Tick **Verbose yt-dlp output** to confirm it is still working. |
-| Brief black windows flash past | Cosmetic, and only during fingerprinting. See below. |
 
 ### Private or age-restricted videos
 
@@ -278,22 +278,13 @@ under*. If you run it as a scheduled task or a service, that account has no
 browser profile, and it fails with a "file not found" error mentioning
 `systemprofile`.
 
-### A note on flashing windows
-
-This program already hides the helper windows it opens itself. audfprint,
-however, calls ffmpeg on its own, which causes a brief black flicker per file.
-It is harmless and changes nothing about the results.
-
-If it bothers you and you are comfortable editing a Python file: in
-`audfprint\audio_read.py`, find where it starts ffmpeg with
-`subprocess.Popen(...)` and add `creationflags=subprocess.CREATE_NO_WINDOW` as
-an argument. **Copy the file first** — a mistyped edit stops audfprint working,
-and this is purely cosmetic.
-
 ## Good to know
 
 - **Audio is never re-encoded.** It is downloaded in its original form and
   split by copying, so quality is exactly what the site served.
+- **Nothing pops up while it works.** The helper programs it runs, and the
+  ones audfprint runs in turn, are all started hidden, so a long run does
+  not flicker black windows across your screen.
 - **Closing the window saves your settings**, including the queue.
 - **It does not fingerprint the same batch twice.** Finished work is recorded in
   `fingerprinted.json` beside the `.pklz` files. To resume after a crash, press
