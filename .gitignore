@@ -1,0 +1,17 @@
+# Your own settings and lists — written by the app as you use it.
+config.json
+recent_urls.json
+*.txt
+!requirements.txt
+
+# Working folders the app creates and empties as it runs.
+texts/
+pklz-files/
+logs/
+console_logs/
+
+# audfprint is fetched separately (see the README); it is not part of this repo.
+audfprint/
+
+__pycache__/
+*.pyc

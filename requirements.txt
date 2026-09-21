@@ -1,0 +1,5 @@
+docopt
+joblib
+numpy
+psutil
+scipy

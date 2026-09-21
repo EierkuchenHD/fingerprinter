@@ -7,21 +7,26 @@ Pipeline:
   3. Show a size/time estimate and confirm before proceeding
   4. Download each selected video as native m4a/opus (no transcode) in
      parallel into <output_dir>/<CHANNEL>_subfolder
-  5. Probe each file with ffprobe; auto-split anything >= 5:00 in place
-     using ffmpeg's silencedetect, or warn in red if splitting is disabled
+  5. Probe each file with ffprobe; split anything over 12:00 in place into
+     pieces of at least 6:00 (audfprint has less to match on the shorter a
+     piece is), or warn in red if splitting is disabled
   6. Confirm-clear the bat dir's texts/ and pklz-files/ folders if non-empty
-  7. Run preparador.bat then creador.bat (both block until exit)
+  7. Scan that folder for audio and fingerprint it with audfprint, several
+     batches at a time (in-process: no .bat files and no node involved)
   8. List the resulting pklz-files folder and optionally open it
 
 Requirements:
   - Python 3.10+
   - yt-dlp on PATH (`pip install yt-dlp`)
   - ffmpeg + ffprobe on PATH
-  - node on PATH (used by yt-dlp's --js-runtimes node)
+  - node on PATH (used by yt-dlp's --js-runtimes node; no longer needed for
+    fingerprinting, which now drives audfprint directly)
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -138,12 +143,35 @@ def save_config(cfg: dict) -> None:
 
 # ----- splitter constants ----------------------------------------------------
 
-SPLITTER_T7 = int(4.5 * 60)           # files shorter than 4:30 won't be split (precondition)
-SPLITTER_T8 = 5 * 60                  # files this long or longer will be split
-SPLITTER_MIN_SEGMENT = 90             # min seconds between cuts
-SPLITTER_SILENCE_THRESHOLD = "-50dB"
-SPLITTER_SILENCE_DURATION = 1
-SPLITTER_EPS = 0.25                   # tolerance for duration-sum sanity check
+# The floor every produced piece must clear. This is the whole point of the
+# step, so it is one constant and the rest are derived from it. It replaced a
+# ceiling of 5:00 with a minimum gap of 90s between silence-aligned cuts, which
+# could leave pieces a minute and a half long; audfprint has less to work with
+# the shorter a piece is, and the moxser corpus is cut to this same floor.
+SPLIT_MIN_CHUNK = 6 * 60
+
+# The nominal body of a segment. Equal to the floor: a full body already clears
+# it, and the tail merge handles the only piece that could come up short.
+SPLIT_SEGMENT = SPLIT_MIN_CHUNK
+
+# Below two segments' worth there is no cut that leaves two legal pieces, so a
+# file shorter than this is left exactly as it is.
+SPLIT_TRIGGER = 2 * SPLIT_MIN_CHUNK
+
+SPLIT_AUDIO_EXTENSIONS = {
+    ".m4a", ".opus", ".mp3", ".webm", ".ogg", ".oga", ".aac", ".wav", ".flac",
+}
+
+# ffmpeg infers its muxer from the output extension, and slices are written to a
+# ".part" scratch name first, so the format has to be named explicitly. The
+# format name equals the extension for most of these; the rest are mapped.
+SPLIT_MUXERS = {
+    ".m4a": "ipod", ".aac": "adts", ".oga": "ogg", ".opus": "opus",
+}
+
+
+# audfprint prints one of these per file it reads: "ingesting #12: C:\path\x.mp3 ..."
+_INGESTING_RE = re.compile(r"ingesting #(\d+)\s*:\s*(.+?)\s*\.\.\.\s*$")
 
 
 def fmt_size(num_bytes: float) -> str:
@@ -178,6 +206,15 @@ class FingerprinterApp:
         self.log_queue: queue.Queue[tuple[str, str, str | None]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.cancel_flag = threading.Event()
+        # Running audfprint processes, so Cancel can actually stop them. Without
+        # this, cancelling during fingerprinting only set the flag and then sat
+        # waiting for a batch that can run for twenty minutes.
+        self._fp_procs: list[subprocess.Popen] = []
+        self._fp_procs_lock = threading.Lock()
+        # batch id -> (files done, files in batch), for the aggregate progress line
+        self._fp_progress: dict[int, tuple[int, int]] = {}
+        self._fp_progress_lock = threading.Lock()
+        self._fp_status_base = ""
         # Set to skip just the current channel in a queue run (vs cancel_flag
         # which aborts the entire batch).
         self.skip_flag = threading.Event()
@@ -226,7 +263,7 @@ class FingerprinterApp:
         ttk.Entry(src, textvariable=self.output_dir_var).grid(row=1, column=1, sticky="we", padx=4, pady=4)
         ttk.Button(src, text="Browse...", command=lambda: self._browse(self.output_dir_var)).grid(row=1, column=2, padx=4)
 
-        ttk.Label(src, text="Bat files directory:").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(src, text="Fingerprinter directory:").grid(row=2, column=0, sticky="w", padx=4, pady=4)
         self.bat_dir_var = tk.StringVar()
         ttk.Entry(src, textvariable=self.bat_dir_var).grid(row=2, column=1, sticky="we", padx=4, pady=4)
         ttk.Button(src, text="Browse...", command=lambda: self._browse(self.bat_dir_var)).grid(row=2, column=2, padx=4)
@@ -314,6 +351,43 @@ class FingerprinterApp:
         )
         self.parallel_spin.pack(side="left")
 
+        # Fingerprinting controls, on the same row as parallel downloads since
+        # they are the other half of "how hard should this work the machine".
+        #
+        # Concurrent batches is the one that matters. Measured here: the old
+        # single sequential audfprint did 32 files in 117s; eight concurrent
+        # batches did the same 32 in 28s. It is capped rather than opened up
+        # because a 1000-file batch peaks around 5.5 GB, so 4 is roughly 22 GB
+        # of this box's 64 GB and leaves room for everything else running.
+        ttk.Label(opts_r1, text="   Concurrent batches:").pack(side="left", padx=(12, 4))
+        self.fp_concurrency_var = tk.IntVar(value=4)
+        self.fp_concurrency_spin = ttk.Spinbox(
+            opts_r1, from_=1, to=16, textvariable=self.fp_concurrency_var, width=5,
+        )
+        self.fp_concurrency_spin.pack(side="left")
+
+        # audfprint's own internal parallelism. Left at 1 on purpose: it splits
+        # one file list across processes and merges their hash tables back
+        # serially, which stopped paying off past 8 and got slower at 16, and it
+        # multiplies against the batch concurrency above.
+        ttk.Label(opts_r1, text="   audfprint cores:").pack(side="left", padx=(12, 4))
+        self.fp_ncores_var = tk.IntVar(value=1)
+        self.fp_ncores_spin = ttk.Spinbox(
+            opts_r1, from_=1, to=16, textvariable=self.fp_ncores_var, width=5,
+        )
+        self.fp_ncores_spin.pack(side="left")
+
+        # Files per .pklz. Bigger means fewer, larger shards, which matters
+        # downstream: a matcher reloads every .pklz on every run, so hundreds of
+        # small ones pay that cost hundreds of times.
+        ttk.Label(opts_r1, text="   Files per pklz:").pack(side="left", padx=(12, 4))
+        self.batch_size_var = tk.IntVar(value=1000)
+        self.batch_size_spin = ttk.Spinbox(
+            opts_r1, from_=50, to=5000, increment=50,
+            textvariable=self.batch_size_var, width=7,
+        )
+        self.batch_size_spin.pack(side="left")
+
         # Row 2: behavioural checkboxes
         opts_r2 = ttk.Frame(opts)
         opts_r2.pack(fill="x", padx=4, pady=2)
@@ -325,7 +399,7 @@ class FingerprinterApp:
             ("Verbose yt-dlp output", self.verbose_var),
             ("Open channel subfolder on start", self.open_folder_var),
             ("Open pklz-files folder when done", self.open_pklz_var),
-            ("Split files longer than 4:59", self.split_long_var),
+            ("Split into pieces of at least 6:00", self.split_long_var),
         ):
             ttk.Checkbutton(opts_r2, text=label, variable=var).pack(side="left", padx=(0, 14))
 
@@ -354,7 +428,7 @@ class FingerprinterApp:
         btns.pack(fill="x", **pad)
         self.start_btn = ttk.Button(btns, text="Start queue", command=self._start)
         self.start_btn.pack(side="left", padx=(0, 4))
-        self.bats_btn = ttk.Button(btns, text="Run Bats Only", command=self._start_bats_only)
+        self.bats_btn = ttk.Button(btns, text="Split + Fingerprint", command=self._start_bats_only)
         self.bats_btn.pack(side="left", padx=4)
         self.skip_btn = ttk.Button(btns, text="Skip current", command=self._skip_current, state="disabled")
         self.skip_btn.pack(side="left", padx=4)
@@ -508,6 +582,9 @@ class FingerprinterApp:
         ("open_folder_var", "open_folder", bool),
         ("split_long_var", "split_long", bool),
         ("open_pklz_var", "open_pklz", bool),
+        ("batch_size_var", "batch_size", int),
+        ("fp_concurrency_var", "fp_concurrency", int),
+        ("fp_ncores_var", "fp_ncores", int),
     )
 
     def _apply_config(self, cfg: dict) -> None:
@@ -1195,12 +1272,13 @@ class FingerprinterApp:
             messagebox.showerror("Missing input", "Pick a valid bat files directory.")
             return
 
-        prep = Path(bat_dir) / "preparador.bat"
-        creador = Path(bat_dir) / "creador.bat"
-        if not prep.is_file() or not creador.is_file():
+        audfprint = Path(bat_dir) / "audfprint" / "audfprint.py"
+        if not audfprint.is_file():
             messagebox.showerror(
-                "Bat files not found",
-                f"Could not find preparador.bat and/or creador.bat in:\n{bat_dir}",
+                "audfprint not found",
+                f"Could not find audfprint\\audfprint.py under:\n{bat_dir}\n\n"
+                f"Fingerprinting is run directly now, so this is the only script "
+                f"the pipeline needs.",
             )
             return
 
@@ -1303,26 +1381,43 @@ class FingerprinterApp:
             self.root.after(0, self._finish)
 
     def _start_bats_only(self) -> None:
-        """Skip downloads entirely; run just preparador.bat + creador.bat + monitor."""
+        """Skip downloads entirely; scan + fingerprint whatever is already on disk."""
         bat_dir = self.bat_dir_var.get().strip()
         if not bat_dir or not Path(bat_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid bat files directory.")
+            messagebox.showerror("Missing input", "Pick a valid Fingerprinter directory.")
             return
 
-        prep = Path(bat_dir) / "preparador.bat"
-        creador = Path(bat_dir) / "creador.bat"
-        if not prep.is_file() or not creador.is_file():
+        audfprint = Path(bat_dir) / "audfprint" / "audfprint.py"
+        if not audfprint.is_file():
             messagebox.showerror(
-                "Bat files not found",
-                f"Could not find preparador.bat and/or creador.bat in:\n{bat_dir}",
+                "audfprint not found",
+                f"Could not find audfprint\\audfprint.py under:\n{bat_dir}",
             )
             return
 
+        source_dir = self.output_dir_var.get().strip()
+        if not source_dir or not Path(source_dir).is_dir():
+            messagebox.showerror("Missing input", "Pick a valid output directory to scan.")
+            return
+
+        # Says that files get rewritten, because they do: splitting replaces a
+        # long recording with its pieces and deletes the original. Agreeing to
+        # "fingerprint what is on disk" should not quietly also mean "and
+        # restructure it".
+        splitting = self.split_long_var.get()
+        split_line = (
+            f"Anything longer than {SPLIT_TRIGGER // 60}:00 will first be SPLIT IN PLACE "
+            f"into pieces of at least {SPLIT_MIN_CHUNK // 60}:00, and the original file "
+            f"deleted.\n\n"
+            if splitting else
+            "Splitting is switched off, so long files go into the database whole.\n\n"
+        )
         if not messagebox.askyesno(
-            "Run bats only?",
-            f"Run preparador.bat and creador.bat in:\n{bat_dir}\n\n"
-            f"This skips the YouTube download step entirely. Make sure the audio "
-            f"files preparador.bat needs are already in place.\n\nContinue?",
+            "Split and fingerprint existing audio?",
+            f"Scan for audio under:\n{source_dir}\n\n"
+            f"{split_line}"
+            f"Then fingerprint it into:\n{Path(bat_dir) / 'pklz-files'}\n\n"
+            f"This skips the YouTube download step entirely.\n\nContinue?",
             parent=self.root,
         ):
             return
@@ -1487,18 +1582,23 @@ class FingerprinterApp:
                 else:
                     self._log("    ! Path does not exist or is not a directory.", tag="warning")
 
-            # 7. Bat dir + bat presence
+            # 7. Fingerprinter dir + audfprint presence
             bat_dir = self.bat_dir_var.get().strip()
-            self._log(f"[*] Bat directory: {bat_dir or '(not set)'}")
+            self._log(f"[*] Fingerprinter directory: {bat_dir or '(not set)'}")
             if bat_dir:
                 p = Path(bat_dir)
                 if p.is_dir():
-                    for name in ("preparador.bat", "creador.bat"):
-                        bp = p / name
-                        if bp.is_file():
-                            self._log(f"    + {name}: found ({bp.stat().st_size} bytes)")
+                    afp = p / "audfprint" / "audfprint.py"
+                    if afp.is_file():
+                        self._log(f"    + audfprint.py: found ({afp.stat().st_size} bytes)")
+                    else:
+                        self._log("    ! audfprint/audfprint.py: NOT FOUND", tag="warning")
+                    for sub_name in ("texts", "pklz-files"):
+                        d = p / sub_name
+                        if d.is_dir():
+                            self._log(f"    + {sub_name}/: {len(list(d.iterdir()))} item(s)")
                         else:
-                            self._log(f"    ! {name}: NOT FOUND", tag="warning")
+                            self._log(f"    + {sub_name}/: not present (created on use)")
                 else:
                     self._log("    ! Path does not exist or is not a directory.", tag="warning")
 
@@ -1556,6 +1656,20 @@ class FingerprinterApp:
     def _cancel(self) -> None:
         self.cancel_flag.set()
         self._log("[!] Cancellation requested. The entire queue will stop at the next safe checkpoint.")
+        # Fingerprinting is the one stage long enough that waiting for a "safe
+        # checkpoint" means waiting out a whole batch. Terminating is safe here
+        # because each batch writes to a .part file that is only renamed into
+        # place on a clean exit, so a killed batch leaves nothing behind and is
+        # simply redone next run.
+        with self._fp_procs_lock:
+            running = list(self._fp_procs)
+        if running:
+            self._log(f"[!] Stopping {len(running)} running audfprint batch(es)...")
+            for proc in running:
+                try:
+                    proc.terminate()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _skip_current(self) -> None:
         self.skip_flag.set()
@@ -1715,7 +1829,7 @@ class FingerprinterApp:
                 self._log("[X] No successful downloads. Aborting before bat scripts.")
                 return "failed"
 
-            # 4. Folder stays where it was downloaded; preparador.bat reads it from there.
+            # 4. Folder stays where it was downloaded; the scan below picks it up there.
             self._log(f"[+] Folder stays at: {initial_folder}")
 
             # 4a. Audio length sanity check (right after downloads finish)
@@ -1726,19 +1840,20 @@ class FingerprinterApp:
             if not self._preflight_clean(bat_dir, ("texts", "pklz-files")):
                 return "cancelled"
 
-            # 5. preparador.bat
-            self._set_status(f"{qp}Running preparador.bat...")
-            self._log("[*] Running preparador.bat...")
-            self._run_bat(bat_dir / "preparador.bat", bat_dir)
-            if (s := stopped()):
-                return s
-
-            # 6. creador.bat (runs immediately — preparador has already exited)
+            # 5 + 6. Scan and fingerprint, natively (was preparador.bat then
+            # creador.bat). The scan follows the configured output directory
+            # rather than the path setup.js had hard-coded.
             pklz_dir = bat_dir / "pklz-files"
             pklz_before = self._snapshot_pklz(pklz_dir)
-            self._set_status(f"{qp}Running creador.bat...")
-            self._log("[*] Running creador.bat...")
-            self._run_bat(bat_dir / "creador.bat", bat_dir)
+            source_dir = Path(output_dir)
+            if not self._run_fingerprint_stage(bat_dir, source_dir, status_prefix=qp):
+                if (s := stopped()):
+                    return s
+                # Batches failed but their lists are still on disk, so the pklz
+                # files that DID succeed are worth keeping and renaming below.
+                self._log("[!] Fingerprinting did not complete cleanly - see the failures above.")
+            if (s := stopped()):
+                return s
 
             # 6b. Rename the newly-created pklz files using the channel handle.
             self._rename_new_pklz(pklz_dir, pklz_before, pklz_prefix)
@@ -1779,32 +1894,45 @@ class FingerprinterApp:
                 self.root.after(0, self._finish)
 
     def _run_bats_only_pipeline(self, bat_dir: Path) -> None:
-        """Skip downloads. Run preparador.bat -> creador.bat -> done."""
+        """Skip downloads. Scan the output directory, fingerprint it, done."""
         try:
-            self._log("[*] Running bats only (no download)...")
+            self._log("[*] Fingerprinting existing audio (no download)...")
 
-            # Pre-flight: texts/ and pklz-files/ must be empty
-            if not self._preflight_clean(bat_dir, ("texts", "pklz-files")):
+            # Only texts/ is cleared here. pklz-files/ is deliberately left
+            # alone: a successful run moves every .pklz out to the database, so
+            # anything still sitting there is the partial output of a run that
+            # failed, and that is exactly what this path should be resuming from
+            # rather than being made to rebuild. The fingerprint stage decides
+            # per batch whether an existing .pklz still matches its file list.
+            if not self._preflight_clean(bat_dir, ("texts",)):
                 return
 
-            # preparador.bat
-            self._set_status("Running preparador.bat...")
-            self._log("[*] Running preparador.bat...")
-            self._run_bat(bat_dir / "preparador.bat", bat_dir)
+            pklz_dir = bat_dir / "pklz-files"
+            source_dir = Path(self.output_dir_var.get().strip() or bat_dir)
+
+            # Split first, same as the download pipeline does. Without this the
+            # two buttons produced different databases from the same audio: a
+            # downloaded channel went in as >=6:00 pieces while anything
+            # fingerprinted from disk went in whole.
+            #
+            # Recursive here, unlike the download path: that one is handed a
+            # single channel folder, while this is pointed at the whole output
+            # directory, which is normally a folder per channel or per year.
+            if not self._check_long_audio(source_dir, recursive=True):
+                return
+            if not self._run_fingerprint_stage(bat_dir, source_dir):
+                if self.cancel_flag.is_set():
+                    return
+                self._log("[!] Fingerprinting did not complete cleanly - see the failures above.")
             if self.cancel_flag.is_set():
                 return
 
-            # creador.bat (runs immediately — preparador has already exited)
-            pklz_dir = bat_dir / "pklz-files"
-            pklz_before = self._snapshot_pklz(pklz_dir)
-            self._set_status("Running creador.bat...")
-            self._log("[*] Running creador.bat...")
-            self._run_bat(bat_dir / "creador.bat", bat_dir)
-
-            # Rename new pklz files. No URL here, so derive the prefix from a
-            # *_subfolder in the bat dir if present, else use a generic name.
+            # Every numbered .pklz here belongs to the scan that just ran, including
+            # any carried over from a previous attempt, so all of them are renamed
+            # rather than only the ones created this time round. Otherwise a resumed
+            # run ships a mix of "channel_3.pklz" and bare "3.pklz" to the database.
             prefix = self._derive_prefix_from_subfolder(bat_dir)
-            self._rename_new_pklz(pklz_dir, pklz_before, prefix)
+            self._rename_new_pklz(pklz_dir, set(), prefix)
 
             # Optionally move the pklz files to a destination directory.
             move_dest = self.move_pklz_dir_var.get().strip()
@@ -1825,6 +1953,423 @@ class FingerprinterApp:
         finally:
             self.root.after(0, self._finish)
 
+    # ------------------- fingerprinting (native, no .bat / no node) -----------
+    #
+    # Replaces preparador.bat -> setup.js and creador.bat -> fingerprinter.js.
+    # Those were four processes deep (cmd -> bat -> node -> python) to do two
+    # things Python does directly: walk a folder, and run audfprint on batches
+    # of what it found. Doing it here removes the Node dependency, the console
+    # windows, and the Spanish-language logs, and makes the work cancellable
+    # and streamable into this console like everything else.
+    #
+    # Three behaviours are deliberately different from the scripts they replace,
+    # each fixing something that was losing work:
+    #
+    #  1. setup.js scanned a hard-coded "C:\fingerprints\download" and ignored
+    #     the configured Output directory entirely. Point the GUI somewhere else
+    #     and it would fingerprint whatever happened to be at the old path. The
+    #     scan now follows the configured directory.
+    #
+    #  2. fingerprinter.js resumed from max(existing pklz id), so a failed batch
+    #     followed by a successful one was never retried: the run on 2026-09-15
+    #     lost batches 6 and 7 that way, and the next run started at 9. Each
+    #     batch is now checked for its own output, so gaps are picked back up.
+    #
+    #  3. A .pklz is written under a .part name and renamed only once audfprint
+    #     exits 0, so a crash or Cancel mid-write cannot leave a truncated file
+    #     that later looks like a finished batch.
+
+    AUDIO_EXTENSIONS = {
+        ".mp3", ".mp4", ".wav", ".flac", ".m4a",
+        ".wma", ".webm", ".ogg", ".aac", ".opus",
+    }
+
+    def _publish_fp_progress(self) -> None:
+        """Roll the per-batch counters into one status-bar line.
+
+        The batches run concurrently and finish out of order, so a single
+        'files done / files total' across all of them is the only number that
+        means anything while they are in flight."""
+        with self._fp_progress_lock:
+            done = sum(d for d, _ in self._fp_progress.values())
+            total = sum(t for _, t in self._fp_progress.values())
+            active = len(self._fp_progress)
+        base = self._fp_status_base
+        if total:
+            self._set_status(f"{base}{done:,}/{total:,} files "
+                             f"({done * 100 // total}%) across {active} batch(es)")
+        else:
+            self._set_status(f"{base}fingerprinting...")
+
+    def _scan_audio_files(self, source_dir: Path, texts_dir: Path, batch_size: int) -> int:
+        """Walk source_dir for audio and write texts/<n>.txt lists of batch_size
+        paths each. Returns the number of batches written (0 if no audio found).
+
+        os.scandir rather than Path.rglob: at tens of thousands of files the
+        difference is seconds, and this runs on the UI's worker thread."""
+        texts_dir.mkdir(parents=True, exist_ok=True)
+        found: list[str] = []
+        stack = [str(source_dir)]
+        while stack:
+            if self.cancel_flag.is_set():
+                return 0
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif os.path.splitext(entry.name)[1].lower() in self.AUDIO_EXTENSIONS:
+                                found.append(entry.path)
+                        except OSError:
+                            continue
+            except OSError as e:
+                self._log(f"[!] Could not read {current}: {e}")
+
+        if not found:
+            return 0
+
+        # Sorted so a given folder always batches the same way: a rerun after a
+        # failure then reproduces the same <n>.txt contents, which is what makes
+        # "batch 6 is missing its pklz" mean the same thing on the second run.
+        found.sort()
+        batches = 0
+        for start in range(0, len(found), batch_size):
+            batches += 1
+            chunk = found[start:start + batch_size]
+            (texts_dir / f"{batches}.txt").write_text("\n".join(chunk), encoding="utf-8")
+        self._log(f"[+] Found {len(found):,} audio file(s) -> {batches} batch(es) of up to {batch_size}")
+        return batches
+
+    # The record of what was actually fingerprinted, kept next to the .pklz files
+    # it describes rather than next to the lists, because it has to outlive any
+    # rescan. It maps batch id -> hash of the file list that produced that batch's
+    # .pklz. Resume compares the current list against it, so "batch 3 is done" is
+    # only true while batch 3 still means the same files: add or remove audio and
+    # the batching reshuffles under the old numbers, and without this check a
+    # resumed run would keep .pklz files whose contents no longer match.
+    FINGERPRINTED_RECORD = "fingerprinted.json"
+
+    @staticmethod
+    def _batch_list_hash(texts_dir: Path, batch_id: int) -> str | None:
+        try:
+            raw = (texts_dir / f"{batch_id}.txt").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _load_fingerprinted(self, pklz_dir: Path) -> dict[str, str]:
+        try:
+            data = json.loads((pklz_dir / self.FINGERPRINTED_RECORD).read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _save_fingerprinted(self, pklz_dir: Path, record: dict[str, str]) -> None:
+        try:
+            (pklz_dir / self.FINGERPRINTED_RECORD).write_text(
+                json.dumps(record, indent=1), encoding="utf-8")
+        except OSError as e:
+            self._log(f"[!] Could not update {self.FINGERPRINTED_RECORD}: {e}")
+
+    def _run_audfprint_batch(
+        self,
+        bat_dir: Path,
+        batch_id: int,
+        ncores: int,
+        log_lock: threading.Lock,
+    ) -> tuple[int, bool, str]:
+        """Run audfprint over texts/<batch_id>.txt -> pklz-files/<batch_id>.pklz.
+
+        Returns (batch_id, ok, detail). Output is streamed rather than buffered:
+        the old version used Node's exec(), which holds everything in memory and
+        only hands it over at the end, so a batch that died mid-run reported an
+        empty stdout and there was nothing to diagnose it with."""
+        texts_dir = bat_dir / "texts"
+        pklz_dir = bat_dir / "pklz-files"
+        list_file = texts_dir / f"{batch_id}.txt"
+        final_pklz = pklz_dir / f"{batch_id}.pklz"
+        part_pklz = pklz_dir / f"{batch_id}.pklz.part"
+
+        if not list_file.is_file():
+            return batch_id, False, f"{list_file.name} is missing"
+
+        if part_pklz.exists():
+            try:
+                part_pklz.unlink()      # leftover from an interrupted attempt
+            except OSError:
+                pass
+
+        script = bat_dir / "audfprint" / "audfprint.py"
+        cmd = [
+            # -u matters: Python block-buffers stdout when it is a pipe rather
+            # than a terminal, so audfprint's per-file lines would sit in the
+            # child's buffer and arrive in one lump when the batch ended. Without
+            # it the console shows a single line and then looks frozen for the
+            # twenty minutes the batch actually takes.
+            sys.executable, "-u", str(script), "new",
+            "-C",                        # keep going when one file fails to read
+            "--dbase", str(part_pklz),
+            "--list", str(list_file),
+            "--ncores", str(max(1, ncores)),
+        ]
+
+        try:
+            total_files = sum(1 for ln in list_file.read_text(encoding="utf-8").splitlines() if ln.strip())
+        except OSError:
+            total_files = 0
+
+        tail: list[str] = []
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(bat_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as e:
+            return batch_id, False, f"could not start audfprint: {e}"
+
+        with self._fp_procs_lock:
+            self._fp_procs.append(proc)
+        try:
+            assert proc.stdout is not None
+            last_report = 0.0
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                # Keep the last lines regardless of verbosity: when a batch dies
+                # this is the only record of where it got to.
+                tail.append(line)
+                if len(tail) > 25:
+                    del tail[0]
+
+                # audfprint prints one "ingesting #N: <path>" per file. Echoing
+                # every one would be thousands of lines of noise across four
+                # concurrent batches, and dropping them (as this first did) left
+                # the console looking frozen for the twenty minutes a batch runs.
+                # Reported as a counter instead, at most once a second per batch.
+                m = _INGESTING_RE.search(line)
+                if m:
+                    done_here = int(m.group(1)) + 1   # audfprint counts from #0
+                    with self._fp_progress_lock:
+                        self._fp_progress[batch_id] = (done_here, total_files)
+                    now = time.time()
+                    if now - last_report >= 1.0:
+                        last_report = now
+                        pct = f" {done_here * 100 // total_files}%" if total_files else ""
+                        name = os.path.basename(m.group(2))[:60]
+                        with log_lock:
+                            self._log(f"  | [batch {batch_id}] {done_here}/{total_files or '?'}"
+                                      f"{pct}  {name}", tag="bat")
+                        self._publish_fp_progress()
+                    continue
+
+                if self.verbose_var.get():
+                    with log_lock:
+                        self._log(f"  | [batch {batch_id}] {line}", tag="bat")
+            proc.wait()
+        finally:
+            with self._fp_procs_lock:
+                if proc in self._fp_procs:
+                    self._fp_procs.remove(proc)
+
+        if self.cancel_flag.is_set():
+            part_pklz.unlink(missing_ok=True)
+            return batch_id, False, "cancelled"
+
+        if proc.returncode != 0 or not part_pklz.exists():
+            part_pklz.unlink(missing_ok=True)
+            detail = f"audfprint exited {proc.returncode}"
+            if tail:
+                detail += "\n      last output: " + "\n      ".join(tail[-6:])
+            return batch_id, False, detail
+
+        try:
+            os.replace(part_pklz, final_pklz)
+        except OSError as e:
+            part_pklz.unlink(missing_ok=True)
+            return batch_id, False, f"could not finalise {final_pklz.name}: {e}"
+        return batch_id, True, f"{final_pklz.name} ({final_pklz.stat().st_size / 1024 / 1024:.1f} MB)"
+
+    def _fingerprint_all(self, bat_dir: Path, total_batches: int) -> bool:
+        """Run every batch that does not already have its .pklz, concurrently.
+
+        Concurrency is across batches rather than inside one. Measured on this
+        machine (50 cores, 32 real files per trial), with the same total number
+        of audfprint worker processes each time:
+
+            1 process  --ncores 8    59.2s
+            2 processes --ncores 4   42.1s
+            4 processes --ncores 2   36.9s
+            8 processes --ncores 1   28.1s
+
+        against 117.1s for the old single process at --ncores 1. audfprint's own
+        --ncores splits one file list across processes and then merges their hash
+        tables back through pipes, and that merge is serial, so it stops paying
+        off around 8 and got slower at 16. Independent batches have nothing to
+        merge.
+
+        The cap matters: peak memory measured at 676 MB for 120 files, which
+        extrapolates to roughly 5.5 GB for a 1000-file batch, so the default of
+        4 concurrent batches is about 22 GB of the 64 GB on this box. Raising it
+        much further risks swapping, which would undo the gain."""
+        pklz_dir = bat_dir / "pklz-files"
+        pklz_dir.mkdir(parents=True, exist_ok=True)
+
+        # Per batch, not max(id). A gap left by an earlier failure is work to
+        # redo, not a batch to skip. A .pklz only counts as done when the batch
+        # it belongs to still covers the same files (see the manifest note in
+        # _scan_audio_files); anything else is stale and gets rebuilt.
+        texts_dir = bat_dir / "texts"
+        record = self._load_fingerprinted(pklz_dir)
+        record_lock = threading.Lock()
+        pending: list[int] = []
+        stale = 0
+        for i in range(1, total_batches + 1):
+            existing = pklz_dir / f"{i}.pklz"
+            current = self._batch_list_hash(texts_dir, i)
+            if existing.exists() and current and record.get(str(i)) == current:
+                continue                      # genuinely already done
+            if existing.exists():
+                # Present but built from a different file set, so it is wrong
+                # for this batch number now. Rebuilt rather than trusted.
+                stale += 1
+                try:
+                    existing.unlink()
+                except OSError as e:
+                    self._log(f"[!] Could not remove stale {existing.name}: {e}")
+            pending.append(i)
+        if stale:
+            self._log(f"[!] {stale} existing pklz file(s) were built from a different "
+                      f"set of files (the audio changed) and are being rebuilt.")
+        # Drop records for batches that no longer exist, so the file cannot grow
+        # forever across runs with different batch counts.
+        for key in [k for k in record if not k.isdigit() or int(k) > total_batches]:
+            record.pop(key, None)
+
+        # A run over less audio than last time produces fewer batches, leaving
+        # higher-numbered .pklz files behind that nothing will refresh. Named
+        # rather than deleted: they may be a previous channel's output that has
+        # not been moved to the database yet, and that is not this step's to throw
+        # away.
+        orphans = sorted(
+            p.name for p in pklz_dir.glob("*.pklz")
+            if p.stem.isdigit() and int(p.stem) > total_batches
+        )
+        if orphans:
+            self._log(f"[!] {len(orphans)} pklz file(s) left over from a previous, larger "
+                      f"run and not covered by this one: {', '.join(orphans)}")
+            self._log("[!] They are untouched. Move or delete them if they are no longer wanted.")
+
+        done_already = total_batches - len(pending)
+        if done_already:
+            self._log(f"[+] {done_already} batch(es) already fingerprinted, {len(pending)} to do")
+        if not pending:
+            self._log("[+] Nothing to fingerprint: every batch already has its pklz.")
+            return True
+
+        # Seeded with every pending batch at 0 so the total is the real total
+        # from the first line printed, rather than climbing as batches start.
+        with self._fp_progress_lock:
+            self._fp_progress = {}
+            for i in pending:
+                try:
+                    n_files = sum(1 for ln in (texts_dir / f"{i}.txt").read_text(
+                        encoding="utf-8").splitlines() if ln.strip())
+                except OSError:
+                    n_files = 0
+                self._fp_progress[i] = (0, n_files)
+
+        concurrency = max(1, min(int(self.fp_concurrency_var.get()), len(pending)))
+        ncores = max(1, int(self.fp_ncores_var.get()))
+        self._log(f"[*] Fingerprinting {len(pending)} batch(es), "
+                  f"{concurrency} at a time, audfprint --ncores {ncores}")
+
+        log_lock = threading.Lock()
+        completed = 0
+        failures: list[tuple[int, str]] = []
+        started = time.time()
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(self._run_audfprint_batch, bat_dir, i, ncores, log_lock): i
+                for i in pending
+            }
+            for fut in as_completed(futures):
+                batch_id, ok, detail = fut.result()
+                completed += 1
+                if ok:
+                    # Recorded the moment the batch lands, not at the end of the
+                    # run: a crash after batch 3 should still leave 1-3 known-good
+                    # rather than throwing away work that is already on disk.
+                    with record_lock:
+                        h = self._batch_list_hash(texts_dir, batch_id)
+                        if h:
+                            record[str(batch_id)] = h
+                            self._save_fingerprinted(pklz_dir, record)
+                    self._log(f"[+] Batch {batch_id} done -> {detail}  "
+                              f"({completed}/{len(pending)})")
+                else:
+                    failures.append((batch_id, detail))
+                    self._log(f"[X] Batch {batch_id} failed: {detail}")
+                # A finished batch counts as fully done, so the aggregate line
+                # does not stall at whatever its last "ingesting" line reported.
+                with self._fp_progress_lock:
+                    if batch_id in self._fp_progress:
+                        _, tot = self._fp_progress[batch_id]
+                        self._fp_progress[batch_id] = (tot, tot)
+                elapsed = time.time() - started
+                rate = completed / elapsed if elapsed else 0
+                left = (len(pending) - completed) / rate if rate else 0
+                self._fp_status_base = (f"Batch {completed}/{len(pending)} done, "
+                                        f"{fmt_time(left)} left - ")
+                self._publish_fp_progress()
+                if self.cancel_flag.is_set():
+                    for f in futures:
+                        f.cancel()
+                    break
+
+        if self.cancel_flag.is_set():
+            self._log("[!] Fingerprinting cancelled.")
+            return False
+
+        took = fmt_time(time.time() - started)
+        if failures:
+            self._log(f"[!] Fingerprinting finished in {took} with "
+                      f"{len(failures)} failed batch(es): "
+                      + ", ".join(str(b) for b, _ in failures))
+            self._log("[!] Their .pklz files were not written, so running this "
+                      "again retries exactly those batches.")
+            return False
+        self._log(f"[+] All {len(pending)} batch(es) fingerprinted in {took}.")
+        return True
+
+    def _run_fingerprint_stage(self, bat_dir: Path, source_dir: Path, status_prefix: str = "") -> bool:
+        """Scan + fingerprint: the whole of what preparador.bat and creador.bat
+        used to do. Returns True only if every batch produced a .pklz."""
+        texts_dir = bat_dir / "texts"
+        batch_size = max(1, int(self.batch_size_var.get()))
+
+        self._set_status(f"{status_prefix}Scanning for audio...")
+        self._log(f"[*] Scanning for audio under: {source_dir}")
+        total_batches = self._scan_audio_files(source_dir, texts_dir, batch_size)
+        if self.cancel_flag.is_set():
+            return False
+        if total_batches == 0:
+            self._log(f"[X] No audio files found under {source_dir}. Nothing to fingerprint.")
+            return False
+
+        self._set_status(f"{status_prefix}Fingerprinting...")
+        return self._fingerprint_all(bat_dir, total_batches)
+
     # ------------------------- yt-dlp wrappers --------------------------------
 
     def _get_audio_duration(self, path: Path) -> float | None:
@@ -1843,10 +2388,15 @@ class FingerprinterApp:
         except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
             return None
 
-    def _check_long_audio(self, folder: Path, threshold_seconds: int = 300) -> bool:
-        """Probe every audio file in `folder`. If any is `threshold_seconds` or longer,
-        either auto-split (if the checkbox is on) or just log a red warning. Always
-        returns True so the pipeline continues; only returns False on cancel."""
+    def _check_long_audio(self, folder: Path, recursive: bool = False) -> bool:
+        """Probe every audio file under `folder` and split anything long enough to
+        be split. Always returns True so the pipeline continues; returns False only
+        on cancel.
+
+        `recursive` because the two callers see different shapes: a channel
+        download lands one flat folder, while Fingerprint Only is pointed at the
+        whole output directory, which is usually a folder per channel or per year.
+        """
         self._set_status("Checking audio durations...")
         self._log("[*] Checking audio file durations...")
 
@@ -1854,11 +2404,16 @@ class FingerprinterApp:
             self._log("[!] ffprobe not on PATH; skipping length check.")
             return True
 
-        audio_exts = {".m4a", ".opus", ".mp3", ".webm", ".ogg", ".oga", ".aac", ".wav", ".flac"}
-        audio_files = sorted(
-            p for p in folder.iterdir()
-            if p.is_file() and p.suffix.lower() in audio_exts
-        )
+        if recursive:
+            audio_files = sorted(
+                p for p in folder.rglob("*")
+                if p.is_file() and p.suffix.lower() in SPLIT_AUDIO_EXTENSIONS
+            )
+        else:
+            audio_files = sorted(
+                p for p in folder.iterdir()
+                if p.is_file() and p.suffix.lower() in SPLIT_AUDIO_EXTENSIONS
+            )
         if not audio_files:
             self._log("[!] No audio files found to check.")
             return True
@@ -1872,22 +2427,25 @@ class FingerprinterApp:
             if dur is None:
                 unreadable += 1
                 continue
-            if dur >= threshold_seconds:
+            if dur > SPLIT_TRIGGER:
                 long_files.append((f, dur))
 
         if unreadable:
             self._log(f"[!] Could not read duration of {unreadable} file(s).")
         if not long_files:
-            self._log(f"[+] All {len(audio_files)} files are under 5:00.")
+            self._log(
+                f"[+] All {len(audio_files)} file(s) are under "
+                f"{SPLIT_TRIGGER // 60}:00 — nothing to split."
+            )
             return True
 
-        long_files.sort(key=lambda x: -x[1])  # longest first
+        long_files.sort(key=lambda x: -x[1])
 
         if not self.split_long_var.get():
-            # Splitting disabled — just warn in red and continue.
             self._log(
-                f"[!] WARNING: {len(long_files)} file(s) are 5:00 or longer. "
-                f"Splitting is disabled — pklz creation may run into issues.",
+                f"[!] WARNING: {len(long_files)} file(s) are longer than "
+                f"{SPLIT_TRIGGER // 60}:00. Splitting is disabled, so they go into "
+                f"the database whole.",
                 tag="warning",
             )
             for path, dur in long_files[:10]:
@@ -1897,199 +2455,170 @@ class FingerprinterApp:
                 self._log(f"    ... (+{len(long_files) - 10} more)", tag="warning")
             return True
 
-        # Splitting enabled — split each long file in place.
-        self._log(f"[*] Splitting {len(long_files)} file(s) longer than 5:00...", tag="splitter")
+        self._log(
+            f"[*] Splitting {len(long_files)} file(s) into pieces of at least "
+            f"{SPLIT_MIN_CHUNK // 60}:00...",
+            tag="splitter",
+        )
+        made = 0
         for path, dur in long_files:
             if self.cancel_flag.is_set():
                 return False
-            self._split_file_in_place(path, dur)
-        self._log("[+] Splitting complete.", tag="splitter")
+            made += self._split_file_in_place(path, dur)
+        self._log(f"[+] Splitting complete: {made} piece(s) written.", tag="splitter")
         return True
 
-    # ---------- splitter (ported from FILE_SPLITTER.py) -----------------------
-
-    def _detect_silences(self, file: Path) -> list[tuple[float, float]]:
-        """Return list of (start, end) silence ranges via ffmpeg's silencedetect filter."""
-        try:
-            proc = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-i", str(file),
-                 "-af", f"silencedetect=noise={SPLITTER_SILENCE_THRESHOLD}:d={SPLITTER_SILENCE_DURATION}",
-                 "-f", "null", "-"],
-                capture_output=True, text=True, check=False,
-                encoding="utf-8", errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except FileNotFoundError:
-            self._log("[!] ffmpeg missing during silence detection.", tag="warning")
-            return []
-
-        silences: list[tuple[float, float]] = []
-        start: float | None = None
-        for line in (proc.stderr or "").splitlines():
-            line = line.strip()
-            if "silence_start:" in line:
-                try:
-                    start = float(line.split("silence_start:")[-1].strip())
-                except ValueError:
-                    start = None
-            elif "silence_end:" in line and start is not None:
-                try:
-                    end = float(line.split("silence_end:")[-1].split("|")[0].strip())
-                    silences.append((start, end))
-                except ValueError:
-                    pass
-                start = None
-        return silences
+    # ---------- splitter ------------------------------------------------------
+    #
+    # Every piece is at least SPLIT_MIN_CHUNK long. That is a floor, not a
+    # ceiling, and it replaced the opposite rule: this used to cut on detected
+    # silences until no piece was longer than 5:00, which meant pieces as short
+    # as 90 seconds. Audfprint has less to match on the shorter a piece is, and
+    # the moxser corpus is built to the same floor, so a database fed from both
+    # now has one granularity rather than two.
+    #
+    # The arithmetic is the same as moxser-split.py's: cut at fixed
+    # SPLIT_SEGMENT boundaries, and if the last piece would come up short,
+    # drop the segment count by one so the remainder joins the piece before it.
+    # That final piece is then SPLIT_SEGMENT + remainder, which is over the
+    # floor by construction — so no cut can produce a short piece.
 
     @staticmethod
-    def _choose_cut_points(
-        raw_silences: list[tuple[float, float]],
-        seg_start: float,
-        seg_end: float,
-        min_len: float = SPLITTER_MIN_SEGMENT,
-    ) -> list[float]:
-        """Select silence-start times inside (seg_start, seg_end) such that no
-        resulting piece is shorter than `min_len`."""
-        candidates = sorted(s[0] for s in raw_silences if seg_start < s[0] < seg_end)
-        cuts: list[float] = []
-        last_boundary = seg_start
-        for i, t in enumerate(candidates):
-            next_boundary = candidates[i + 1] if i + 1 < len(candidates) else seg_end
-            if (t - last_boundary) >= min_len and (next_boundary - t) >= min_len:
-                cuts.append(t)
-                last_boundary = t
-        return cuts
+    def _build_segments(duration: float) -> list[tuple[float, float]]:
+        """(start, end) pairs, or [] when the file should be left whole.
 
-    def _split_segment(
-        self,
-        seg_start: float,
-        seg_end: float,
-        raw_silences: list[tuple[float, float]],
-    ) -> list[tuple[float, float]]:
-        """Recursively pick cut points until every piece is <= 5:00.
-        Falls back to halfway-cut when no usable silences exist."""
-        duration = seg_end - seg_start
-        if duration <= SPLITTER_T8:
-            return [(seg_start, seg_end)]
+        Below two segments' worth there is no cut that leaves two legal pieces,
+        so a 9-minute video stays a 9-minute video."""
+        if duration <= SPLIT_TRIGGER:
+            return []
 
-        cuts = self._choose_cut_points(raw_silences, seg_start, seg_end)
-        if cuts:
-            pieces: list[tuple[float, float]] = []
-            last = seg_start
-            for t in cuts:
-                pieces.extend(self._split_segment(last, t, raw_silences))
-                last = t
-            pieces.extend(self._split_segment(last, seg_end, raw_silences))
-            return pieces
+        count = int(math.ceil(duration / float(SPLIT_SEGMENT)))
+        if count >= 2:
+            tail = duration - (count - 1) * SPLIT_SEGMENT
+            if 0 < tail < SPLIT_MIN_CHUNK:
+                count -= 1
+        if count < 2:
+            return []
 
-        # No usable silences and piece is still > 5:00 — bisect.
-        mid = (seg_start + seg_end) / 2.0
-        self._log(
-            f"  No usable silences in [{seg_start:.1f}s, {seg_end:.1f}s] "
-            f"(dur={duration:.1f}s); cutting halfway at {mid:.1f}s.",
-            tag="splitter",
-        )
-        left = self._split_segment(seg_start, mid, raw_silences)
-        right = self._split_segment(mid, seg_end, raw_silences)
-        return left + right
+        segments = [
+            (i * SPLIT_SEGMENT,
+             duration if i == count - 1 else min((i + 1) * SPLIT_SEGMENT, duration))
+            for i in range(count)
+        ]
+        segments = [(s, e) for s, e in segments if e > s]
+        # Asserted rather than trusted: this runs unattended over whole channels,
+        # and a short piece would only show up later as a weak fingerprint.
+        for s, e in segments:
+            assert e - s >= SPLIT_MIN_CHUNK - 0.5, (
+                f"produced a {e - s:.1f}s piece from a {duration:.1f}s file")
+        return segments
+
+    @staticmethod
+    def _split_piece_name(base: str, start: float, end: float, ext: str) -> str:
+        """`song_split_000m-006m.m4a`, the same scheme the moxser corpus uses.
+
+        Self-describing on purpose: a bare `_1`, `_2` says nothing about which
+        part of the recording it is, which matters when a match comes back
+        against one piece of a long set."""
+        def label(seconds: float) -> str:
+            total = max(0, int(round(seconds)))
+            m, s = divmod(total, 60)
+            return f"{m:03d}m" if s == 0 else f"{m:03d}m{s:02d}s"
+        return f"{base}_split_{label(start)}-{label(end)}{ext}"
 
     def _ffmpeg_slice(self, src: Path, start: float, end: float, dst: Path) -> bool:
-        """Stream-copy a slice [start, end] of src into dst. Returns True on success."""
+        """Stream-copy [start, end) of src into dst. Returns True on success.
+
+        Written to a scratch name and moved into place only once ffmpeg exits
+        cleanly, so a cancel or a crash mid-write cannot leave a truncated piece
+        sitting at the real name looking like finished work.
+        """
+        length = end - start
+        if length <= 0:
+            return False
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        # ffmpeg picks its muxer from the output extension, and ".part" tells it
+        # nothing — without -f every single slice fails with "Unable to find a
+        # suitable output format".
+        fmt = SPLIT_MUXERS.get(dst.suffix.lower(), dst.suffix.lower().lstrip("."))
         try:
             proc = subprocess.run(
+                # -ss before -i is an input seek: fast, and accurate enough here
+                # because these are all frame-independent audio codecs. Duration
+                # is given as -t after the input rather than -to before it,
+                # because -to as an input option has meant different things
+                # across ffmpeg versions.
                 ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                 "-i", str(src),
-                 "-ss", f"{start:.6f}",
-                 "-to", f"{end:.6f}",
-                 "-c", "copy",
-                 str(dst)],
+                 "-ss", f"{start:.6f}", "-i", str(src), "-t", f"{length:.6f}",
+                 "-vn", "-c", "copy", "-f", fmt, str(tmp)],
                 capture_output=True, text=True, check=False,
                 encoding="utf-8", errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            if proc.returncode != 0:
+            ok = proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0
+            if not ok:
                 err = (proc.stderr or "").strip()[:200]
                 self._log(f"  ! ffmpeg slice failed: {err}", tag="warning")
+                tmp.unlink(missing_ok=True)
                 return False
+            os.replace(tmp, dst)
             return True
         except FileNotFoundError:
             self._log("[!] ffmpeg missing during slicing.", tag="warning")
+            tmp.unlink(missing_ok=True)
             return False
 
-    def _split_file_in_place(self, file_path: Path, duration: float) -> None:
-        """Split one file using silence detection. Pieces land in the same folder
-        with `_1`, `_2`, ... suffixes; the original is deleted on success."""
+    def _split_file_in_place(self, file_path: Path, duration: float) -> int:
+        """Split one file into >= SPLIT_MIN_CHUNK pieces beside it, then delete the
+        original. Returns how many pieces were written."""
         mins, secs = divmod(int(duration), 60)
-        self._log(
-            f"[*] Splitting: {file_path.name}  ({mins}:{secs:02d})",
-            tag="splitter",
-        )
+        segments = self._build_segments(duration)
+        if not segments:
+            self._log(f"  {file_path.name} ({mins}:{secs:02d}) is too short to split; left whole.",
+                      tag="splitter")
+            return 0
 
-        if duration < SPLITTER_T7:
-            # Shouldn't happen given the caller's filter, but mirror the original guard.
-            self._log("  Skipping: shorter than 4:30.", tag="splitter")
-            return
-
+        self._log(f"[*] Splitting: {file_path.name}  ({mins}:{secs:02d}) "
+                  f"-> {len(segments)} piece(s)", tag="splitter")
         self._set_status(f"Splitting {file_path.name}...")
-        silences = self._detect_silences(file_path)
-        self._log(f"  Found {len(silences)} silence region(s).", tag="splitter")
 
-        if self.cancel_flag.is_set():
-            return
-
-        ranges = self._split_segment(0.0, duration, silences)
-        ranges.sort(key=lambda r: r[0])
-
-        total_out = sum(e - s for s, e in ranges)
-        if abs(duration - total_out) > SPLITTER_EPS:
-            self._log(
-                f"  ! Sum of pieces ({total_out:.2f}s) differs from original "
-                f"({duration:.2f}s) by {total_out - duration:+.2f}s.",
-                tag="warning",
-            )
-
-        self._log(f"  Will produce {len(ranges)} piece(s):", tag="splitter")
         base = file_path.stem
         ext = file_path.suffix
         out_dir = file_path.parent
-
         written: list[Path] = []
-        used_names: set[str] = {file_path.name}  # never collide with the source
-        for i, (start, end) in enumerate(ranges, start=1):
+
+        for start, end in segments:
             if self.cancel_flag.is_set():
-                return
-            # Build a piece name, bumping the index if it would collide with the
-            # source file or an existing/already-written piece (ffmpeg's -y would
-            # otherwise silently overwrite them).
-            n = i
-            out_path = out_dir / f"{base}_{n}{ext}"
-            while out_path.name in used_names or (
-                out_path.exists() and out_path.name != file_path.name
-            ):
-                n += 1
-                out_path = out_dir / f"{base}_{n}{ext}"
-            used_names.add(out_path.name)
-            ms, ss = divmod(int(start), 60)
-            me, se = divmod(int(end), 60)
+                # Leave the original alone: a half-split file that lost its
+                # source would be unrecoverable.
+                for p in written:
+                    p.unlink(missing_ok=True)
+                self._log("  cancelled; pieces removed and original kept.", tag="warning")
+                return 0
+            out_path = out_dir / self._split_piece_name(base, start, end, ext)
+            if out_path.exists() and out_path != file_path:
+                out_path.unlink(missing_ok=True)   # leftover from an earlier attempt
             if self._ffmpeg_slice(file_path, start, end, out_path):
                 written.append(out_path)
-                self._log(
-                    f"    + {out_path.name}  [{ms}:{ss:02d} \u2192 {me}:{se:02d}, "
-                    f"dur {(end - start):.1f}s]",
-                    tag="splitter",
-                )
+                self._log(f"    + {out_path.name}  [{(end - start):.0f}s]", tag="splitter")
 
-        if written:
+        if len(written) == len(segments):
             try:
                 file_path.unlink()
-                self._log(f"  - deleted original: {file_path.name}", tag="splitter")
             except Exception as e:  # noqa: BLE001
                 self._log(f"[!] Could not delete original {file_path.name}: {e}", tag="warning")
         else:
+            # Some pieces failed, so the original is still the only complete copy
+            # of the parts that did not get written.
+            for p in written:
+                p.unlink(missing_ok=True)
             self._log(
-                f"[!] No pieces produced for {file_path.name}; original kept.",
+                f"[!] Only {len(written)}/{len(segments)} piece(s) written for "
+                f"{file_path.name}; pieces discarded and original kept.",
                 tag="warning",
             )
+            return 0
+        return len(written)
 
     def _preflight_clean(
         self,
@@ -2325,7 +2854,10 @@ class FingerprinterApp:
                 else:
                     fail += 1
                 done += 1
-                title = futures[fut].get("title", "?")
+                # See the note in _download_one: .get(key, default) doesn't
+                # fall back when the key is present with an explicit None
+                # value, which happens for extractors that leave title blank.
+                title = futures[fut].get("title") or "?"
                 tag = "OK" if success else "FAIL"
                 self._log(f"  [{done}/{total}] {tag}: {title}")
                 self._set_status(f"Downloading {done}/{total}...")
@@ -2337,7 +2869,7 @@ class FingerprinterApp:
         slot: int,
         target_folder: Path,
     ) -> bool:
-        video_url = entry.get("webpage_url") or entry.get("url") or entry.get("id", "")
+        video_url = entry.get("webpage_url") or entry.get("url") or entry.get("id") or ""
         video_url = str(video_url)
         # If the entry only gave us a bare 11-character YouTube video ID
         # (typical for flat-playlist results), build the full URL. Anything
@@ -2349,7 +2881,14 @@ class FingerprinterApp:
             video_url = f"https://www.youtube.com/watch?v={video_url}"
         elif video_url.startswith(("youtu.be/", "www.", "youtube.com/")):
             video_url = f"https://{video_url}"
-        title = entry.get("title", str(video_url))
+        # NOTE: entry.get("title", default) would NOT fall back here if the key
+        # is present with an explicit None value — which happens whenever
+        # yt-dlp printed its "NA" marker for a missing title (common on
+        # non-YouTube extractors like Mixcloud, SoundCloud, etc., where flat
+        # playlist enumeration doesn't always populate every field). `.get()`
+        # only uses its default when the key is ABSENT, not when its value is
+        # None. Using `or` instead correctly falls back in both cases.
+        title = entry.get("title") or str(video_url) or "(untitled)"
         short_title = title if len(title) <= 40 else (title[:37] + "...")
 
         self._update_slot(slot, f"{short_title} | queued")
@@ -2489,32 +3028,6 @@ class FingerprinterApp:
         return None
 
     # ------------------------- bat runner -------------------------------------
-
-    def _run_bat(self, bat_path: Path, cwd: Path) -> None:
-        try:
-            proc = subprocess.Popen(
-                ["cmd", "/c", str(bat_path)],
-                cwd=str(cwd),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                # Force UTF-8 decoding with replacement. Without this Python
-                # picks the system codepage (cp1252 on most Windows installs)
-                # which crashes on filenames containing non-Latin characters.
-                encoding="utf-8",
-                errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    self._log(f"  | {line}", tag="bat")
-            proc.wait()
-            self._log(f"[+] {bat_path.name} exited with code {proc.returncode}")
-        except FileNotFoundError as e:
-            self._log(f"[X] Could not run {bat_path.name}: {e}")
 
     # ------------------------- pklz reporting ---------------------------------
 

@@ -1,0 +1,16 @@
+{
+  "output_dir": "C:/fingerprints/download",
+  "bat_dir": "C:/fingerprints/Fingerprinter",
+  "move_pklz_dir": "",
+  "extra_args": "",
+  "filename_template": "%(title)s [%(id)s].%(ext)s",
+  "parallel": 10,
+  "verbose": false,
+  "open_folder": true,
+  "split_long": true,
+  "open_pklz": true,
+  "batch_size": 1000,
+  "fp_concurrency": 4,
+  "fp_ncores": 1,
+  "queue": []
+}
