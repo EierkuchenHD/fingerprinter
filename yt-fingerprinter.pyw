@@ -147,7 +147,7 @@ def save_config(cfg: dict) -> None:
 # step, so it is one constant and the rest are derived from it. It replaced a
 # ceiling of 5:00 with a minimum gap of 90s between silence-aligned cuts, which
 # could leave pieces a minute and a half long; audfprint has less to work with
-# the shorter a piece is, and the moxser corpus is cut to this same floor.
+# the shorter a piece is, so six minutes is the floor used throughout.
 SPLIT_MIN_CHUNK = 6 * 60
 
 # The nominal body of a segment. Equal to the floor: a full body already clears
@@ -200,8 +200,16 @@ class FingerprinterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("YouTube Channel Fingerprinter")
-        self.root.geometry("1100x780")
-        self.root.minsize(900, 480)
+        # Sized against the actual screen rather than a fixed guess. The
+        # step-by-step layout carries an explanation line under most controls,
+        # which is worth roughly 170px of height over the old dense version; at
+        # a hardcoded 780 the log box at the bottom got squeezed to nothing.
+        # Clamped so a laptop at 1366x768 still gets a usable window instead of
+        # one running off the bottom of the screen.
+        want_w = min(1100, max(900, self.root.winfo_screenwidth() - 80))
+        want_h = min(900, max(560, self.root.winfo_screenheight() - 70))
+        self.root.geometry(f"{want_w}x{want_h}")
+        self.root.minsize(900, 560)
 
         self.log_queue: queue.Queue[tuple[str, str, str | None]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
@@ -224,69 +232,107 @@ class FingerprinterApp:
 
         self._build_ui()
         self._apply_config(load_config())
+        # First run, or a config that predates this: the program already knows
+        # where it lives, and audfprint sits next to it, so fill that in rather
+        # than presenting an empty box the user has to guess at (and then
+        # refusing to start until they do).
+        if not self.bat_dir_var.get().strip():
+            self.bat_dir_var.set(str(Path(__file__).resolve().parent))
         self._poll_log_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------- UI ---------------------------------------------
+    #
+    # The people who use this are not necessarily technical, so the window is
+    # laid out as the three things you actually do, in that order, and every
+    # control that has a sensible default is folded away behind "Advanced
+    # settings" instead of competing for attention with the ones that matter.
+    # Each field carries a plain-language line underneath saying what it is
+    # for; that is deliberately visible text rather than a tooltip, because a
+    # tooltip only helps someone who already suspects there is something to
+    # hover over.
+
+    HELP_FONT = ("Segoe UI", 8)
+    HELP_GREY = "#5f6b7a"
+    HELP_WARN = "#b02a37"
+
+    def _help(
+        self, parent: tk.Misc, text: str,
+        colour: str | None = None, wrap: int = 980,
+    ) -> ttk.Label:
+        """One small grey explanation line, to sit under the control it explains."""
+        return ttk.Label(
+            parent, text=text, font=self.HELP_FONT,
+            foreground=colour or self.HELP_GREY,
+            wraplength=wrap, justify="left",
+        )
+
+    def _folder_row(
+        self, parent: ttk.Frame, row: int, label: str,
+        var: tk.StringVar, help_text: str,
+    ) -> ttk.Label:
+        """Label + entry + Browse, with an explanation line beneath it.
+
+        Returns the explanation label so callers can keep a reference and
+        rewrite it later (the fingerprints folder does this to warn when it is
+        needed but empty)."""
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", padx=4, pady=(6, 0),
+        )
+        ttk.Entry(parent, textvariable=var).grid(
+            row=row, column=1, sticky="we", padx=4, pady=(6, 0),
+        )
+        ttk.Button(
+            parent, text="Browse...", command=lambda: self._browse(var),
+        ).grid(row=row, column=2, padx=4, pady=(6, 0))
+        hint = self._help(parent, help_text)
+        hint.grid(row=row + 1, column=1, columnspan=2, sticky="w", padx=4, pady=(1, 2))
+        return hint
 
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 4}
 
-        # ---- Source -------------------------------------------------------
-        src = ttk.LabelFrame(self.root, text="Source")
+        # ---- Step 1: what to fingerprint ----------------------------------
+        src = ttk.LabelFrame(self.root, text="  Step 1   What do you want to fingerprint?  ")
         src.pack(fill="x", **pad)
 
-        ttk.Label(src, text="YouTube URL (channel/playlist):").grid(
-            row=0, column=0, sticky="w", padx=4, pady=4,
-        )
+        top = ttk.Frame(src)
+        top.pack(fill="x", padx=4, pady=(6, 0))
+        ttk.Label(top, text="Link:").pack(side="left", padx=(0, 4))
         self.url_var = tk.StringVar()
         # Cap input at 200 chars. Pasting tens of thousands of characters
         # froze the GUI on the main thread; legitimate URLs (even with
         # playlist + tracking params) stay well under this limit.
-        url_validator = self.root.register(
-            lambda s: len(s) <= 200,
-        )
+        url_validator = self.root.register(lambda s: len(s) <= 200)
         self.url_combo = ttk.Combobox(
-            src, textvariable=self.url_var, values=load_recent_urls(),
+            top, textvariable=self.url_var, values=load_recent_urls(),
             validate="key", validatecommand=(url_validator, "%P"),
         )
-        self.url_combo.grid(row=0, column=1, sticky="we", padx=4, pady=4)
+        self.url_combo.pack(side="left", fill="x", expand=True, padx=(0, 4))
         self.add_queue_btn = ttk.Button(
-            src, text="Add to queue", command=self._add_to_queue,
+            top, text="Add to list", command=self._add_to_queue,
         )
-        self.add_queue_btn.grid(row=0, column=2, padx=4)
-        # Enter in the URL field adds to the queue too.
+        self.add_queue_btn.pack(side="left")
+        # Enter in the URL field adds to the list too.
         self.url_combo.bind("<Return>", lambda _e: self._add_to_queue())
 
-        ttk.Label(src, text="Output directory:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
-        self.output_dir_var = tk.StringVar()
-        ttk.Entry(src, textvariable=self.output_dir_var).grid(row=1, column=1, sticky="we", padx=4, pady=4)
-        ttk.Button(src, text="Browse...", command=lambda: self._browse(self.output_dir_var)).grid(row=1, column=2, padx=4)
+        self._help(
+            src,
+            "A YouTube channel or playlist, or an archive.org page. Press Add to "
+            "list (or hit Enter). Add as many as you like — they are worked "
+            "through from top to bottom.",
+        ).pack(anchor="w", padx=8, pady=(2, 4))
 
-        ttk.Label(src, text="Fingerprinter directory:").grid(row=2, column=0, sticky="w", padx=4, pady=4)
-        self.bat_dir_var = tk.StringVar()
-        ttk.Entry(src, textvariable=self.bat_dir_var).grid(row=2, column=1, sticky="we", padx=4, pady=4)
-        ttk.Button(src, text="Browse...", command=lambda: self._browse(self.bat_dir_var)).grid(row=2, column=2, padx=4)
+        ttk.Label(src, text="Your list:").pack(anchor="w", padx=8, pady=(2, 0))
 
-        ttk.Label(src, text="Move pklzs to (optional):").grid(row=3, column=0, sticky="w", padx=4, pady=4)
-        self.move_pklz_dir_var = tk.StringVar()
-        ttk.Entry(src, textvariable=self.move_pklz_dir_var).grid(row=3, column=1, sticky="we", padx=4, pady=4)
-        ttk.Button(src, text="Browse...", command=lambda: self._browse(self.move_pklz_dir_var)).grid(row=3, column=2, padx=4)
-
-        src.columnconfigure(1, weight=1)
-
-        # ---- Queue --------------------------------------------------------
-        queue_box = ttk.LabelFrame(self.root, text="Channel queue")
-        queue_box.pack(fill="x", **pad)
-
-        q_inner = ttk.Frame(queue_box)
-        q_inner.pack(fill="x", padx=4, pady=4)
+        q_inner = ttk.Frame(src)
+        q_inner.pack(fill="x", padx=4, pady=(2, 6))
 
         # Scrollable frame of checkbox rows (one per queued URL). The Listbox
         # widget can't host checkboxes, so we build rows manually in a canvas.
         q_list_frame = ttk.Frame(q_inner)
         q_list_frame.pack(side="left", fill="both", expand=True)
-        self.queue_canvas = tk.Canvas(q_list_frame, height=96, highlightthickness=0)
+        self.queue_canvas = tk.Canvas(q_list_frame, height=72, highlightthickness=0)
         q_scroll = ttk.Scrollbar(
             q_list_frame, orient="vertical", command=self.queue_canvas.yview,
         )
@@ -314,20 +360,20 @@ class FingerprinterApp:
         self.queue_canvas.bind("<Enter>", lambda _e: self.queue_canvas.bind_all("<MouseWheel>", _q_wheel, add="+"))
         self.queue_canvas.bind("<Leave>", lambda _e: self.queue_canvas.unbind_all("<MouseWheel>"))
 
-        # Queue control buttons stacked on the right.
+        # List control buttons stacked on the right.
         q_btns = ttk.Frame(q_inner)
         q_btns.pack(side="left", fill="y", padx=(8, 0))
         self.queue_import_btn = ttk.Button(
-            q_btns, text="Import file...", width=14, command=self._import_queue_from_file,
+            q_btns, text="Import from file...", width=18, command=self._import_queue_from_file,
         )
         self.queue_import_btn.pack(fill="x", pady=1)
-        self.queue_remove_btn = ttk.Button(q_btns, text="Remove checked", width=14, command=self._queue_remove)
+        self.queue_remove_btn = ttk.Button(q_btns, text="Remove ticked", width=18, command=self._queue_remove)
         self.queue_remove_btn.pack(fill="x", pady=1)
-        self.queue_up_btn = ttk.Button(q_btns, text="Move up", width=14, command=lambda: self._queue_move(-1))
+        self.queue_up_btn = ttk.Button(q_btns, text="Move up", width=18, command=lambda: self._queue_move(-1))
         self.queue_up_btn.pack(fill="x", pady=1)
-        self.queue_down_btn = ttk.Button(q_btns, text="Move down", width=14, command=lambda: self._queue_move(1))
+        self.queue_down_btn = ttk.Button(q_btns, text="Move down", width=18, command=lambda: self._queue_move(1))
         self.queue_down_btn.pack(fill="x", pady=1)
-        self.queue_clear_btn = ttk.Button(q_btns, text="Clear all", width=14, command=self._queue_clear)
+        self.queue_clear_btn = ttk.Button(q_btns, text="Clear the list", width=18, command=self._queue_clear)
         self.queue_clear_btn.pack(fill="x", pady=1)
 
         # Backing state. queue_urls holds the URLs; queue_checks holds a
@@ -337,29 +383,109 @@ class FingerprinterApp:
         self.queue_checks: list[tk.BooleanVar] = []
         self.queue_active: int | None = None
 
-        # ---- Options (one labelled box, three rows) -----------------------
-        opts = ttk.LabelFrame(self.root, text="Options")
-        opts.pack(fill="x", **pad)
+        # ---- Step 2: where things go --------------------------------------
+        dirs = ttk.LabelFrame(self.root, text="  Step 2   Where should the files go?  ")
+        dirs.pack(fill="x", **pad)
 
-        # Row 1: parallel downloads
-        opts_r1 = ttk.Frame(opts)
-        opts_r1.pack(fill="x", padx=4, pady=(4, 2))
-        ttk.Label(opts_r1, text="Parallel downloads:").pack(side="left", padx=(0, 4))
+        self.output_dir_var = tk.StringVar()
+        self.bat_dir_var = tk.StringVar()
+        self.move_pklz_dir_var = tk.StringVar()
+
+        self._folder_row(
+            dirs, 0, "Working folder for audio:", self.output_dir_var,
+            "Audio is downloaded here while it works — and deleted again once a "
+            "link has been fingerprinted. Nothing you want to keep should live here.",
+        )
+        self._folder_row(
+            dirs, 2, "This program's folder:", self.bat_dir_var,
+            "The folder holding this program and audfprint. Filled in for you; "
+            "change it only if you moved things around.",
+        )
+        self.move_hint = self._folder_row(
+            dirs, 4, "Keep finished fingerprints in:", self.move_pklz_dir_var,
+            "Where your finished .pklz files are collected.",
+        )
+        dirs.columnconfigure(1, weight=1)
+
+        # The hint above turns into a warning when the list holds more than one
+        # link and no destination is set, because that is the case where the
+        # results of every link but the last are quietly thrown away.
+        self.move_pklz_dir_var.trace_add("write", lambda *_a: self._update_move_hint())
+
+        # ---- Step 3: go ----------------------------------------------------
+        go = ttk.LabelFrame(self.root, text="  Step 3   Start  ")
+        go.pack(fill="x", **pad)
+
+        btns = ttk.Frame(go)
+        btns.pack(fill="x", padx=4, pady=(6, 0))
+        self.start_btn = ttk.Button(btns, text="Download and fingerprint", command=self._start)
+        self.start_btn.pack(side="left", padx=(0, 4))
+        self.bats_btn = ttk.Button(
+            btns, text="Split + fingerprint files I already have",
+            command=self._start_bats_only,
+        )
+        self.bats_btn.pack(side="left", padx=4)
+        self.skip_btn = ttk.Button(btns, text="Skip this link", command=self._skip_current, state="disabled")
+        self.skip_btn.pack(side="left", padx=4)
+        self.cancel_btn = ttk.Button(btns, text="Stop", command=self._cancel, state="disabled")
+        self.cancel_btn.pack(side="left", padx=4)
+        # Diagnostic rather than part of the run — pushed right, visually apart.
+        self.test_btn = ttk.Button(btns, text="Check my setup", command=self._start_test_connection)
+        self.test_btn.pack(side="right", padx=(4, 0))
+
+        self._help(
+            go,
+            "Download and fingerprint does the whole job for every ticked link. "
+            "Use Split + fingerprint instead when the audio is already in the "
+            "working folder and only needs processing. Not sure everything is "
+            "installed? Press Check my setup.",
+        ).pack(anchor="w", padx=8, pady=(3, 6))
+
+        # ---- Advanced (folded away) ----------------------------------------
+        self.adv_holder = ttk.Frame(self.root)
+        self.adv_holder.pack(fill="x", padx=8, pady=(2, 0))
+        self.adv_open = False
+        self.adv_btn = ttk.Button(
+            self.adv_holder, text="▸  Advanced settings",
+            width=24, command=self._toggle_advanced,
+        )
+        self.adv_btn.pack(side="left")
+        self._help(
+            self.adv_holder,
+            "Everything here already has a sensible default.",
+        ).pack(side="left", padx=8)
+
+        # Advanced settings get their own small window instead of folding out
+        # inside the main one. Expanding them inline pushed the progress panel,
+        # the log and the status bar off the bottom of the screen, and the log
+        # is the thing you actually watch while it runs. The window is built
+        # once and only hidden, never destroyed, so every widget reference in
+        # here stays valid for the code that disables these controls mid-run.
+        self.adv_win = tk.Toplevel(self.root)
+        self.adv_win.title("Advanced settings")
+        self.adv_win.transient(self.root)
+        self.adv_win.resizable(False, False)
+        self.adv_win.protocol("WM_DELETE_WINDOW", self._hide_advanced)
+        self.adv_win.withdraw()
+        self.adv_frame = ttk.Frame(self.adv_win)
+        self.adv_frame.pack(fill="both", expand=True)
+
+        # Row 1: how hard to work the machine
+        opts_r1 = ttk.Frame(self.adv_frame)
+        opts_r1.pack(fill="x", padx=4, pady=(6, 2))
+        ttk.Label(opts_r1, text="Downloads at once:").pack(side="left", padx=(0, 4))
         self.parallel_var = tk.IntVar(value=4)
         self.parallel_spin = ttk.Spinbox(
             opts_r1, from_=1, to=16, textvariable=self.parallel_var, width=5,
         )
         self.parallel_spin.pack(side="left")
 
-        # Fingerprinting controls, on the same row as parallel downloads since
-        # they are the other half of "how hard should this work the machine".
-        #
         # Concurrent batches is the one that matters. Measured here: the old
         # single sequential audfprint did 32 files in 117s; eight concurrent
         # batches did the same 32 in 28s. It is capped rather than opened up
         # because a 1000-file batch peaks around 5.5 GB, so 4 is roughly 22 GB
         # of this box's 64 GB and leaves room for everything else running.
-        ttk.Label(opts_r1, text="   Concurrent batches:").pack(side="left", padx=(12, 4))
+        ttk.Label(opts_r1, text="   Fingerprint jobs at once:").pack(side="left", padx=(12, 4))
         self.fp_concurrency_var = tk.IntVar(value=4)
         self.fp_concurrency_spin = ttk.Spinbox(
             opts_r1, from_=1, to=16, textvariable=self.fp_concurrency_var, width=5,
@@ -370,7 +496,7 @@ class FingerprinterApp:
         # one file list across processes and merges their hash tables back
         # serially, which stopped paying off past 8 and got slower at 16, and it
         # multiplies against the batch concurrency above.
-        ttk.Label(opts_r1, text="   audfprint cores:").pack(side="left", padx=(12, 4))
+        ttk.Label(opts_r1, text="   Cores per job:").pack(side="left", padx=(12, 4))
         self.fp_ncores_var = tk.IntVar(value=1)
         self.fp_ncores_spin = ttk.Spinbox(
             opts_r1, from_=1, to=16, textvariable=self.fp_ncores_var, width=5,
@@ -380,7 +506,7 @@ class FingerprinterApp:
         # Files per .pklz. Bigger means fewer, larger shards, which matters
         # downstream: a matcher reloads every .pklz on every run, so hundreds of
         # small ones pay that cost hundreds of times.
-        ttk.Label(opts_r1, text="   Files per pklz:").pack(side="left", padx=(12, 4))
+        ttk.Label(opts_r1, text="   Recordings per file:").pack(side="left", padx=(12, 4))
         self.batch_size_var = tk.IntVar(value=1000)
         self.batch_size_spin = ttk.Spinbox(
             opts_r1, from_=50, to=5000, increment=50,
@@ -388,64 +514,79 @@ class FingerprinterApp:
         )
         self.batch_size_spin.pack(side="left")
 
+        self._help(
+            self.adv_frame,
+            "Raise the first two to use more of the machine; lower them if "
+            "downloads start failing or memory runs short. Cores per job is best "
+            "left at 1 — running more jobs at once is faster than splitting one "
+            "job across cores.",
+        ).pack(anchor="w", padx=8, pady=(0, 4))
+
         # Row 2: behavioural checkboxes
-        opts_r2 = ttk.Frame(opts)
+        opts_r2 = ttk.Frame(self.adv_frame)
         opts_r2.pack(fill="x", padx=4, pady=2)
         self.verbose_var = tk.BooleanVar(value=True)
         self.open_folder_var = tk.BooleanVar(value=True)
         self.open_pklz_var = tk.BooleanVar(value=True)
         self.split_long_var = tk.BooleanVar(value=True)
         for label, var in (
-            ("Verbose yt-dlp output", self.verbose_var),
-            ("Open channel subfolder on start", self.open_folder_var),
-            ("Open pklz-files folder when done", self.open_pklz_var),
-            ("Split into pieces of at least 6:00", self.split_long_var),
+            ("Split anything over 12 minutes into pieces (recommended)", self.split_long_var),
+            ("Show every line of download output", self.verbose_var),
+            ("Open the audio folder when a link starts", self.open_folder_var),
+            ("Open the results folder when it finishes", self.open_pklz_var),
         ):
-            ttk.Checkbutton(opts_r2, text=label, variable=var).pack(side="left", padx=(0, 14))
+            ttk.Checkbutton(opts_r2, text=label, variable=var).pack(anchor="w", pady=1)
+
+        self._help(
+            self.adv_frame,
+            "Splitting matters more than it sounds: a match against a three-hour "
+            "mix only tells you it is somewhere in three hours, while a match "
+            "against a 6-minute piece points straight at it.",
+        ).pack(anchor="w", padx=8, pady=(0, 4))
 
         # Row 3: filename template
-        opts_r3 = ttk.Frame(opts)
-        opts_r3.pack(fill="x", padx=4, pady=(2, 2))
-        ttk.Label(opts_r3, text="Filename template:").pack(side="left", padx=(0, 4))
-        self.filename_template_var = tk.StringVar(
-            value="%(title)s [%(id)s].%(ext)s",
-        )
+        opts_r3 = ttk.Frame(self.adv_frame)
+        opts_r3.pack(fill="x", padx=4, pady=(2, 0))
+        ttk.Label(opts_r3, text="Name downloaded files:").pack(side="left", padx=(0, 4))
+        self.filename_template_var = tk.StringVar(value="%(title)s [%(id)s].%(ext)s")
         self.filename_template_entry = ttk.Entry(
             opts_r3, textvariable=self.filename_template_var,
         )
         self.filename_template_entry.pack(side="left", fill="x", expand=True)
+        self._help(
+            self.adv_frame,
+            "yt-dlp naming. The default gives “Title [videoid].m4a”. "
+            "Safe to ignore.",
+        ).pack(anchor="w", padx=8, pady=(1, 4))
 
-        # Row 4: extra yt-dlp args (own row, full width)
-        opts_r4 = ttk.Frame(opts)
-        opts_r4.pack(fill="x", padx=4, pady=(2, 4))
-        ttk.Label(opts_r4, text="Extra yt-dlp args:").pack(side="left", padx=(0, 4))
+        # Row 4: extra yt-dlp args
+        opts_r4 = ttk.Frame(self.adv_frame)
+        opts_r4.pack(fill="x", padx=4, pady=(2, 0))
+        ttk.Label(opts_r4, text="Extra download options:").pack(side="left", padx=(0, 4))
         self.extra_args_var = tk.StringVar(value="")
         self.extra_args_entry = ttk.Entry(opts_r4, textvariable=self.extra_args_var)
         self.extra_args_entry.pack(side="left", fill="x", expand=True)
+        self._help(
+            self.adv_frame,
+            "Passed straight to yt-dlp. For videos that need you signed in, try "
+            "--cookies-from-browser firefox (or chrome, edge, brave), with that "
+            "browser closed.",
+        ).pack(anchor="w", padx=8, pady=(1, 6))
 
-        # ---- Action buttons (run controls left, diagnostic right) ---------
-        btns = ttk.Frame(self.root)
-        btns.pack(fill="x", **pad)
-        self.start_btn = ttk.Button(btns, text="Start queue", command=self._start)
-        self.start_btn.pack(side="left", padx=(0, 4))
-        self.bats_btn = ttk.Button(btns, text="Split + Fingerprint", command=self._start_bats_only)
-        self.bats_btn.pack(side="left", padx=4)
-        self.skip_btn = ttk.Button(btns, text="Skip current", command=self._skip_current, state="disabled")
-        self.skip_btn.pack(side="left", padx=4)
-        self.cancel_btn = ttk.Button(btns, text="Cancel", command=self._cancel, state="disabled")
-        self.cancel_btn.pack(side="left", padx=4)
-        # Test Connection is diagnostic — push to the right so it's visually separate.
-        self.test_btn = ttk.Button(btns, text="Test Connection", command=self._start_test_connection)
-        self.test_btn.pack(side="right", padx=(4, 0))
+        # An explicit way out, so the window does not rely on the title-bar X.
+        # Changes take effect immediately; there is nothing to apply or cancel.
+        adv_close = ttk.Frame(self.adv_frame)
+        adv_close.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(adv_close, text="Close", command=self._hide_advanced).pack(side="right")
 
-        # ---- Active downloads (fixed-height, scrollable) ------------------
-        active_box = ttk.LabelFrame(self.root, text="Active downloads")
+        # ---- Progress ------------------------------------------------------
+        active_box = ttk.LabelFrame(self.root, text="  Downloading now  ")
         active_box.pack(fill="x", **pad)
 
         # A fixed-height canvas holds the slot rows. With many parallel
         # downloads (up to 16) the rows scroll inside this fixed area instead
         # of stretching the panel and squashing the log box.
-        active_canvas = tk.Canvas(active_box, height=96, highlightthickness=0)
+        active_canvas = tk.Canvas(active_box, height=60, highlightthickness=0)
         active_scroll = ttk.Scrollbar(
             active_box, orient="vertical", command=active_canvas.yview,
         )
@@ -479,29 +620,33 @@ class FingerprinterApp:
         self.slot_vars: list[tk.StringVar] = []
         # placeholder line so the frame doesn't collapse before a run
         self._slot_placeholder = ttk.Label(
-            self.active_frame, text="(no active downloads)", foreground="grey",
+            self.active_frame, text="Nothing downloading yet.", foreground="grey",
         )
         self._slot_placeholder.pack(anchor="w")
 
         # ---- Log -----------------------------------------------------------
         log_header = ttk.Frame(self.root)
         log_header.pack(fill="x", padx=8, pady=(4, 0))
-        ttk.Label(log_header, text="Log").pack(side="left")
+        ttk.Label(log_header, text="What it is doing").pack(side="left")
 
         # Pack the bottom-anchored widgets FIRST (status bar, then log buttons)
         # using side="bottom". Tk reserves their space before the expanding log,
         # so on small screens the log shrinks instead of pushing them off-screen.
-        self.status_var = tk.StringVar(value="Idle.")
+        self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(
             self.root, textvariable=self.status_var, relief="sunken", anchor="w",
         ).pack(side="bottom", fill="x")
 
         log_btns = ttk.Frame(self.root)
         log_btns.pack(side="bottom", fill="x", padx=8, pady=(0, 4))
-        self.clear_btn = ttk.Button(log_btns, text="Clear log", command=self._clear_log)
+        self.clear_btn = ttk.Button(log_btns, text="Clear", command=self._clear_log)
         self.clear_btn.pack(side="left", padx=(0, 4))
-        self.copy_btn = ttk.Button(log_btns, text="Copy Log", command=self._copy_log)
+        self.copy_btn = ttk.Button(log_btns, text="Copy", command=self._copy_log)
         self.copy_btn.pack(side="left", padx=4)
+        self._help(
+            log_btns,
+            "Copy this and include it if you need to ask someone for help.",
+        ).pack(side="left", padx=8)
 
         # The log fills whatever vertical space is left between the top widgets
         # and the bottom-pinned buttons/status bar. A minimum height keeps it
@@ -514,6 +659,53 @@ class FingerprinterApp:
         self.log_text.tag_configure("warning", foreground="#c0392b")
         self.log_text.tag_configure("splitter", foreground="#16a085")
         self.log_text.tag_configure("ts", foreground="#888888")
+
+        self._update_move_hint()
+
+    def _toggle_advanced(self) -> None:
+        (self._hide_advanced if self.adv_open else self._show_advanced)()
+
+    def _show_advanced(self) -> None:
+        self.adv_open = True
+        self.adv_btn.configure(text="▾  Advanced settings")
+        self.adv_win.deiconify()
+        self.adv_win.lift()
+        # Open it over the main window rather than wherever Windows feels like,
+        # so it reads as belonging to the button that opened it.
+        self.root.update_idletasks()
+        self.adv_win.geometry(
+            f"+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 120}"
+        )
+
+    def _hide_advanced(self) -> None:
+        self.adv_open = False
+        self.adv_btn.configure(text="▸  Advanced settings")
+        self.adv_win.withdraw()
+
+    def _update_move_hint(self) -> None:
+        """Keep the fingerprints-folder line honest about whether it is needed.
+
+        With one link it genuinely is optional. With several it is not: the
+        results folder is emptied before each link, so without somewhere to
+        move them to, every link but the last is thrown away. Saying
+        "(optional)" in that situation is how people lose an overnight run."""
+        hint = getattr(self, "move_hint", None)
+        if hint is None:
+            return
+        many = len(getattr(self, "queue_urls", [])) > 1
+        if many and not self.move_pklz_dir_var.get().strip():
+            hint.configure(
+                text="Needed here — you have more than one link. The results folder "
+                     "is emptied before each one, so without a destination you "
+                     "will keep only the last link's fingerprints.",
+                foreground=self.HELP_WARN,
+            )
+        else:
+            hint.configure(
+                text="Where your finished .pklz files are collected. Optional for a "
+                     "single link; required once the list has more than one.",
+                foreground=self.HELP_GREY,
+            )
 
     def _browse(self, var: tk.StringVar) -> None:
         path = filedialog.askdirectory()
@@ -1074,6 +1266,10 @@ class FingerprinterApp:
             # Clicking the label (not the checkbox) selects the row as active.
             lbl.bind("<Button-1>", lambda _e, idx=i: self._queue_set_active(idx))
 
+        # The "keep fingerprints in" hint changes meaning as soon as there is
+        # more than one link in the list, so it is refreshed alongside it.
+        self._update_move_hint()
+
     def _queue_set_active(self, idx: int) -> None:
         self.queue_active = idx
         self._refresh_queue()
@@ -1266,10 +1462,10 @@ class FingerprinterApp:
         output_dir = self.output_dir_var.get().strip()
         bat_dir = self.bat_dir_var.get().strip()
         if not output_dir or not Path(output_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid output directory.")
+            messagebox.showerror("Missing input", "Pick a valid working folder for audio.")
             return
         if not bat_dir or not Path(bat_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid bat files directory.")
+            messagebox.showerror("Missing input", "Pick a valid program folder — the one containing audfprint.")
             return
 
         audfprint = Path(bat_dir) / "audfprint" / "audfprint.py"
@@ -1384,7 +1580,7 @@ class FingerprinterApp:
         """Skip downloads entirely; scan + fingerprint whatever is already on disk."""
         bat_dir = self.bat_dir_var.get().strip()
         if not bat_dir or not Path(bat_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid Fingerprinter directory.")
+            messagebox.showerror("Missing input", "Pick a valid program folder — the one containing audfprint.")
             return
 
         audfprint = Path(bat_dir) / "audfprint" / "audfprint.py"
@@ -1397,7 +1593,7 @@ class FingerprinterApp:
 
         source_dir = self.output_dir_var.get().strip()
         if not source_dir or not Path(source_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid output directory to scan.")
+            messagebox.showerror("Missing input", "Pick a valid working folder to scan for audio.")
             return
 
         # Says that files get rewritten, because they do: splitting replaces a
@@ -1826,7 +2022,7 @@ class FingerprinterApp:
             if (s := stopped()):
                 return s
             if ok == 0:
-                self._log("[X] No successful downloads. Aborting before bat scripts.")
+                self._log("[X] No successful downloads. Aborting before fingerprinting.")
                 return "failed"
 
             # 4. Folder stays where it was downloaded; the scan below picks it up there.
@@ -2486,10 +2682,10 @@ class FingerprinterApp:
     # ceiling, and it replaced the opposite rule: this used to cut on detected
     # silences until no piece was longer than 5:00, which meant pieces as short
     # as 90 seconds. Audfprint has less to match on the shorter a piece is, and
-    # the moxser corpus is built to the same floor, so a database fed from both
-    # now has one granularity rather than two.
+    # holding every collection to the same floor means a database fed from
+    # several sources has one granularity rather than several.
     #
-    # The arithmetic is the same as moxser-split.py's: cut at fixed
+    # The arithmetic: cut at fixed
     # SPLIT_SEGMENT boundaries, and if the last piece would come up short,
     # drop the segment count by one so the remainder joins the piece before it.
     # That final piece is then SPLIT_SEGMENT + remainder, which is over the
@@ -2527,7 +2723,7 @@ class FingerprinterApp:
 
     @staticmethod
     def _split_piece_name(base: str, start: float, end: float, ext: str) -> str:
-        """`song_split_000m-006m.m4a`, the same scheme the moxser corpus uses.
+        """`song_split_000m-006m.m4a`, naming each piece by its position.
 
         Self-describing on purpose: a bare `_1`, `_2` says nothing about which
         part of the recording it is, which matters when a match comes back

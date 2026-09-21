@@ -19,9 +19,10 @@ install some Python packages; step 3 shows exactly what to type.
 
 ![The Fingerprinter window](screenshot.png)
 
-Everything happens in this one window: paste a link at the top, adjust anything
-you want in the middle, press **Start queue**, and watch progress in the log at
-the bottom.
+The window is three numbered steps in the order you actually do them: say what
+you want fingerprinted, say where things should go, press the button. Every box
+has a line underneath explaining what it is for, and anything with a sensible
+default is tucked away under **Advanced settings** so it is not in your way.
 
 ## What is a fingerprint, and why would I want one?
 
@@ -44,18 +45,19 @@ This tool handles the tedious part: fetching the audio and producing the
 
 Neither is a bug, but both surprise people, and both can lose work.
 
-> **1. The downloaded audio is deleted when a channel finishes.**
-> The audio is treated as working material, not as a result — once a channel has
-> been fingerprinted, its download subfolder is removed to stop a long queue
+> **1. The downloaded audio is deleted when a link finishes.**
+> The audio is treated as working material, not as a result — once a link has
+> been fingerprinted, its download folder is removed to stop a long list
 > filling your disk. **The `.pklz` files are the output you keep.** If you also
 > want the audio, copy it out while the run is going, or use a separate
 > downloader.
 
-> **2. Set *Move pklzs to* before queueing more than one channel.**
-> The `pklz-files` folder is emptied before each channel is fingerprinted. With
-> a single channel that does not matter. With a queue of five it very much does:
-> without a destination to move finished fingerprints to, **you end up with only
-> the last channel's results.**
+> **2. Fill in *Keep finished fingerprints in* before adding more than one link.**
+> The results folder is emptied before each link is fingerprinted. With a single
+> link that does not matter. With a list of five it very much does: without a
+> destination to move finished fingerprints to, **you end up with only the last
+> link's results.** The program turns that line red to remind you, and asks
+> before starting anyway.
 
 ## What you need before you start
 
@@ -129,89 +131,84 @@ pip install yt-dlp
 > as **yt-fingerprinter**. If double-clicking opens a text editor instead of the
 > program, right-click it → **Open with** → **Python**.
 
-**5. Fill in the two folder boxes.** On a first run **Output directory** and
-**Fingerprinter directory** are empty and the program will refuse to start
-until they are set. Use the **Browse...** buttons:
+**5. Set your working folder.** In **Step 2**, use **Browse...** next to
+**Working folder for audio** and pick somewhere with room to spare, for example
+`C:\fingerprints\download`. *This program's folder* fills itself in, so you can
+normally leave it alone.
 
-- **Output directory** — a working folder for audio, e.g. `C:\fingerprints\download`
-- **Fingerprinter directory** — the folder from step 1, the one containing `audfprint\`
-
-From then on your settings are remembered: the program writes a `config.json`
-when you close it and reads it back next time. (`config.example.json` in this
+Everything is remembered from then on: the program writes a `config.json` when
+you close it and reads it back next time. (`config.example.json` in this
 repository shows what that file looks like.)
 
 ## Using it
 
 ### The short version
 
-1. Paste a channel or playlist URL into **YouTube URL**.
-2. Press **Add to queue**.
-3. If you are queueing more than one channel, set **Move pklzs to** — see the
-   warning above.
-4. Click **Start queue** and watch the log at the bottom.
+1. **Step 1** — paste a link and press **Add to list**.
+2. **Step 2** — check the folders. If your list has more than one link, fill in
+   **Keep finished fingerprints in**.
+3. **Step 3** — press **Download and fingerprint**, and watch *What it is doing*
+   at the bottom.
 
-**Start queue does not stop to ask you anything.** It lists the channel, prints
-a size and estimated download time to the log, and begins. Read those numbers
-as they appear, and press **Cancel** if they are larger than you bargained for.
+**It does not stop to ask you anything.** It lists the link, prints a size and
+an estimated download time to the log, and gets going. Read those numbers as
+they appear, and press **Stop** if they are bigger than you bargained for.
 
-When it finishes, your `.pklz` files are in `pklz-files` inside the Fingerprinter
-directory (or wherever **Move pklzs to** points), and that folder opens for you.
+When it finishes, your `.pklz` files are wherever **Keep finished fingerprints
+in** points (or in the `pklz-files` folder), and that folder opens for you.
 
-### The buttons
+### The buttons in Step 3
 
-**Start queue** — the full job: download, cut, fingerprint, then delete the
-downloaded audio. This is the one you want almost always.
+**Download and fingerprint** — the whole job for every ticked link: download,
+cut, fingerprint, then delete the downloaded audio. This is the one you want
+almost always.
 
-**Split + Fingerprint** — skips downloading and works on audio already sitting
-in the output directory. Use it for audio of your own, or to pick up after a
-crash. It is also the gentler of the two: it does *not* clear `pklz-files`, so
-fingerprints you already have survive.
+**Split + fingerprint files I already have** — skips downloading and works on
+audio already sitting in your working folder. Use it for audio of your own, or
+to pick up after a crash. It is also the gentler of the two: it does *not*
+clear the results folder, so fingerprints you already have survive.
 
-**Skip current** — moves on to the next queue item. It takes effect between
-stages rather than instantly, so a download already in flight finishes first.
+**Skip this link** — moves on to the next one in the list. It takes effect
+between stages rather than instantly, so a download already in flight finishes
+first.
 
-**Cancel** — stops everything.
+**Stop** — stops everything.
 
-**Test Connection** — the thing to press when something seems wrong. It checks
+**Check my setup** — the thing to press when something seems wrong. It checks
 Python, ffmpeg, ffprobe, node, yt-dlp and audfprint, plus free disk space and
-whether the output directory is writable. Note it also runs `yt-dlp -U`, which
+whether your working folder is writable. Note it also runs `yt-dlp -U`, which
 tries to **update yt-dlp over the internet** and can take up to 90 seconds.
 
-### Doing several channels in one go
+### Doing several links in one go
 
-The **Channel queue** takes a list. **Add to queue** adds whatever is in the URL
-box; **Import file...** reads a plain text file with one URL per line. Reorder
-with **Move up** / **Move down**, tidy up with **Remove checked** or **Clear
-all**, then press **Start queue**. It works from top to bottom, and the queue is
-saved when you close the program, so an interrupted batch is still there in the
-morning.
+**Your list** in Step 1 holds as many as you like. **Add to list** adds whatever
+is in the Link box; **Import from file...** reads a plain text file with one URL
+per line. Reorder with **Move up** / **Move down**, tidy up with **Remove
+ticked** or **Clear the list**, then press **Download and fingerprint**. It
+works from top to bottom, and the list is saved when you close the program, so
+an interrupted batch is still there in the morning.
 
-**Set *Move pklzs to* first.** Without it you keep only the last channel.
+Untick a row to leave it in the list but skip it this time.
 
-## The settings, explained
+## Advanced settings
 
-The defaults are sensible. Change things only if you have a reason.
+The **Advanced settings** button opens a separate little window. Nothing in it
+needs changing to get a good result.
+
+![The Advanced settings window](screenshot-advanced.png)
 
 | Setting | What it does |
 |---|---|
-| **Output directory** | Working folder for downloaded audio. Each channel gets a subfolder, **which is deleted once that channel is fingerprinted.** |
-| **Fingerprinter directory** | The folder holding this program and `audfprint\`. Blank until you set it. |
-| **Move pklzs to (optional)** | Where finished `.pklz` files are moved. Optional for one channel; **necessary for a queue**, since `pklz-files` is emptied before each one. |
-| **Parallel downloads** (default 4) | How many downloads run at once. Raise it on a fast connection; lower it if downloads start failing. |
-| **Concurrent batches** (default 4) | How many fingerprinting jobs run side by side. |
-| **audfprint cores** (default 1) | Leave at 1. audfprint's own multi-core mode is slower in practice than running more batches at once — which is what *Concurrent batches* does. |
-| **Files per pklz** (default 1000) | How many recordings go into one fingerprint file. Keep it high: a matching tool reloads *every* `.pklz` each time it runs, so many small ones make every future search slower. |
-| **Filename template** | How files are named, in [yt-dlp's output notation](https://github.com/yt-dlp/yt-dlp#output-template). The default gives `Title [videoid].m4a` — or `.opus`, depending on what the site offers. Safe to ignore. |
-| **Extra yt-dlp args** | Passed straight to yt-dlp. Usually empty — see *Private or age-restricted videos*. |
-
-And the four tickboxes:
-
-| Tickbox | What it does |
-|---|---|
-| **Verbose yt-dlp output** | Shows every line yt-dlp prints. Useful when diagnosing a failure, noisy otherwise. |
-| **Open channel subfolder on start** | Opens the download folder so you can watch files arrive. |
-| **Open pklz-files folder when done** | Opens the results folder at the end. |
-| **Split into pieces of at least 6:00** | **Keep this ticked.** Explained just below. |
+| **Downloads at once** (4) | How many downloads run in parallel. Raise it on a fast connection; lower it if downloads start failing. |
+| **Fingerprint jobs at once** (4) | How many fingerprinting jobs run side by side. The main speed control once downloading is done. |
+| **Cores per job** (1) | Best left at 1. audfprint's own multi-core mode is slower in practice than simply running more jobs at once. |
+| **Recordings per file** (1000) | How many recordings go into one `.pklz`. Keep it high: a matching tool reloads *every* `.pklz` each time it runs, so many small ones make every future search slower. |
+| **Split anything over 12 minutes** (on) | **Leave this on.** Explained below. |
+| **Show every line of download output** | Useful when diagnosing a failure, noisy otherwise. |
+| **Open the audio folder when a link starts** | Opens it so you can watch files arrive. |
+| **Open the results folder when it finishes** | Opens your fingerprints at the end. |
+| **Name downloaded files** | yt-dlp [output notation](https://github.com/yt-dlp/yt-dlp#output-template). The default gives `Title [videoid].m4a` — or `.opus`, depending on what the site offers. Safe to ignore. |
+| **Extra download options** | Passed straight to yt-dlp. Usually empty — see *Private or age-restricted videos*. |
 
 ### Why the splitting matters
 
@@ -229,25 +226,24 @@ it takes seconds rather than minutes.
 
 ## Where everything ends up
 
-Inside your Fingerprinter directory:
+Inside the program's own folder:
 
-- **`pklz-files\`** — your results, unless **Move pklzs to** is set.
+- **`pklz-files\`** — your results, unless *Keep finished fingerprints in* is set.
 - **`texts\`** — working lists written for audfprint. Housekeeping.
 - **`logs\`** — a record of each run, worth keeping if you need to ask for help.
 
 Once the downloading stage is done, these are cleared before fingerprinting
-begins — `texts\` and `pklz-files\` for **Start queue**, only `texts\` for
-**Split + Fingerprint**.
+begins — `texts\` and `pklz-files\` for **Download and fingerprint**, only
+`texts\` for **Split + fingerprint files I already have**.
 
 > If they are not already empty you get a prompt first — **but that prompt
 > answers itself with "yes, delete" after two minutes** if nobody is at the
-> keyboard, so an unattended queue is never blocked by it. Move anything you
-> want to keep out of the way before starting, rather than relying on the
-> prompt.
+> keyboard, so an unattended list is never blocked by it. Move anything you want
+> to keep out of the way before starting, rather than relying on the prompt.
 
 ## If something goes wrong
 
-**Press *Test Connection* first.** It checks each requirement in turn and names
+**Press *Check my setup* first.** It checks each requirement in turn and names
 whichever is missing, which usually answers the question on its own.
 
 | Problem | What is going on |
@@ -255,15 +251,16 @@ whichever is missing, which usually answers the question on its own.
 | *"'pip' is not recognized"* | Python was installed without **Add Python to PATH**. Re-run its installer → **Modify** → tick the box. |
 | *"Could not find audfprint\audfprint.py"* | audfprint is missing, or one folder too deep — see the warning in step 2. |
 | *"ffmpeg is not recognized"* | ffmpeg is not on PATH, or `C:\ffmpeg\bin` does not really exist because of the versioned folder. See *What you need*. |
-| Downloads fail, or nothing downloads at all | Usually Node.js missing, or YouTube rate-limiting. Check node in *Test Connection*, then lower **Parallel downloads**. |
+| Downloads fail, or nothing downloads at all | Usually Node.js missing, or YouTube rate-limiting. Check node in *Check my setup*, then lower **Downloads at once**. |
 | Some videos are skipped | Members-only, private, or region-blocked. See below. |
-| A queue produced far fewer results than expected | **Move pklzs to** was not set, so each channel overwrote the previous one. |
-| My downloaded audio vanished | Expected — it is deleted once a channel is fingerprinted. See the warnings near the top. |
-| A run seems frozen | Big channels take a while to list before anything visible happens. Tick **Verbose yt-dlp output** to confirm it is still working. |
+| A list produced far fewer results than expected | *Keep finished fingerprints in* was empty, so each link overwrote the previous one. |
+| My downloaded audio vanished | Expected — it is deleted once a link is fingerprinted. See the warnings near the top. |
+| A run seems frozen | Big channels take a while to list before anything visible happens. Turn on **Show every line of download output** to confirm it is still working. |
 
 ### Private or age-restricted videos
 
-If videos need you to be signed in, put this in **Extra yt-dlp args**:
+If videos need you to be signed in, put this in **Extra download options** under
+Advanced settings:
 
 ```
 --cookies-from-browser firefox
@@ -282,14 +279,14 @@ browser profile, and it fails with a "file not found" error mentioning
 
 - **Audio is never re-encoded.** It is downloaded in its original form and
   split by copying, so quality is exactly what the site served.
-- **Nothing pops up while it works.** The helper programs it runs, and the
-  ones audfprint runs in turn, are all started hidden, so a long run does
-  not flicker black windows across your screen.
-- **Closing the window saves your settings**, including the queue.
+- **Nothing pops up while it works.** The helper programs it runs, and the ones
+  audfprint runs in turn, are all started hidden, so a long run does not
+  flicker black windows across your screen.
+- **Closing the window saves your settings**, including your list.
 - **It does not fingerprint the same batch twice.** Finished work is recorded in
   `fingerprinted.json` beside the `.pklz` files. To resume after a crash, press
-  **Split + Fingerprint** — not **Start queue**, which clears `pklz-files` and
-  takes that record with it.
+  **Split + fingerprint files I already have** — not **Download and
+  fingerprint**, which clears the results folder and takes that record with it.
 
 ## Credits
 
