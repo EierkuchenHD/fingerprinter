@@ -148,7 +148,8 @@ repository shows what that file looks like.)
 2. **Step 2** — check the folders. If your list has more than one link, fill in
    **Keep finished fingerprints in**.
 3. **Step 3** — press **Download and fingerprint**, and watch *What it is doing*
-   at the bottom.
+   at the bottom. (Already have the audio? Use one of the *Audio already on
+   disk* buttons instead.)
 
 **It does not stop to ask you anything.** It lists the link, prints a size and
 an estimated download time to the log, and gets going. Read those numbers as
@@ -163,10 +164,19 @@ in** points (or in the `pklz-files` folder), and that folder opens for you.
 cut, fingerprint, then delete the downloaded audio. This is the one you want
 almost always.
 
-**Split + fingerprint files I already have** — skips downloading and works on
-audio already sitting in your working folder. Use it for audio of your own, or
-to pick up after a crash. It is also the gentler of the two: it does *not*
-clear the results folder, so fingerprints you already have survive.
+Under **Audio already on disk** are two buttons that both skip downloading and
+work on what is already in your working folder. Neither clears the results
+folder, so fingerprints you already have survive either one.
+
+**Split + fingerprint** — checks how long every file is and cuts anything over
+12 minutes before fingerprinting. Use it for audio of your own that has not
+been split yet.
+
+**Fingerprint only (already split)** — fingerprints the files exactly as they
+are. Use it when the audio has already been split. This is not just a matter of
+skipping the cutting: it skips the length check as well, and that check costs
+one read per file. Over a collection of several thousand pieces that is a long
+wait purely to be told there was nothing to do.
 
 **Skip this link** — moves on to the next one in the list. It takes effect
 between stages rather than instantly, so a download already in flight finishes
@@ -203,7 +213,7 @@ needs changing to get a good result.
 | **Fingerprint jobs at once** (4) | How many fingerprinting jobs run side by side. The main speed control once downloading is done. |
 | **Cores per job** (1) | Best left at 1. audfprint's own multi-core mode is slower in practice than simply running more jobs at once. |
 | **Recordings per file** (1000) | How many recordings go into one `.pklz`. Keep it high: a matching tool reloads *every* `.pklz` each time it runs, so many small ones make every future search slower. |
-| **Split anything over 12 minutes** (on) | **Leave this on.** Explained below. |
+| **Split long recordings after downloading** (on) | **Leave this on.** Applies to *Download and fingerprint*; for audio already on disk the two Step 3 buttons decide it instead. Explained below. |
 | **Show every line of download output** | Useful when diagnosing a failure, noisy otherwise. |
 | **Open the audio folder when a link starts** | Opens it so you can watch files arrive. |
 | **Open the results folder when it finishes** | Opens your fingerprints at the end. |
@@ -234,7 +244,7 @@ Inside the program's own folder:
 
 Once the downloading stage is done, these are cleared before fingerprinting
 begins — `texts\` and `pklz-files\` for **Download and fingerprint**, only
-`texts\` for **Split + fingerprint files I already have**.
+`texts\` for either of the *Audio already on disk* buttons.
 
 > If they are not already empty you get a prompt first — **but that prompt
 > answers itself with "yes, delete" after two minutes** if nobody is at the
@@ -284,9 +294,9 @@ browser profile, and it fails with a "file not found" error mentioning
   flicker black windows across your screen.
 - **Closing the window saves your settings**, including your list.
 - **It does not fingerprint the same batch twice.** Finished work is recorded in
-  `fingerprinted.json` beside the `.pklz` files. To resume after a crash, press
-  **Split + fingerprint files I already have** — not **Download and
-  fingerprint**, which clears the results folder and takes that record with it.
+  `fingerprinted.json` beside the `.pklz` files. To resume after a crash, use
+  one of the *Audio already on disk* buttons — not **Download and fingerprint**,
+  which clears the results folder and takes that record with it.
 
 ## Credits
 

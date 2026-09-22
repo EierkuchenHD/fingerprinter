@@ -420,11 +420,6 @@ class FingerprinterApp:
         btns.pack(fill="x", padx=4, pady=(6, 0))
         self.start_btn = ttk.Button(btns, text="Download and fingerprint", command=self._start)
         self.start_btn.pack(side="left", padx=(0, 4))
-        self.bats_btn = ttk.Button(
-            btns, text="Split + fingerprint files I already have",
-            command=self._start_bats_only,
-        )
-        self.bats_btn.pack(side="left", padx=4)
         self.skip_btn = ttk.Button(btns, text="Skip this link", command=self._skip_current, state="disabled")
         self.skip_btn.pack(side="left", padx=4)
         self.cancel_btn = ttk.Button(btns, text="Stop", command=self._cancel, state="disabled")
@@ -433,11 +428,33 @@ class FingerprinterApp:
         self.test_btn = ttk.Button(btns, text="Check my setup", command=self._start_test_connection)
         self.test_btn.pack(side="right", padx=(4, 0))
 
+        # Second row: the two ways of working on audio that is already on disk.
+        # They are separate buttons rather than one button plus a setting
+        # because the difference is one you do not want to get wrong by
+        # accident -- one rewrites your files in place, the other never touches
+        # them -- and because a setting buried under Advanced is not something
+        # you would find when you needed it.
+        disk = ttk.Frame(go)
+        disk.pack(fill="x", padx=4, pady=(6, 0))
+        ttk.Label(disk, text="Audio already on disk:").pack(side="left", padx=(0, 8))
+        self.bats_btn = ttk.Button(
+            disk, text="Split + fingerprint",
+            command=lambda: self._start_bats_only(split=True),
+        )
+        self.bats_btn.pack(side="left", padx=4)
+        self.fp_only_btn = ttk.Button(
+            disk, text="Fingerprint only (already split)",
+            command=lambda: self._start_bats_only(split=False),
+        )
+        self.fp_only_btn.pack(side="left", padx=4)
+
         self._help(
             go,
             "Download and fingerprint does the whole job for every ticked link. "
-            "Use Split + fingerprint instead when the audio is already in the "
-            "working folder and only needs processing. Not sure everything is "
+            "For audio you already have, Split + fingerprint cuts anything over "
+            "12 minutes first, while Fingerprint only skips the length check "
+            "altogether — far quicker over a collection that is already in "
+            "pieces, since nothing has to be examined. Not sure everything is "
             "installed? Press Check my setup.",
         ).pack(anchor="w", padx=8, pady=(3, 6))
 
@@ -530,7 +547,7 @@ class FingerprinterApp:
         self.open_pklz_var = tk.BooleanVar(value=True)
         self.split_long_var = tk.BooleanVar(value=True)
         for label, var in (
-            ("Split anything over 12 minutes into pieces (recommended)", self.split_long_var),
+            ("Split long recordings after downloading (recommended)", self.split_long_var),
             ("Show every line of download output", self.verbose_var),
             ("Open the audio folder when a link starts", self.open_folder_var),
             ("Open the results folder when it finishes", self.open_pklz_var),
@@ -541,7 +558,9 @@ class FingerprinterApp:
             self.adv_frame,
             "Splitting matters more than it sounds: a match against a three-hour "
             "mix only tells you it is somewhere in three hours, while a match "
-            "against a 6-minute piece points straight at it.",
+            "against a 6-minute piece points straight at it. This applies to "
+            "downloads; for audio already on disk the two buttons in Step 3 "
+            "decide it instead.",
         ).pack(anchor="w", padx=8, pady=(0, 4))
 
         # Row 3: filename template
@@ -1502,6 +1521,7 @@ class FingerprinterApp:
         self.skip_flag.clear()
         self.start_btn.config(state="disabled")
         self.bats_btn.config(state="disabled")
+        self.fp_only_btn.config(state="disabled")
         self.test_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
         self.skip_btn.config(state="normal")
@@ -1576,7 +1596,10 @@ class FingerprinterApp:
         finally:
             self.root.after(0, self._finish)
 
-    def _start_bats_only(self) -> None:
+    def _start_bats_only(self, split: bool = True) -> None:
+        """Fingerprint audio already on disk. `split` picks the variant: the
+        two buttons that reach here differ only in this flag, and each says in
+        its own label which it is, so neither depends on the Advanced setting."""
         """Skip downloads entirely; scan + fingerprint whatever is already on disk."""
         bat_dir = self.bat_dir_var.get().strip()
         if not bat_dir or not Path(bat_dir).is_dir():
@@ -1600,16 +1623,19 @@ class FingerprinterApp:
         # long recording with its pieces and deletes the original. Agreeing to
         # "fingerprint what is on disk" should not quietly also mean "and
         # restructure it".
-        splitting = self.split_long_var.get()
+        splitting = split
         split_line = (
             f"Anything longer than {SPLIT_TRIGGER // 60}:00 will first be SPLIT IN PLACE "
             f"into pieces of at least {SPLIT_MIN_CHUNK // 60}:00, and the original file "
             f"deleted.\n\n"
             if splitting else
-            "Splitting is switched off, so long files go into the database whole.\n\n"
+            "Nothing will be split, and no file is examined for length. Use this "
+            "when the audio has already been split; anything still over "
+            f"{SPLIT_TRIGGER // 60}:00 goes into the database whole.\n\n"
         )
         if not messagebox.askyesno(
-            "Split and fingerprint existing audio?",
+            "Split and fingerprint existing audio?" if splitting
+            else "Fingerprint existing audio?",
             f"Scan for audio under:\n{source_dir}\n\n"
             f"{split_line}"
             f"Then fingerprint it into:\n{Path(bat_dir) / 'pklz-files'}\n\n"
@@ -1621,6 +1647,7 @@ class FingerprinterApp:
         self.cancel_flag.clear()
         self.start_btn.config(state="disabled")
         self.bats_btn.config(state="disabled")
+        self.fp_only_btn.config(state="disabled")
         self.test_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
         self._set_inputs_locked(True)
@@ -1629,7 +1656,7 @@ class FingerprinterApp:
 
         self.worker_thread = threading.Thread(
             target=self._run_bats_only_pipeline,
-            args=(Path(bat_dir),),
+            args=(Path(bat_dir), splitting),
             daemon=True,
         )
         self.worker_thread.start()
@@ -1639,6 +1666,7 @@ class FingerprinterApp:
         self.cancel_flag.clear()
         self.start_btn.config(state="disabled")
         self.bats_btn.config(state="disabled")
+        self.fp_only_btn.config(state="disabled")
         self.test_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
         self._set_inputs_locked(True)
@@ -1887,6 +1915,7 @@ class FingerprinterApp:
     def _finish(self) -> None:
         self.start_btn.config(state="normal")
         self.bats_btn.config(state="normal")
+        self.fp_only_btn.config(state="normal")
         self.test_btn.config(state="normal")
         self.cancel_btn.config(state="disabled")
         self.skip_btn.config(state="disabled")
@@ -2089,7 +2118,7 @@ class FingerprinterApp:
             if not queue_mode:
                 self.root.after(0, self._finish)
 
-    def _run_bats_only_pipeline(self, bat_dir: Path) -> None:
+    def _run_bats_only_pipeline(self, bat_dir: Path, split: bool = True) -> None:
         """Skip downloads. Scan the output directory, fingerprint it, done."""
         try:
             self._log("[*] Fingerprinting existing audio (no download)...")
@@ -2114,7 +2143,7 @@ class FingerprinterApp:
             # Recursive here, unlike the download path: that one is handed a
             # single channel folder, while this is pointed at the whole output
             # directory, which is normally a folder per channel or per year.
-            if not self._check_long_audio(source_dir, recursive=True):
+            if not self._check_long_audio(source_dir, recursive=True, split=split):
                 return
             if not self._run_fingerprint_stage(bat_dir, source_dir):
                 if self.cancel_flag.is_set():
@@ -2596,15 +2625,37 @@ class FingerprinterApp:
         except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
             return None
 
-    def _check_long_audio(self, folder: Path, recursive: bool = False) -> bool:
+    def _check_long_audio(
+        self, folder: Path, recursive: bool = False, split: bool | None = None,
+    ) -> bool:
         """Probe every audio file under `folder` and split anything long enough to
         be split. Always returns True so the pipeline continues; returns False only
         on cancel.
 
         `recursive` because the two callers see different shapes: a channel
-        download lands one flat folder, while Fingerprint Only is pointed at the
-        whole output directory, which is usually a folder per channel or per year.
+        download lands one flat folder, while the disk paths are pointed at the
+        whole working folder, which is usually a folder per channel or per year.
+
+        `split` overrides the checkbox for one run: the two disk buttons say in
+        their own labels whether they split, so they pass it explicitly rather
+        than depending on a setting the user would have to go and find. None
+        means "use the checkbox", which is what the download path does.
+
+        When splitting is off this returns before enumerating anything. That is
+        the whole point of the no-split path: the probe costs one ffprobe per
+        file, so on an already-split collection of thousands of pieces it used
+        to spend a long time reading durations only to announce it had nothing
+        to do.
         """
+        if split is None:
+            split = self.split_long_var.get()
+        if not split:
+            self._log(
+                "[*] Splitting is off - skipping the duration check entirely "
+                "(no files are probed)."
+            )
+            return True
+
         self._set_status("Checking audio durations...")
         self._log("[*] Checking audio file durations...")
 
@@ -2649,20 +2700,8 @@ class FingerprinterApp:
 
         long_files.sort(key=lambda x: -x[1])
 
-        if not self.split_long_var.get():
-            self._log(
-                f"[!] WARNING: {len(long_files)} file(s) are longer than "
-                f"{SPLIT_TRIGGER // 60}:00. Splitting is disabled, so they go into "
-                f"the database whole.",
-                tag="warning",
-            )
-            for path, dur in long_files[:10]:
-                mins, secs = divmod(int(dur), 60)
-                self._log(f"    {mins:>3}:{secs:02d}  {path.name}", tag="warning")
-            if len(long_files) > 10:
-                self._log(f"    ... (+{len(long_files) - 10} more)", tag="warning")
-            return True
-
+        # No "splitting is disabled" branch here any more: that case now returns
+        # at the top of this method, before anything is enumerated or probed.
         self._log(
             f"[*] Splitting {len(long_files)} file(s) into pieces of at least "
             f"{SPLIT_MIN_CHUNK // 60}:00...",
