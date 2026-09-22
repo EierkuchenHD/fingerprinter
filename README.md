@@ -211,14 +211,19 @@ needs changing to get a good result.
 |---|---|
 | **Downloads at once** (4) | How many downloads run in parallel. Raise it on a fast connection; lower it if downloads start failing. |
 | **Fingerprint jobs at once** (4) | How many fingerprinting jobs run side by side. The main speed control once downloading is done. |
-| **Cores per job** (1) | Best left at 1. audfprint's own multi-core mode is slower in practice than simply running more jobs at once. |
-| **Recordings per file** (1000) | How many recordings go into one `.pklz`. Keep it high: a matching tool reloads *every* `.pklz` each time it runs, so many small ones make every future search slower. |
+| **Recordings per file** (1000 recommended) | How many recordings go into one `.pklz`. Keep it high: a matching tool reloads *every* `.pklz` each time it runs, so many small ones make every future search slower. |
 | **Split long recordings after downloading** (on) | **Leave this on.** Applies to *Download and fingerprint*; for audio already on disk the two Step 3 buttons decide it instead. Explained below. |
 | **Show every line of download output** | Useful when diagnosing a failure, noisy otherwise. |
 | **Open the audio folder when a link starts** | Opens it so you can watch files arrive. |
 | **Open the results folder when it finishes** | Opens your fingerprints at the end. |
 | **Name downloaded files** | yt-dlp [output notation](https://github.com/yt-dlp/yt-dlp#output-template). The default gives `Title [videoid].m4a` — or `.opus`, depending on what the site offers. Safe to ignore. |
 | **Extra download options** | Passed straight to yt-dlp. Usually empty — see *Private or age-restricted videos*. |
+
+There is deliberately no control for audfprint's own core count. It splits one
+batch across processes and then merges their results back one at a time, so it
+is the slowest way to spend extra cores: measured here, eight jobs at one core
+each did in 28s what one job at eight cores took 59s to do. *Fingerprint jobs
+at once* is the setting that actually helps.
 
 ### Why the splitting matters
 

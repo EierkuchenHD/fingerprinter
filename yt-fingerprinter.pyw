@@ -148,6 +148,22 @@ def save_config(cfg: dict) -> None:
 # ceiling of 5:00 with a minimum gap of 90s between silence-aligned cuts, which
 # could leave pieces a minute and a half long; audfprint has less to work with
 # the shorter a piece is, so six minutes is the floor used throughout.
+# audfprint's own --ncores, pinned rather than exposed. It splits one batch's
+# file list across processes and then merges their hash tables back through
+# pipes, and that merge is serial, so it is the worst place to spend
+# parallelism. Measured on this machine, 32 files, identical total worker
+# count in every row:
+#
+#     1 job  x --ncores 8    59.2s
+#     2 jobs x --ncores 4    42.1s
+#     4 jobs x --ncores 2    36.9s
+#     8 jobs x --ncores 1    28.1s
+#
+# Independent batches have nothing to merge, so "Fingerprint jobs at once" is
+# the control worth having and this one only ever made things slower while
+# multiplying peak memory. It used to be a spinbox; there is no setting now.
+AUDFPRINT_NCORES = 1
+
 SPLIT_MIN_CHUNK = 6 * 60
 
 # The nominal body of a segment. Equal to the floor: a full body already clears
@@ -214,9 +230,10 @@ class FingerprinterApp:
         self.log_queue: queue.Queue[tuple[str, str, str | None]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.cancel_flag = threading.Event()
-        # Running audfprint processes, so Cancel can actually stop them. Without
-        # this, cancelling during fingerprinting only set the flag and then sat
-        # waiting for a batch that can run for twenty minutes.
+        # EVERY live child process, so Stop and Quit can actually end them.
+        # This used to hold audfprint batches only, which meant Stop during the
+        # download stage killed nothing at all: yt-dlp was noticed only when it
+        # next wrote a line, and it writes nothing for the whole remux.
         self._fp_procs: list[subprocess.Popen] = []
         self._fp_procs_lock = threading.Lock()
         # batch id -> (files done, files in batch), for the aggregate progress line
@@ -509,16 +526,8 @@ class FingerprinterApp:
         )
         self.fp_concurrency_spin.pack(side="left")
 
-        # audfprint's own internal parallelism. Left at 1 on purpose: it splits
-        # one file list across processes and merges their hash tables back
-        # serially, which stopped paying off past 8 and got slower at 16, and it
-        # multiplies against the batch concurrency above.
-        ttk.Label(opts_r1, text="   Cores per job:").pack(side="left", padx=(12, 4))
-        self.fp_ncores_var = tk.IntVar(value=1)
-        self.fp_ncores_spin = ttk.Spinbox(
-            opts_r1, from_=1, to=16, textvariable=self.fp_ncores_var, width=5,
-        )
-        self.fp_ncores_spin.pack(side="left")
+        # There is deliberately no control for audfprint's own --ncores. It is
+        # pinned to AUDFPRINT_NCORES; see that constant for the measurements.
 
         # Files per .pklz. Bigger means fewer, larger shards, which matters
         # downstream: a matcher reloads every .pklz on every run, so hundreds of
@@ -530,13 +539,14 @@ class FingerprinterApp:
             textvariable=self.batch_size_var, width=7,
         )
         self.batch_size_spin.pack(side="left")
+        self._help(opts_r1, "(1000 recommended)").pack(side="left", padx=(6, 0))
 
         self._help(
             self.adv_frame,
             "Raise the first two to use more of the machine; lower them if "
-            "downloads start failing or memory runs short. Cores per job is best "
-            "left at 1 — running more jobs at once is faster than splitting one "
-            "job across cores.",
+            "downloads start failing or memory runs short. Recordings per file "
+            "is best left alone: a matching tool reloads every .pklz each time "
+            "it runs, so many small ones slow every future search.",
         ).pack(anchor="w", padx=8, pady=(0, 4))
 
         # Row 2: behavioural checkboxes
@@ -795,7 +805,6 @@ class FingerprinterApp:
         ("open_pklz_var", "open_pklz", bool),
         ("batch_size_var", "batch_size", int),
         ("fp_concurrency_var", "fp_concurrency", int),
-        ("fp_ncores_var", "fp_ncores", int),
     )
 
     def _apply_config(self, cfg: dict) -> None:
@@ -805,7 +814,13 @@ class FingerprinterApp:
                 continue
             try:
                 getattr(self, var_name).set(conv(cfg[key]))
-            except (ValueError, TypeError, AttributeError):
+            except (ValueError, TypeError, AttributeError, tk.TclError):
+                # tk.TclError matters: a Spinbox the user cleared leaves its
+                # IntVar holding "", and IntVar.get() raises TclError - which is
+                # not a ValueError. Uncaught it escaped into Tk's callback
+                # handler, invisible under .pyw, after _start had already
+                # disabled every button and before any worker existed, leaving
+                # the window dead until restart.
                 pass
         # Restore the saved channel queue (crash recovery / persistence).
         saved_queue = cfg.get("queue")
@@ -815,13 +830,31 @@ class FingerprinterApp:
             self.queue_active = None
             self._refresh_queue()
 
+    @staticmethod
+    def _safe_int(var: tk.IntVar, default: int, minimum: int = 1) -> int:
+        """Read an IntVar that the user may have emptied.
+
+        Same hazard as _gather_config: a cleared Spinbox makes IntVar.get()
+        raise TclError, and these are read on the worker thread mid-run where
+        that surfaces as an unexplained failed channel."""
+        try:
+            return max(minimum, int(var.get()))
+        except (tk.TclError, ValueError, TypeError):
+            return default
+
     def _gather_config(self) -> dict:
         """Read current Tk var values into a serializable dict."""
         out: dict = {}
         for var_name, key, conv in self._CONFIG_FIELDS:
             try:
                 out[key] = conv(getattr(self, var_name).get())
-            except (ValueError, TypeError, AttributeError):
+            except (ValueError, TypeError, AttributeError, tk.TclError):
+                # tk.TclError matters: a Spinbox the user cleared leaves its
+                # IntVar holding "", and IntVar.get() raises TclError - which is
+                # not a ValueError. Uncaught it escaped into Tk's callback
+                # handler, invisible under .pyw, after _start had already
+                # disabled every button and before any worker existed, leaving
+                # the window dead until restart.
                 pass
         # Persist the queue so it survives restarts.
         out["queue"] = list(self.queue_urls)
@@ -842,8 +875,14 @@ class FingerprinterApp:
             )
             if not confirm:
                 return
-            # Best-effort: signal the worker to stop at its next checkpoint.
+            # Signal the worker to stop, then actually kill what is running.
+            # Setting the flag alone left audfprint, yt-dlp and their ffmpeg
+            # children running after the window had gone, with no UI left to
+            # stop them from.
             self.cancel_flag.set()
+            killed = self._kill_all_children()
+            if killed:
+                self._log(f"[!] Killed {killed} running process(es) on exit.")
         save_config(self._gather_config())
         self.root.destroy()
 
@@ -1877,23 +1916,70 @@ class FingerprinterApp:
         for ln in lines:
             self._log(f"{prefix}{ln}", tag=tag)
 
-    def _cancel(self) -> None:
-        self.cancel_flag.set()
-        self._log("[!] Cancellation requested. The entire queue will stop at the next safe checkpoint.")
-        # Fingerprinting is the one stage long enough that waiting for a "safe
-        # checkpoint" means waiting out a whole batch. Terminating is safe here
-        # because each batch writes to a .part file that is only renamed into
-        # place on a clean exit, so a killed batch leaves nothing behind and is
-        # simply redone next run.
+    @staticmethod
+    def _kill_tree(proc: subprocess.Popen) -> None:
+        """Kill a child process and everything it started.
+
+        proc.terminate() only kills the process we launched, which is not the
+        thing actually doing the work: audfprint spawns an ffmpeg per file,
+        yt-dlp spawns ffmpeg to remux, and where ffmpeg or aria2c came from a
+        package manager the name on PATH is often a small shim that runs the
+        real binary as a further child. Terminating the top of that chain
+        leaves the rest running, which is why Stop used to be something you had
+        to press and then wait out. taskkill /T walks the whole tree."""
+        if proc.poll() is not None:
+            return
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=10,
+                )
+            else:
+                proc.terminate()
+        except Exception:  # noqa: BLE001
+            # taskkill can lose a race with a process that just exited; falling
+            # back costs nothing and never leaves the tree alive on purpose.
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _track_proc(self, proc: subprocess.Popen) -> None:
+        with self._fp_procs_lock:
+            self._fp_procs.append(proc)
+
+    def _untrack_proc(self, proc: subprocess.Popen) -> None:
+        with self._fp_procs_lock:
+            if proc in self._fp_procs:
+                self._fp_procs.remove(proc)
+
+    def _kill_all_children(self) -> int:
+        """Kill every child we know about, and their children. Returns the count."""
         with self._fp_procs_lock:
             running = list(self._fp_procs)
-        if running:
-            self._log(f"[!] Stopping {len(running)} running audfprint batch(es)...")
-            for proc in running:
-                try:
-                    proc.terminate()
-                except Exception:  # noqa: BLE001
-                    pass
+        for proc in running:
+            self._kill_tree(proc)
+        return len(running)
+
+    def _cancel(self) -> None:
+        self.cancel_flag.set()
+        self._log("[!] Stopping. Running work is being killed now; "
+                  "nothing further will start.")
+        # Safe to kill: an audfprint batch writes to a .part file that is only
+        # renamed into place on a clean exit, and a killed download is simply
+        # downloaded again.
+        with self._fp_procs_lock:
+            n = len(self._fp_procs)
+        if n:
+            self._log(f"[!] Stopping {n} running process(es)...")
+        # On a worker thread, not here. This is a Tk button callback, and
+        # taskkill is synchronous: walking every child on the UI thread froze
+        # the window mid-Stop, which looks exactly like the hang that Stop is
+        # supposed to end.
+        threading.Thread(target=self._kill_all_children, daemon=True).start()
 
     def _skip_current(self) -> None:
         self.skip_flag.set()
@@ -2023,7 +2109,7 @@ class FingerprinterApp:
                 entries = selected
 
             # 1b. Size/time estimate — interactive only outside queue mode.
-            workers = max(1, int(self.parallel_var.get()))
+            workers = self._safe_int(self.parallel_var, 4)
             if queue_mode:
                 self._confirm_estimate(entries, workers, log_only=True)
             else:
@@ -2065,12 +2151,15 @@ class FingerprinterApp:
             if not self._preflight_clean(bat_dir, ("texts", "pklz-files")):
                 return "cancelled"
 
-            # 5 + 6. Scan and fingerprint, natively (was preparador.bat then
-            # creador.bat). The scan follows the configured output directory
-            # rather than the path setup.js had hard-coded.
+            # 5 + 6. Scan and fingerprint. Scan THIS channel's download
+            # subfolder -- the same folder we downloaded into, split in place,
+            # and delete further down -- not the whole output directory, which
+            # in a queue run can still hold a previous channel whose cleanup
+            # failed. (This read an undefined `output_dir` and raised NameError
+            # on every download run.)
             pklz_dir = bat_dir / "pklz-files"
             pklz_before = self._snapshot_pklz(pklz_dir)
-            source_dir = Path(output_dir)
+            source_dir = initial_folder
             if not self._run_fingerprint_stage(bat_dir, source_dir, status_prefix=qp):
                 if (s := stopped()):
                     return s
@@ -2311,6 +2400,12 @@ class FingerprinterApp:
         the old version used Node's exec(), which holds everything in memory and
         only hands it over at the end, so a batch that died mid-run reported an
         empty stdout and there was nothing to diagnose it with."""
+        # Every remaining batch is already queued in the pool, so the moment a
+        # running one is killed the pool dispatches the next. Without this
+        # guard, pressing Stop during batch 4 simply started batch 5.
+        if self.cancel_flag.is_set():
+            return batch_id, False, "cancelled before it started"
+
         texts_dir = bat_dir / "texts"
         pklz_dir = bat_dir / "pklz-files"
         list_file = texts_dir / f"{batch_id}.txt"
@@ -2373,8 +2468,12 @@ class FingerprinterApp:
         except OSError as e:
             return batch_id, False, f"could not start audfprint: {e}"
 
-        with self._fp_procs_lock:
-            self._fp_procs.append(proc)
+        self._track_proc(proc)
+        # Stop can land between the guard above and this spawn, in which case
+        # _cancel walked a process list that did not yet contain us. Re-check
+        # now that we are registered, so no batch survives by timing.
+        if self.cancel_flag.is_set():
+            self._kill_tree(proc)
         try:
             assert proc.stdout is not None
             last_report = 0.0
@@ -2414,9 +2513,7 @@ class FingerprinterApp:
                         self._log(f"  | [batch {batch_id}] {line}", tag="bat")
             proc.wait()
         finally:
-            with self._fp_procs_lock:
-                if proc in self._fp_procs:
-                    self._fp_procs.remove(proc)
+            self._untrack_proc(proc)
 
         if self.cancel_flag.is_set():
             part_pklz.unlink(missing_ok=True)
@@ -2525,8 +2622,8 @@ class FingerprinterApp:
                     n_files = 0
                 self._fp_progress[i] = (0, n_files)
 
-        concurrency = max(1, min(int(self.fp_concurrency_var.get()), len(pending)))
-        ncores = max(1, int(self.fp_ncores_var.get()))
+        concurrency = max(1, min(self._safe_int(self.fp_concurrency_var, 4), len(pending)))
+        ncores = AUDFPRINT_NCORES
         self._log(f"[*] Fingerprinting {len(pending)} batch(es), "
                   f"{concurrency} at a time, audfprint --ncores {ncores}")
 
@@ -2570,8 +2667,11 @@ class FingerprinterApp:
                                         f"{fmt_time(left)} left - ")
                 self._publish_fp_progress()
                 if self.cancel_flag.is_set():
-                    for f in futures:
-                        f.cancel()
+                    # cancel_futures drops everything still queued in one go.
+                    # Cancelling them individually (as this did) races the pool,
+                    # which dispatches the next batch as soon as a worker frees
+                    # up -- which killing the running batches does immediately.
+                    pool.shutdown(wait=False, cancel_futures=True)
                     break
 
         if self.cancel_flag.is_set():
@@ -2593,7 +2693,7 @@ class FingerprinterApp:
         """Scan + fingerprint: the whole of what preparador.bat and creador.bat
         used to do. Returns True only if every batch produced a .pklz."""
         texts_dir = bat_dir / "texts"
-        batch_size = max(1, int(self.batch_size_var.get()))
+        batch_size = self._safe_int(self.batch_size_var, 1000)
 
         self._set_status(f"{status_prefix}Scanning for audio...")
         self._log(f"[*] Scanning for audio under: {source_dir}")
@@ -2979,6 +3079,29 @@ class FingerprinterApp:
             self._log(f"[X] yt-dlp launch failed: {e}")
             return None
 
+        self._track_proc(proc)
+
+        # Drain stderr on a thread. It was piped and never read, so as soon as
+        # yt-dlp wrote more than one pipe buffer there (a few KB - trivial with
+        # --verbose in Extra download options, or a playlist full of warnings)
+        # the child blocked writing while we sat in the stdout loop below
+        # waiting for a line that could never arrive. Neither side could move.
+        stderr_tail: list[str] = []
+
+        def _drain_stderr() -> None:
+            if proc.stderr is None:
+                return
+            try:
+                for errline in proc.stderr:
+                    errline = errline.rstrip()
+                    if errline:
+                        stderr_tail.append(errline)
+                        del stderr_tail[:-20]   # keep only the last few
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=_drain_stderr, daemon=True).start()
+
         assert proc.stdout is not None
         last_log = time.monotonic()
         keys = (
@@ -2988,7 +3111,7 @@ class FingerprinterApp:
         try:
             for line in proc.stdout:
                 if self.cancel_flag.is_set():
-                    proc.terminate()
+                    self._kill_tree(proc)
                     break
                 line = line.rstrip("\n")
                 if not line:
@@ -3032,6 +3155,7 @@ class FingerprinterApp:
                     last_log = now
         finally:
             proc.wait()
+            self._untrack_proc(proc)
 
         if self.cancel_flag.is_set():
             return None
@@ -3088,6 +3212,11 @@ class FingerprinterApp:
             futures = {ex.submit(worker, e): e for e in entries}
             for fut in as_completed(futures):
                 if self.cancel_flag.is_set():
+                    # Drop everything still queued. Without this the `with`
+                    # block's shutdown(wait=True) also blocked the whole
+                    # pipeline until the remaining downloads finished on their
+                    # own, so the UI stayed "running" long after Stop.
+                    ex.shutdown(wait=False, cancel_futures=True)
                     break
                 try:
                     success = fut.result()
@@ -3116,6 +3245,11 @@ class FingerprinterApp:
         slot: int,
         target_folder: Path,
     ) -> bool:
+        # Same shape as the fingerprint batches: every remaining video is
+        # already queued in the pool, so without this a Stop during download 4
+        # simply started download 5.
+        if self.cancel_flag.is_set():
+            return False
         video_url = entry.get("webpage_url") or entry.get("url") or entry.get("id") or ""
         video_url = str(video_url)
         # If the entry only gave us a bare 11-character YouTube video ID
@@ -3173,6 +3307,12 @@ class FingerprinterApp:
             self._log(f"[!] {title}: {e!r}")
             return False
 
+        # Registered so Stop can kill it outright. Relying on the cancel check
+        # inside the stdout loop below was not enough: yt-dlp prints nothing
+        # for the whole remux, so the loop sits in a blocking read and the
+        # download outlived Stop.
+        self._track_proc(proc)
+
         err_lines: list[str] = []
         assert proc.stdout is not None
 
@@ -3196,7 +3336,7 @@ class FingerprinterApp:
         try:
             for raw in proc.stdout:
                 if self.cancel_flag.is_set():
-                    proc.terminate()
+                    self._kill_tree(proc)
                     break
                 line = raw.rstrip()
                 if not line:
@@ -3214,6 +3354,7 @@ class FingerprinterApp:
                     err_lines.append(line)
         finally:
             ticker_stop.set()
+            self._untrack_proc(proc)
             ticker_thread.join(timeout=2.0)
 
         proc.wait()
