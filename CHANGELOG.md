@@ -3,6 +3,44 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.0.0-beta.3] - 2026-09-23
+
+### Added
+
+- **Skip items already fingerprinted in an earlier run** (Settings,
+  Downloads), with **Forget them**. Running a channel again then only fetches
+  its new uploads. Items are remembered in `fingerprinted-items.txt`, in the
+  format of yt-dlp's `--download-archive`, and only once their whole link has
+  been fingerprinted.
+- **Skip items shorter than / longer than** (Settings, Downloads): leave out
+  items by length, for example YouTube Shorts under 60 seconds. Items whose
+  length the listing does not give are checked by yt-dlp before downloading.
+- **Sign in with cookies from** a browser (Settings, Downloads), instead of
+  typing `--cookies-from-browser` into Extra download options.
+- **Play a sound and flash the taskbar button when a run finishes**
+  (Settings, Fingerprinting), on by default.
+
+### Changed
+
+- **Fingerprint jobs at once now speeds up a single batch too.** A link with
+  fewer recordings than Recordings per file is one batch, and it used to run
+  as one process however many jobs were allowed. Its files are now split
+  across the jobs (4 by default), fingerprinted side by side, and merged into
+  the same single `.pklz`, which holds the same fingerprints and matches the
+  same way. 48 six-minute files took 2 minutes instead of 3; a full
+  1000-file batch should take about 14 minutes instead of 52. Batches under
+  40 files are not split, as merging costs about a minute.
+- **Show every line of download output** is off by default, explains itself
+  in Settings, and can't be changed while a job runs. Settings files from
+  earlier versions saved it as on because that was the old default, so it is
+  switched off once.
+
+### Fixed
+
+- Titles with ä, ö, ü, ß and other letters outside English showed them as "?"
+  in the Now panel and the console. yt-dlp now writes UTF-8.
+- The console no longer mentions audfprint's `--ncores` setting.
+
 ## [1.0.0-beta.2] - 2026-09-23
 
 ### Added
@@ -125,5 +163,6 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.0.0-beta.3]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.1

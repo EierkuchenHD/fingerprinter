@@ -133,6 +133,14 @@ connection, in which case yt-dlp retries and continues from its partial file.
 **Skip link** moves on to the next link once the current stage finishes.
 **Stop** ends everything immediately.
 
+### Running a channel again
+
+Turn on **Skip items already fingerprinted in an earlier run** (Settings,
+Downloads). Every item is then remembered once its link has been fingerprinted,
+and the next run of that channel only downloads what is new. An item is only
+remembered after its whole link succeeds, so a failed run never marks anything
+as done. **Forget them** clears the list.
+
 ### Audio you already have
 
 The **Audio on disk** menu has two choices. Both work on the working folder
@@ -185,13 +193,17 @@ HTTP 429 (too many requests) or 403, lower it.
 | Folders | Keep finished fingerprints in | `pklz-files\` | Where finished `.pklz` files are collected. Nothing in it is ever deleted. |
 | Folders | This program's folder | filled in | The folder that holds this program and its `audfprint\`. |
 | Downloads | Name downloaded files | `%(title)s [%(id)s].%(ext)s` | A yt-dlp [output template](https://github.com/yt-dlp/yt-dlp#output-template). |
-| Downloads | Extra download options | empty | Passed to yt-dlp as they are. See [Content that needs a login](#content-that-needs-a-login). |
-| Downloads | Show every line of download output | On | yt-dlp's full output in the console. Useful when a download fails. |
+| Downloads | Extra download options | empty | Passed to yt-dlp as they are. |
+| Downloads | Sign in with cookies from | None | A browser whose login yt-dlp uses. See [Content that needs a login](#content-that-needs-a-login). |
+| Downloads | Skip items shorter than / longer than | 0 (no limit) | Leaves out items by length, in seconds and minutes. 60 seconds leaves out YouTube Shorts. |
+| Downloads | Skip items already fingerprinted in an earlier run | Off | See [Running a channel again](#running-a-channel-again). |
+| Downloads | Show every line of download output | Off | Adds everything yt-dlp and audfprint print to the console. Useful when a download fails; otherwise it floods the console. Locked while a job runs. |
 | Downloads | Open the audio folder when a link starts | On | |
-| Fingerprinting | Fingerprint jobs at once | 4 | Batches fingerprinted side by side. Each can use around 5.5 GB of memory at 1000 recordings per file, so raise it only if you have the RAM. |
+| Fingerprinting | Fingerprint jobs at once | 4 | How many audfprint processes work at the same time. A link with fewer recordings than Recordings per file is one batch; from 40 files, the jobs share it and their work is merged into one `.pklz`. Each job can use up to about 5.5 GB of memory, so raise it only if you have the RAM and CPU cores. |
 | Fingerprinting | Recordings per file | 1000 | How many recordings go into one `.pklz`. Keep it high: a matcher loads every `.pklz` on each search, so many small files slow every search. |
 | Fingerprinting | Split long recordings after downloading | On | See [Splitting](#splitting). |
 | Fingerprinting | Open the fingerprints folder when a run finishes | On | |
+| Fingerprinting | Play a sound and flash the taskbar button when a run finishes | On | |
 
 audfprint's own `--ncores` is fixed at 1 on purpose: several single-core jobs
 are faster than one job spread over several cores (measured: 8 jobs at 1 core
@@ -223,14 +235,9 @@ Press **Check setup** first. It:
 
 ### Content that needs a login
 
-Add this to **Extra download options** (Settings, Downloads), with `chrome`, `edge` or `brave` in
-place of `firefox` if needed, and close that browser first:
-
-```
---cookies-from-browser firefox
-```
-
-yt-dlp then uses that browser's login. It reads the cookies of the Windows
+In Settings, Downloads, choose your browser under **Sign in with cookies from**,
+and close that browser before starting; Firefox works most reliably. yt-dlp
+then uses that browser's login. It reads the cookies of the Windows
 account the program runs under, so it does not work from a scheduled task or a
 service, whose account has no browser profile.
 
@@ -264,6 +271,7 @@ service, whose account has no browser profile.
 | `pklz-files\` | The default place finished fingerprints are kept. Nothing in it is deleted. |
 | `work\` | The program's scratch space: file lists for audfprint and unfinished `.pklz` files. |
 | `config.json`, `recent_urls.json` | Your settings, list and recent links. |
+| `fingerprinted-items.txt` | Items already fingerprinted, when that setting is on. The format of yt-dlp's `--download-archive`. |
 | `CHANGELOG.md` | What changed in each version. |
 
 ## Credits

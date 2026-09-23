@@ -59,7 +59,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.0.0-beta.2"
+__version__ = "1.0.0-beta.3"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -142,6 +142,11 @@ def save_recent_url(url: str) -> list[str]:
 # ----- general config persistence --------------------------------------------
 
 CONFIG_FILE = SCRIPT_DIR / "config.json"
+# Raised when the meaning of a saved setting changes (see _apply_config).
+CONFIG_VERSION = 3
+# Items already fingerprinted, one "<extractor> <id>" per line: the format of
+# yt-dlp's --download-archive, so the file also works with yt-dlp itself.
+DONE_FILE = SCRIPT_DIR / "fingerprinted-items.txt"
 
 
 def load_config() -> dict:
@@ -218,6 +223,17 @@ _INGESTING_RE = re.compile(r"ingesting #(\d+)\s*:\s*(.+?)\s*\.\.\.\s*$")
 # kept, and nothing in pklz-files\ is ever deleted. work\ is the program's own
 # scratch space (audfprint's file lists, and the .pklz files it is writing
 # before they are renamed and moved out), emptied whenever a run needs it.
+# yt-dlp writes to a pipe in the Windows code page (cp1252 and the like),
+# while everything here reads UTF-8, so every non-ASCII letter in a title
+# (ä, ö, ü, ß, Japanese...) arrived as a replacement character and showed as
+# "?". yt-dlp's own --encoding makes it write UTF-8, whether it is the pip
+# script, python -m yt_dlp or the standalone exe.
+YTDLP_UTF8 = ("--encoding", "utf-8")
+
+# Browsers yt-dlp can take cookies from (Settings, Downloads); "None" means
+# no --cookies-from-browser.
+COOKIE_BROWSERS = ("None", "Firefox", "Chrome", "Edge", "Brave", "Opera", "Vivaldi", "Chromium")
+
 DOWNLOADS_DIR = "downloads"
 PKLZ_DIR = "pklz-files"
 WORK_DIR = "work"
@@ -337,6 +353,10 @@ class FingerprinterApp:
         self._fp_procs_lock = threading.Lock()
         # batch id -> (files done, files in batch), for the aggregate progress line
         self._fp_progress: dict[int, tuple[int, int]] = {}
+        # (batch id, part) -> files done, summed per batch into _fp_progress;
+        # and when each batch last printed its progress line
+        self._fp_part_done: dict[tuple[int, int], int] = {}
+        self._fp_last_report: dict[int, float] = {}
         self._fp_progress_lock = threading.Lock()
         self._fp_status_base = ""
         # Set to skip just the current channel in a queue run (vs cancel_flag
@@ -350,6 +370,8 @@ class FingerprinterApp:
         # Tracks where the most recent channel's pklz files landed, so a queue
         # run can open that folder once at the end.
         self._last_report_dir: Path | None = None
+        # This link's items that downloaded (see _download_parallel)
+        self._downloaded_ok: list[dict] = []
 
         self._build_ui()
         self._apply_config(load_config())
@@ -389,6 +411,12 @@ class FingerprinterApp:
     # default stays moderate and the ceiling finite.
     DEFAULT_PARALLEL = 8
     MAX_PARALLEL = 32
+
+    # audfprint processes side by side, and when a batch is worth splitting
+    # into parts (see _fingerprint_all).
+    DEFAULT_FP_JOBS = 4
+    MIN_FILES_TO_SPLIT = 40
+    MIN_FILES_PER_PART = 10
 
     HELP_FONT = ("Segoe UI", 8)
     HELP_GREY = "#5f6b7a"
@@ -755,17 +783,81 @@ class FingerprinterApp:
         self.extra_args_entry.pack(side="left", fill="x", expand=True)
         self._help(
             tab,
-            "Passed to yt-dlp as they are. For content that needs a login, try "
-            "--cookies-from-browser firefox (or chrome, edge, brave) with that browser closed.",
+            "Passed to yt-dlp as they are, for anything the settings below do not cover "
+            "(--limit-rate 2M, for example, caps each download at 2 MB/s).",
             wrap=560,
         ).pack(anchor="w", padx=4, pady=(1, 8))
-        self.verbose_var = tk.BooleanVar(value=True)
+        row = ttk.Frame(tab)
+        row.pack(fill="x")
+        ttk.Label(row, text="Sign in with cookies from:").pack(side="left", padx=(0, 4))
+        self.cookies_browser_var = tk.StringVar(value=COOKIE_BROWSERS[0])
+        self.cookies_combo = ttk.Combobox(
+            row, textvariable=self.cookies_browser_var, values=COOKIE_BROWSERS,
+            state="readonly", width=12)
+        self.cookies_combo.pack(side="left")
+        self._help(
+            tab,
+            "For private, members-only or age-restricted items: yt-dlp uses your login "
+            "from that browser. Close the browser first; Firefox works most reliably.",
+            wrap=560,
+        ).pack(anchor="w", padx=4, pady=(1, 8))
+
+        row = ttk.Frame(tab)
+        row.pack(fill="x")
+        ttk.Label(row, text="Skip items shorter than").pack(side="left", padx=(0, 4))
+        self.min_seconds_var = tk.IntVar(value=0)
+        self.min_seconds_spin = ttk.Spinbox(
+            row, from_=0, to=3600, increment=15, textvariable=self.min_seconds_var, width=6)
+        self.min_seconds_spin.pack(side="left")
+        ttk.Label(row, text="seconds, or longer than").pack(side="left", padx=4)
+        self.max_minutes_var = tk.IntVar(value=0)
+        self.max_minutes_spin = ttk.Spinbox(
+            row, from_=0, to=1440, increment=10, textvariable=self.max_minutes_var, width=6)
+        self.max_minutes_spin.pack(side="left")
+        ttk.Label(row, text="minutes").pack(side="left", padx=(4, 0))
+        self._help(
+            tab,
+            "0 means no limit. 60 seconds, for example, leaves out YouTube Shorts and "
+            "other short clips.",
+            wrap=560,
+        ).pack(anchor="w", padx=4, pady=(1, 8))
+
+        row = ttk.Frame(tab)
+        row.pack(fill="x")
+        self.skip_done_var = tk.BooleanVar(value=False)
+        self.skip_done_check = ttk.Checkbutton(
+            row, text="Skip items already fingerprinted in an earlier run",
+            variable=self.skip_done_var)
+        self.skip_done_check.pack(side="left")
+        self.forget_done_btn = ttk.Button(row, text="Forget them", command=self._forget_done)
+        self.forget_done_btn.pack(side="right")
+        self.done_count_var = tk.StringVar()
+        ttk.Label(row, textvariable=self.done_count_var, foreground=self.HELP_GREY).pack(
+            side="right", padx=6)
+        self._help(
+            tab,
+            "Each item is remembered once its link has been fingerprinted, in "
+            f"{DONE_FILE.name} in the program folder. Running a channel again then only "
+            "fetches what is new.",
+            wrap=560,
+        ).pack(anchor="w", padx=22, pady=(0, 8))
+
+        self.verbose_var = tk.BooleanVar(value=False)
+        self.verbose_check = ttk.Checkbutton(
+            tab, text="Show every line of download output in the console",
+            variable=self.verbose_var)
+        self.verbose_check.pack(anchor="w", pady=1)
+        self._help(
+            tab,
+            "Adds everything yt-dlp and audfprint print to the console: each "
+            "download's progress, redirects, retries and warnings. Useful when a "
+            "download fails; otherwise it floods the console. It can't be changed "
+            "while a job is running.",
+            wrap=560,
+        ).pack(anchor="w", padx=22, pady=(0, 6))
         self.open_folder_var = tk.BooleanVar(value=True)
-        for label, var in (
-            ("Show every line of download output in the console", self.verbose_var),
-            ("Open the audio folder when a link starts", self.open_folder_var),
-        ):
-            ttk.Checkbutton(tab, text=label, variable=var).pack(anchor="w", pady=1)
+        ttk.Checkbutton(tab, text="Open the audio folder when a link starts",
+                        variable=self.open_folder_var).pack(anchor="w", pady=1)
 
         # ---- Fingerprinting ----
         tab = ttk.Frame(self.settings_tabs, padding=8)
@@ -778,7 +870,7 @@ class FingerprinterApp:
         # because a 1000-file batch peaks around 5.5 GB, so 4 is roughly 22 GB
         # of this box's 64 GB and leaves room for everything else running.
         ttk.Label(row, text="Fingerprint jobs at once:").pack(side="left", padx=(0, 4))
-        self.fp_concurrency_var = tk.IntVar(value=4)
+        self.fp_concurrency_var = tk.IntVar(value=self.DEFAULT_FP_JOBS)
         self.fp_concurrency_spin = ttk.Spinbox(
             row, from_=1, to=16, textvariable=self.fp_concurrency_var, width=5,
         )
@@ -799,10 +891,12 @@ class FingerprinterApp:
         self._help(row, "(1000 recommended)").pack(side="left", padx=(6, 0))
         self._help(
             tab,
-            "Each fingerprint job can use around 5.5 GB of memory at 1000 recordings "
-            "per file, so raise jobs only if you have the RAM. Keep recordings per file "
-            "high: a matcher reloads every .pklz on each search, so many small files "
-            "slow down every search later.",
+            "Jobs are audfprint processes working at the same time, 4 by default. A link "
+            "with fewer recordings than Recordings per file is one batch; from 40 files, "
+            "the jobs share it and their work is merged into one .pklz. "
+            "Each job can use up to about 5.5 GB of memory, so raise jobs only if you have "
+            "the RAM and CPU cores. Keep recordings per file high: a matcher reloads every "
+            ".pklz on each search, so many small files slow down every search later.",
             wrap=560,
         ).pack(anchor="w", padx=4, pady=(1, 8))
         self.split_long_var = tk.BooleanVar(value=True)
@@ -819,12 +913,16 @@ class FingerprinterApp:
         ).pack(anchor="w", padx=22, pady=(0, 6))
         ttk.Checkbutton(tab, text="Open the fingerprints folder when a run finishes",
                         variable=self.open_pklz_var).pack(anchor="w", pady=1)
+        self.notify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tab, text="Play a sound and flash the taskbar button when a run finishes",
+                        variable=self.notify_var).pack(anchor="w", pady=1)
 
         close = ttk.Frame(self.settings_win)
         close.pack(fill="x", padx=8, pady=8)
         ttk.Button(close, text="Close", command=self._hide_settings).pack(side="right")
 
     def _show_settings(self, tab: int | None = None) -> None:
+        self._update_done_count()
         if tab is not None:
             self.settings_tabs.select(tab)
         self.settings_win.deiconify()
@@ -1097,10 +1195,24 @@ class FingerprinterApp:
         ("open_pklz_var", "open_pklz", bool),
         ("batch_size_var", "batch_size", int),
         ("fp_concurrency_var", "fp_concurrency", int),
+        ("cookies_browser_var", "cookies_browser", str),
+        ("min_seconds_var", "skip_shorter_than", int),
+        ("max_minutes_var", "skip_longer_than", int),
+        ("skip_done_var", "skip_done", bool),
+        ("notify_var", "notify", bool),
     )
 
     def _apply_config(self, cfg: dict) -> None:
         """Apply a loaded config dict to the relevant Tk vars. Bad values silently skipped."""
+        # Every setting is saved on close, defaults included, so a settings
+        # file from before CONFIG_VERSION 3 holds "verbose": true because that
+        # was the default, not because anyone chose it. The default is now off.
+        try:
+            version = int(cfg.get("config_version") or 0)
+        except (TypeError, ValueError):
+            version = 0
+        if version < 3:
+            cfg = {k: v for k, v in cfg.items() if k != "verbose"}
         for var_name, key, conv in self._CONFIG_FIELDS:
             if key not in cfg:
                 continue
@@ -1172,6 +1284,7 @@ class FingerprinterApp:
             value = norm_path(out.get(key, ""))
             out[key] = "" if value and Path(value) == default else value
         # Persist the queue so it survives restarts.
+        out["config_version"] = CONFIG_VERSION
         out["queue"] = list(self.queue_urls)
         out["queue_counts"] = {u: c for u, c in self.queue_counts.items() if u in self.queue_urls}
         console, share = self._console_height(), self._list_share()
@@ -1578,15 +1691,138 @@ class FingerprinterApp:
             self._log(f"[!] Could not open folder: {e}")
 
     def _extra_args(self) -> list[str]:
-        """Parse the free-form extra-args field into a list, respecting quoting."""
+        """yt-dlp options from Settings, for every yt-dlp run that fetches from
+        a site: the browser to sign in with, then Extra download options
+        (parsed respecting quotes)."""
+        args: list[str] = []
+        browser = self.cookies_browser_var.get().strip()
+        if browser and browser != COOKIE_BROWSERS[0]:
+            args += ["--cookies-from-browser", browser.lower()]
         raw = self.extra_args_var.get().strip()
         if not raw:
-            return []
+            return args
         try:
-            return shlex.split(raw, posix=False)
+            return args + shlex.split(raw, posix=False)
         except ValueError as e:
-            self._log(f"[!] Could not parse 'Extra yt-dlp args': {e}. Ignoring.")
-            return []
+            self._log(f"[!] Could not parse 'Extra download options': {e}. Ignoring them.")
+            return args
+
+    # ---- what to leave out (Settings, Downloads) ----------------------------
+
+    @staticmethod
+    def _archive_key(entry: dict) -> str | None:
+        """"<extractor> <id>", as yt-dlp's --download-archive writes it, or None
+        when the listing did not say (such an item is never left out)."""
+        extractor, item_id = entry.get("extractor"), entry.get("id")
+        if not extractor or not item_id:
+            return None
+        return f"{str(extractor).lower()} {item_id}"
+
+    @staticmethod
+    def _load_done() -> set[str]:
+        try:
+            return {ln.strip() for ln in DONE_FILE.read_text(encoding="utf-8").splitlines() if ln.strip()}
+        except OSError:
+            return set()
+
+    def _filter_entries(self, entries: list[dict]) -> list[dict]:
+        """Leave out items outside the length limits and, when asked, items
+        fingerprinted in an earlier run. Items whose length the listing did not
+        give are kept here; yt-dlp checks those itself (see _download_one)."""
+        shortest = self._safe_int(self.min_seconds_var, 0, minimum=0)
+        longest = self._safe_int(self.max_minutes_var, 0, minimum=0) * 60
+        kept: list[dict] = []
+        short = long_ = 0
+        for entry in entries:
+            length = entry.get("duration")
+            if length and shortest and length < shortest:
+                short += 1
+            elif length and longest and length > longest:
+                long_ += 1
+            else:
+                kept.append(entry)
+        if short:
+            self._log(f"[*] Leaving out {short} item(s) shorter than {shortest} seconds.")
+        if long_:
+            self._log(f"[*] Leaving out {long_} item(s) longer than {longest // 60} minutes.")
+        if self.skip_done_var.get():
+            done = self._load_done()
+            before = len(kept)
+            kept = [e for e in kept if self._archive_key(e) not in done]
+            if before > len(kept):
+                self._log(f"[*] Leaving out {before - len(kept)} item(s) already "
+                          f"fingerprinted in an earlier run.")
+        return kept
+
+    def _remember_done(self, entries: list[dict]) -> None:
+        """Worker thread, after a link has been fingerprinted: add its items to
+        the done list. Only then, so a link that fails part-way leaves nothing
+        marked as done that is not in a .pklz."""
+        keys = [k for k in map(self._archive_key, entries) if k]
+        new = [k for k in dict.fromkeys(keys) if k not in self._load_done()]
+        if not new:
+            return
+        try:
+            with open(DONE_FILE, "a", encoding="utf-8") as f:
+                f.writelines(k + "\n" for k in new)
+        except OSError as e:
+            self._log(f"[!] Could not update {DONE_FILE.name}: {e}")
+            return
+        self._log(f"[+] Remembered {len(new)} item(s) as fingerprinted.")
+        self.root.after(0, self._update_done_count)
+
+    def _update_done_count(self) -> None:
+        n = len(self._load_done())
+        self.done_count_var.set(f"{n:,} remembered" if n else "none remembered yet")
+
+    def _forget_done(self) -> None:
+        n = len(self._load_done())
+        if not n:
+            return
+        if not messagebox.askyesno(
+            "Forget fingerprinted items?",
+            f"Forget the {n:,} item(s) remembered as fingerprinted?\n\n"
+            "The next run of each link then downloads and fingerprints everything "
+            "again. The .pklz files you already have are not touched.",
+            parent=self.settings_win,
+        ):
+            return
+        try:
+            DONE_FILE.unlink(missing_ok=True)
+        except OSError as e:
+            messagebox.showerror("Could not forget them", str(e), parent=self.settings_win)
+        self._update_done_count()
+
+    def _notify_done(self) -> None:
+        """UI thread, when a run finishes: a sound, and the taskbar button
+        flashes until the window is brought forward (Settings, Fingerprinting)."""
+        if not self.notify_var.get():
+            return
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:  # noqa: BLE001 - not Windows, or no sound device
+            self.root.bell()
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND),
+                            ("dwFlags", wintypes.DWORD), ("uCount", wintypes.UINT),
+                            ("dwTimeout", wintypes.DWORD)]
+
+            # Tk's own window sits inside the frame Windows draws the taskbar
+            # button for; that frame is its parent.
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            FLASHW_ALL, FLASHW_TIMERNOFG = 0x3, 0xC
+            info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd,
+                              FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0)
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        except Exception:  # noqa: BLE001 - a missed flash is not worth an error
+            pass
 
     @staticmethod
     def _parse_yt_dlp_line(line: str) -> tuple[str | None, str | None]:
@@ -1905,7 +2141,7 @@ class FingerprinterApp:
         state = {"status": "counting", "n": 0}
         self._count_state[url] = state
         self.root.after(0, self._update_count_label, url)
-        cmd = [*self.ytdlp, "--js-runtimes", "node", "--flat-playlist", "--no-warnings",
+        cmd = [*self.ytdlp, *YTDLP_UTF8, "--js-runtimes", "node", "--flat-playlist", "--no-warnings",
                "--print", "%(playlist_title)s", *self._extra_args(), url]
         try:
             proc = subprocess.Popen(
@@ -2239,6 +2475,7 @@ class FingerprinterApp:
                     self._log(f"    [{s}] {u}", tag=tag)
             self._log("=" * 60)
             self._set_status(f"List done: {done}/{total} completed.")
+            self.root.after(0, self._notify_done)
 
             # Open the folder where pklz files ended up, once, at the very end
             # (per-channel opening was suppressed to avoid window spam). Honors
@@ -2411,7 +2648,7 @@ class FingerprinterApp:
         self._log("    (YouTube's first upload, a stable test target.)")
         try:
             proc = subprocess.run(
-                [*self.ytdlp, "--js-runtimes", "node",
+                [*self.ytdlp, *YTDLP_UTF8, "--js-runtimes", "node",
                  "--dump-single-json", "--no-warnings", "--no-playlist",
                  test_url],
                 capture_output=True, text=True, check=False,
@@ -2811,6 +3048,13 @@ class FingerprinterApp:
         entry_state = "readonly" if locked else "normal"
         self.extra_args_entry.config(state=entry_state)
         self.filename_template_entry.config(state=entry_state)
+        # Read for every line a running job prints, so it waits for the next job.
+        self.verbose_check.config(state="disabled" if locked else "normal")
+        # Read as each link is listed, downloaded and recorded.
+        self.cookies_combo.config(state="disabled" if locked else "readonly")
+        for widget in (self.min_seconds_spin, self.max_minutes_spin,
+                       self.skip_done_check, self.forget_done_btn):
+            widget.config(state="disabled" if locked else "normal")
 
     def _finish(self) -> None:
         self.pause_flag.clear()
@@ -2894,6 +3138,13 @@ class FingerprinterApp:
             self._log(f"[+] Source: {channel_name_raw}  ({len(entries)} item(s))")
             if (s := stopped()):
                 return s
+            # Settings, Downloads: items outside the length limits, and items
+            # fingerprinted in an earlier run, are left out here.
+            entries = self._filter_entries(entries)
+            if not entries:
+                self._log(f"[+] {qp}Nothing new to download for this link.")
+                self._set_status(f"{qp}Nothing new.")
+                return "done"
 
             # Resolve this channel's download subfolder now (needed for the
             # pre-download cleanup check below).
@@ -2983,7 +3234,8 @@ class FingerprinterApp:
             pklz_dir = bat_dir / WORK_PKLZ
             pklz_before = self._snapshot_pklz(pklz_dir)
             source_dir = initial_folder
-            if not self._run_fingerprint_stage(bat_dir, source_dir, status_prefix=qp):
+            complete = self._run_fingerprint_stage(bat_dir, source_dir, status_prefix=qp)
+            if not complete:
                 if (s := stopped()):
                     return s
                 # Batches failed but their lists are still on disk, so the pklz
@@ -2999,6 +3251,8 @@ class FingerprinterApp:
             #     empties, to where finished fingerprints are kept.
             keep_dir = self._keep_dir(bat_dir)
             self._move_pklz_files(pklz_dir, keep_dir)
+            if complete and self.skip_done_var.get():
+                self._remember_done(self._downloaded_ok)
 
             # 6d. Delete this channel's download folder now that its audio has
             #     been fingerprinted and the pklz files saved. The next run
@@ -3082,6 +3336,7 @@ class FingerprinterApp:
             self._report_pklz(keep_dir, label="Finished fingerprints")
 
             self._log("[+] All done.")
+            self.root.after(0, self._notify_done)
             self._set_status("Done.")
         except Exception as e:  # noqa: BLE001
             self._log(f"[X] Error: {e!r}")
@@ -3224,13 +3479,11 @@ class FingerprinterApp:
         batch_id: int,
         ncores: int,
         log_lock: threading.Lock,
+        parts: int = 1,
     ) -> tuple[int, bool, str]:
-        """Run audfprint over work/texts/<batch_id>.txt -> work/pklz/<batch_id>.pklz.
-
-        Returns (batch_id, ok, detail). Output is streamed rather than buffered:
-        the old version used Node's exec(), which holds everything in memory and
-        only hands it over at the end, so a batch that died mid-run reported an
-        empty stdout and there was nothing to diagnose it with."""
+        """Run audfprint over work/texts/<batch_id>.txt -> work/pklz/<batch_id>.pklz,
+        as one process or, with `parts` above 1, as that many side by side
+        whose results are merged. Returns (batch_id, ok, detail)."""
         # Every remaining batch is already queued in the pool, so the moment a
         # running one is killed the pool dispatches the next. Without this
         # guard, pressing Stop during batch 4 simply started batch 5.
@@ -3253,6 +3506,79 @@ class FingerprinterApp:
             except OSError:
                 pass
 
+        try:
+            files = [ln for ln in list_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        except OSError:
+            files = []
+        total_files = len(files)
+        new_args = ["new", "-C",               # -C: keep going when one file fails to read
+                    "--ncores", str(max(1, ncores))]
+
+        if parts <= 1:
+            ok, detail = self._audfprint_process(
+                bat_dir, batch_id, [*new_args, "--dbase", str(part_pklz), "--list", str(list_file)],
+                log_lock, total_files)
+        else:
+            # A batch split into parts: each part's files are fingerprinted by
+            # a process of its own, side by side, and the parts are merged into
+            # the batch's one .pklz. Merging only combines hash buckets (which
+            # hold up to 100 entries, the same cap as building in one go), so
+            # the result matches what a single process would have written.
+            part_lists = [texts_dir / f"{batch_id}.part{k + 1}.txt" for k in range(parts)]
+            part_dbs = [pklz_dir / f"{batch_id}.part{k + 1}.pklz" for k in range(parts)]
+            for k, (lst, db) in enumerate(zip(part_lists, part_dbs)):
+                lst.write_text("\n".join(files[k::parts]), encoding="utf-8")
+                db.unlink(missing_ok=True)
+            with ThreadPoolExecutor(max_workers=parts) as pool:
+                results = list(pool.map(
+                    lambda k: self._audfprint_process(
+                        bat_dir, batch_id,
+                        [*new_args, "--dbase", str(part_dbs[k]), "--list", str(part_lists[k])],
+                        log_lock, total_files, part=k),
+                    range(parts)))
+            failed = [d for good, d in results if not good]
+            if failed or self.cancel_flag.is_set():
+                ok, detail = False, (failed[0] if failed else "cancelled")
+            else:
+                with log_lock:
+                    self._log(f"  | [batch {batch_id}] merging {parts} parts into one .pklz...",
+                              tag="bat")
+                ok, detail = self._audfprint_process(
+                    bat_dir, batch_id,
+                    ["newmerge", "--dbase", str(part_pklz), *map(str, part_dbs)], log_lock)
+            for path in (*part_lists, *part_dbs):
+                path.unlink(missing_ok=True)
+
+        if self.cancel_flag.is_set():
+            part_pklz.unlink(missing_ok=True)
+            return batch_id, False, "cancelled"
+        if not ok or not part_pklz.exists():
+            part_pklz.unlink(missing_ok=True)
+            return batch_id, False, detail or "audfprint wrote no .pklz"
+        try:
+            os.replace(part_pklz, final_pklz)
+        except OSError as e:
+            part_pklz.unlink(missing_ok=True)
+            return batch_id, False, f"could not finalise {final_pklz.name}: {e}"
+        return batch_id, True, f"{final_pklz.name} ({final_pklz.stat().st_size / 1024 / 1024:.1f} MB)"
+
+    def _audfprint_process(
+        self,
+        bat_dir: Path,
+        batch_id: int,
+        args: list[str],
+        log_lock: threading.Lock,
+        total_files: int = 0,
+        part: int = 0,
+    ) -> tuple[bool, str]:
+        """Run one audfprint process for a batch (the whole batch, one part of
+        it, or the merge of its parts) and stream its output. Returns (ok,
+        detail); detail says why it failed.
+
+        Output is streamed rather than buffered: the old version used Node's
+        exec(), which holds everything in memory and only hands it over at the
+        end, so a batch that died mid-run reported an empty stdout and there
+        was nothing to diagnose it with."""
         script = bat_dir / "audfprint" / "audfprint.py"
 
         # Go through audfprint_quiet.py so that audfprint's own ffmpeg children
@@ -3266,23 +3592,12 @@ class FingerprinterApp:
         # directly: everything still works, it just flickers again.
         wrapper = Path(__file__).with_name("audfprint_quiet.py")
         launcher = [str(wrapper), str(script)] if wrapper.is_file() else [str(script)]
-        cmd = [
-            # -u matters: Python block-buffers stdout when it is a pipe rather
-            # than a terminal, so audfprint's per-file lines would sit in the
-            # child's buffer and arrive in one lump when the batch ended. Without
-            # it the console shows a single line and then looks frozen for the
-            # twenty minutes the batch actually takes.
-            sys.executable, "-u", *launcher, "new",
-            "-C",                        # keep going when one file fails to read
-            "--dbase", str(part_pklz),
-            "--list", str(list_file),
-            "--ncores", str(max(1, ncores)),
-        ]
-
-        try:
-            total_files = sum(1 for ln in list_file.read_text(encoding="utf-8").splitlines() if ln.strip())
-        except OSError:
-            total_files = 0
+        # -u matters: Python block-buffers stdout when it is a pipe rather than
+        # a terminal, so audfprint's per-file lines would sit in the child's
+        # buffer and arrive in one lump when the batch ended. Without it the
+        # console shows a single line and then looks frozen for the twenty
+        # minutes the batch actually takes.
+        cmd = [sys.executable, "-u", *launcher, *args]
 
         tail: list[str] = []
         try:
@@ -3298,17 +3613,16 @@ class FingerprinterApp:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except OSError as e:
-            return batch_id, False, f"could not start audfprint: {e}"
+            return False, f"could not start audfprint: {e}"
 
         self._track_proc(proc)
-        # Stop can land between the guard above and this spawn, in which case
+        # Stop can land between the caller's guard and this spawn, in which case
         # _cancel walked a process list that did not yet contain us. Re-check
         # now that we are registered, so no batch survives by timing.
         if self.cancel_flag.is_set():
             self._kill_tree(proc)
         try:
             assert proc.stdout is not None
-            last_report = 0.0
             for line in proc.stdout:
                 line = line.rstrip()
                 if not line:
@@ -3323,19 +3637,24 @@ class FingerprinterApp:
                 # every one would be thousands of lines of noise across four
                 # concurrent batches, and dropping them (as this first did) left
                 # the console looking frozen for the twenty minutes a batch runs.
-                # Reported as a counter instead, at most once a second per batch.
+                # Reported as a counter instead, at most once a second per
+                # batch, summed over its parts when it has them.
                 m = _INGESTING_RE.search(line)
                 if m:
-                    done_here = int(m.group(1)) + 1   # audfprint counts from #0
-                    with self._fp_progress_lock:
-                        self._fp_progress[batch_id] = (done_here, total_files)
                     now = time.time()
-                    if now - last_report >= 1.0:
-                        last_report = now
-                        pct = f" {done_here * 100 // total_files}%" if total_files else ""
+                    with self._fp_progress_lock:
+                        # audfprint counts from #0, in each part separately
+                        self._fp_part_done[(batch_id, part)] = int(m.group(1)) + 1
+                        done = sum(n for (b, _p), n in self._fp_part_done.items() if b == batch_id)
+                        self._fp_progress[batch_id] = (done, total_files)
+                        report = now - self._fp_last_report.get(batch_id, 0.0) >= 1.0
+                        if report:
+                            self._fp_last_report[batch_id] = now
+                    if report:
+                        pct = f" {done * 100 // total_files}%" if total_files else ""
                         name = os.path.basename(m.group(2))
                         with log_lock:
-                            self._log(f"  | [batch {batch_id}] {done_here}/{total_files or '?'}"
+                            self._log(f"  | [batch {batch_id}] {done}/{total_files or '?'}"
                                       f"{pct}  {name}", tag="bat")
                         self._publish_fp_progress()
                     continue
@@ -3348,22 +3667,13 @@ class FingerprinterApp:
             self._untrack_proc(proc)
 
         if self.cancel_flag.is_set():
-            part_pklz.unlink(missing_ok=True)
-            return batch_id, False, "cancelled"
-
-        if proc.returncode != 0 or not part_pklz.exists():
-            part_pklz.unlink(missing_ok=True)
+            return False, "cancelled"
+        if proc.returncode != 0:
             detail = f"audfprint exited {proc.returncode}"
             if tail:
                 detail += "\n      last output: " + "\n      ".join(tail[-6:])
-            return batch_id, False, detail
-
-        try:
-            os.replace(part_pklz, final_pklz)
-        except OSError as e:
-            part_pklz.unlink(missing_ok=True)
-            return batch_id, False, f"could not finalise {final_pklz.name}: {e}"
-        return batch_id, True, f"{final_pklz.name} ({final_pklz.stat().st_size / 1024 / 1024:.1f} MB)"
+            return False, detail
+        return True, ""
 
     def _fingerprint_all(self, bat_dir: Path, total_batches: int) -> bool:
         """Run every batch that does not already have its .pklz, concurrently.
@@ -3382,6 +3692,24 @@ class FingerprinterApp:
         tables back through pipes, and that merge is serial, so it stops paying
         off around 8 and got slower at 16. Independent batches have nothing to
         merge.
+
+        With fewer batches than jobs, though, independent batches leave jobs
+        idle: a link under Recordings per file is one batch, and it used to run
+        alone. So the spare jobs split each batch into parts, run as separate
+        --ncores 1 processes (quiet, like any batch), and audfprint's newmerge
+        combines their tables into the batch's one .pklz. Measured with 48
+        files of 6:00 on the same machine, idle:
+
+            1 process                          170.6s
+            2 parts   97.3s + merge 51.4s  =  148.7s
+            4 parts   60.0s + merge 58.9s  =  118.8s
+
+        The merge costs about a minute however small the parts (it loads and
+        saves 400 MB tables and walks every bucket in Python), so splitting
+        only pays from about MIN_FILES_TO_SPLIT files, and pays most for the
+        big batches: a full 1000-file batch goes from about 52 minutes to 14.
+        The merged .pklz holds the same hashes (1,087,603 in both builds here,
+        0.41% dropped in both) and matches the same way.
 
         The cap matters: peak memory measured at 676 MB for 120 files, which
         extrapolates to roughly 5.5 GB for a 1000-file batch, so the default of
@@ -3446,6 +3774,8 @@ class FingerprinterApp:
         # from the first line printed, rather than climbing as batches start.
         with self._fp_progress_lock:
             self._fp_progress = {}
+            self._fp_part_done = {}
+            self._fp_last_report = {}
             for i in pending:
                 try:
                     n_files = sum(1 for ln in (texts_dir / f"{i}.txt").read_text(
@@ -3454,10 +3784,30 @@ class FingerprinterApp:
                     n_files = 0
                 self._fp_progress[i] = (0, n_files)
 
-        concurrency = max(1, min(self._safe_int(self.fp_concurrency_var, 4), len(pending)))
+        # "Fingerprint jobs at once" is how many audfprint processes run side
+        # by side. With at least that many batches, each batch is one process.
+        # With fewer (a link under Recordings per file is a single batch), the
+        # spare jobs go into the batches: each is split into parts that run at
+        # once and are merged into its one .pklz. Before this, a single batch
+        # ran alone however many jobs were allowed. The merge costs about a
+        # minute however small the parts are, so a batch is only split from
+        # MIN_FILES_TO_SPLIT files, into parts of MIN_FILES_PER_PART or more.
+        jobs = self._safe_int(self.fp_concurrency_var, self.DEFAULT_FP_JOBS)
+        concurrency = max(1, min(jobs, len(pending)))
+        spare = jobs // len(pending) if len(pending) < jobs else 1
+        with self._fp_progress_lock:
+            parts = {i: (max(1, min(spare, n // self.MIN_FILES_PER_PART))
+                         if n >= self.MIN_FILES_TO_SPLIT else 1)
+                     for i, (_d, n) in self._fp_progress.items()}
         ncores = AUDFPRINT_NCORES
-        self._log(f"[*] Fingerprinting {len(pending)} batch(es), "
-                  f"{concurrency} at a time, audfprint --ncores {ncores}")
+        n_files_all = sum(t for _d, t in self._fp_progress.values())
+        if max(parts.values()) > 1:
+            self._log(f"[*] Fingerprinting {n_files_all:,} file(s) in {len(pending)} batch(es), "
+                      f"each split into up to {max(parts.values())} parts that run at the "
+                      f"same time and are merged into one .pklz")
+        else:
+            self._log(f"[*] Fingerprinting {n_files_all:,} file(s) in {len(pending)} batch(es), "
+                      f"{concurrency} at a time")
 
         log_lock = threading.Lock()
         completed = 0
@@ -3466,7 +3816,7 @@ class FingerprinterApp:
 
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {
-                pool.submit(self._run_audfprint_batch, bat_dir, i, ncores, log_lock): i
+                pool.submit(self._run_audfprint_batch, bat_dir, i, ncores, log_lock, parts[i]): i
                 for i in pending
             }
             for fut in as_completed(futures):
@@ -3888,9 +4238,13 @@ class FingerprinterApp:
             "%(playlist_uploader)s",
             "%(playlist_channel)s",
             "%(channel)s",
+            # Which extractor found it, for the done list (_archive_key). Flat
+            # entries carry ie_key; a single page has extractor_key instead.
+            "%(ie_key,extractor_key)s",
         ))
         cmd = [
             *self.ytdlp,
+            *YTDLP_UTF8,
             "--js-runtimes", "node",
             "--flat-playlist",
             "--no-warnings",
@@ -3945,6 +4299,7 @@ class FingerprinterApp:
         keys = (
             "id", "title", "duration", "url", "webpage_url",
             "playlist_title", "playlist_uploader", "playlist_channel", "channel",
+            "extractor",
         )
         try:
             for line in proc.stdout:
@@ -3979,7 +4334,8 @@ class FingerprinterApp:
                         "title": obj.get("playlist_title"),
                     }
                 # Strip the playlist-level keys from each entry; the rest of the
-                # pipeline only consumes id/title/duration/url/webpage_url.
+                # pipeline only consumes id/title/duration/url/webpage_url and
+                # the extractor.
                 for k in ("playlist_title", "playlist_uploader",
                           "playlist_channel", "channel"):
                     obj.pop(k, None)
@@ -4027,6 +4383,8 @@ class FingerprinterApp:
         fail = 0
         total = len(entries)
         done = 0
+        # The items that downloaded, for the done list (see _remember_done).
+        self._downloaded_ok: list[dict] = []
 
         # Number of visible slots = min(workers, total)
         slot_count = max(1, min(workers, total))
@@ -4067,6 +4425,8 @@ class FingerprinterApp:
                     self._log(f"  ! Download worker error: {e!r}", tag="warning")
                 if success:
                     ok += 1
+                    if not futures[fut].get("_left_out"):
+                        self._downloaded_ok.append(futures[fut])
                 else:
                     fail += 1
                 done += 1
@@ -4121,6 +4481,7 @@ class FingerprinterApp:
         template = self.filename_template_var.get().strip() or "%(title)s [%(id)s].%(ext)s"
         cmd = [
             *self.ytdlp,
+            *YTDLP_UTF8,
             "--js-runtimes", "node",
             "-o", str(target_folder / template),
             "--no-playlist",
@@ -4131,6 +4492,16 @@ class FingerprinterApp:
         ]
         if not verbose:
             cmd.append("--no-warnings")
+        # The length limits, for items the listing gave no length for (the
+        # rest were left out before downloading). "?" lets an item whose
+        # length yt-dlp cannot find either through.
+        limits = []
+        if (shortest := self._safe_int(self.min_seconds_var, 0, minimum=0)):
+            limits.append(f"duration >=? {shortest}")
+        if (longest := self._safe_int(self.max_minutes_var, 0, minimum=0)):
+            limits.append(f"duration <=? {longest * 60}")
+        if limits:
+            cmd += ["--match-filter", " & ".join(limits)]
         cmd.extend(self._extra_args())
         cmd.append(video_url)
 
@@ -4190,6 +4561,8 @@ class FingerprinterApp:
                     continue
                 if verbose:
                     self._log(f"  [s{slot + 1}] {line}", tag="ytdlp")
+                if "does not pass filter" in line:
+                    entry["_left_out"] = True     # outside the length limits
                 if "[ExtractAudio]" in line and extract_start[0] is None:
                     extract_start[0] = time.time()
                 _, display = self._parse_yt_dlp_line(line)
@@ -4206,6 +4579,8 @@ class FingerprinterApp:
 
         proc.wait()
         success = proc.returncode == 0 and not self.cancel_flag.is_set()
+        if success and entry.get("_left_out"):
+            self._log(f"  - Left out '{title}': outside the length limits in Settings.")
         if not success and not self.cancel_flag.is_set():
             joined = " ".join(err_lines)
             reason = self._classify_yt_dlp_error(joined)
