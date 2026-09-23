@@ -8,7 +8,8 @@
 [![License](https://img.shields.io/github/license/EierkuchenHD/fingerprinter?style=flat-square)](LICENSE)
 
 Builds audio fingerprint databases (`.pklz` files) for identifying unknown
-songs with [WerZatSong](https://github.com/Nel80s/WerZatSong) and WerZatSonGUI.
+songs with [WerZatSong](https://github.com/Nel80s/WerZatSong) and
+[WerZatSonGUI](https://github.com/LostwaveItalia/WerZatSonGUI).
 
 Give it links to channels, playlists or single pages on YouTube, Archive.org,
 Mixcloud, SoundCloud or [any other site yt-dlp
