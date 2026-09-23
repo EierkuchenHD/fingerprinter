@@ -1,6 +1,6 @@
 {
-  "output_dir": "C:/fingerprints/download",
-  "bat_dir": "C:/fingerprints/Fingerprinter",
+  "output_dir": "",
+  "bat_dir": "",
   "move_pklz_dir": "",
   "extra_args": "",
   "filename_template": "%(title)s [%(id)s].%(ext)s",

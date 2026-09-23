@@ -4,9 +4,12 @@ recent_urls.json
 *.txt
 !requirements.txt
 
-# Working folders the app creates and empties as it runs.
-texts/
+# Folders the app creates: your downloads and finished fingerprints, and its
+# own scratch space. texts/ is where older versions kept their file lists.
+downloads/
 pklz-files/
+work/
+texts/
 logs/
 console_logs/
 

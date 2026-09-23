@@ -92,39 +92,59 @@ extra top-level folder, so check that the file is not one level too deep.
 
 ## Using it
 
-1. **Step 1:** paste a link and press **Add to list** (or Enter). Add as many
-   as you like, or use **Import from file** for a text file with one link per
-   line. Untick a row to skip it this time.
-2. **Step 2:** choose the **Working folder for audio**. With more than one link
-   in the list, also set **Keep finished fingerprints in** (see
-   [Limitations](#limitations)).
-3. **Step 3:** press **Download and fingerprint** and follow the **Console**.
+1. Paste a link into the **Link** box and press **Add** (or Enter). Add as many
+   as you like, or use **Import...** for a text file with one link per line.
+2. Press **Download and fingerprint**.
+
+The folders are already set: audio downloads to `downloads\` and
+finished fingerprints are kept in `pklz-files\`, both in the program folder.
+The status bar at the bottom always shows where fingerprints go; click it to
+open that folder, and change it in **Settings** if you want them elsewhere.
+
+The window has three panels, and the dividers between them can be dragged:
+
+- **Your list**, on the left. Drag a row by its `≡` handle to move it, click a
+  link to open it in your browser, untick a row to skip it this time, and click
+  **✕** to remove it. Right-click a row to open or copy the link, count again,
+  move it to the top or bottom, or remove it. Each row shows how many videos
+  the channel or playlist has; the program counts them in the background when a
+  link is added, and again once a day, and a large channel takes a minute or so.
+- **Now**, on the right: which link is running, what it is doing (listing,
+  downloading, splitting or fingerprinting) with a progress bar and a rough
+  time left, and a row for each download or fingerprint batch under way.
+- **Console**, along the bottom: everything that happens, in detail.
+
+Hover over a control to see what it does.
 
 It does not stop to ask anything: for each link it logs how many items it found
 and a rough size and time estimate, then starts. Press **Stop** if the numbers
 are more than you expected.
 
-Finished `.pklz` files go to **Keep finished fingerprints in**, or to
-`pklz-files\` in the program folder if that is empty. They are named after the
-channel handle in the link (for example `@name-1.pklz`), or after the
-uploader.
+Finished `.pklz` files are named after the channel handle in the link (for
+example `@name-1.pklz`), or after the uploader. Nothing in the fingerprints
+folder is ever deleted: if a name is already taken, the new file gets `_2`,
+`_3` and so on.
 
-**Skip this link** moves on to the next link once the current stage finishes.
+**Pause** freezes whatever is running (downloads, splitting and
+fingerprinting) and starts nothing new until you press **Resume**; it then
+carries on from the same point. A download paused for a long time may lose its
+connection, in which case yt-dlp retries and continues from its partial file.
+**Skip link** moves on to the next link once the current stage finishes.
 **Stop** ends everything immediately.
 
 ### Audio you already have
 
-Both buttons under **Audio already on disk** work on the working folder without
-downloading anything, and neither clears the results folder:
+The **Audio on disk** menu has two choices. Both work on the working folder
+without downloading anything, and both ask before they start:
 
 - **Split + fingerprint** splits long files first (see below), then
   fingerprints.
 - **Fingerprint only** uses the files as they are and skips reading their
   lengths, which saves a long wait on a collection that is already split.
 
-These are also the way to resume after a crash: work that is already
-fingerprinted is recorded in `fingerprinted.json` next to the `.pklz` files and
-is not done twice.
+These are also the way to resume after a crash. Neither empties `work\pklz`,
+where unfinished `.pklz` files wait, and work that is already fingerprinted is
+recorded in `work\pklz\fingerprinted.json` and not done twice.
 
 ## Splitting
 
@@ -138,8 +158,8 @@ in these three hours". Six minutes is the minimum because shorter pieces give
 audfprint less to match on. Pieces are cut by copying the audio stream, without
 re-encoding.
 
-Splitting is on by default for downloads (**Advanced settings**). The two
-buttons for audio already on disk decide it for themselves.
+Splitting is on by default for downloads (**Settings**, Fingerprinting). The
+two **Audio on disk** choices decide it for themselves.
 
 ## Settings
 
@@ -149,25 +169,28 @@ memory use, download speed and how big the output files are.
 
 ### Downloads at once
 
-In Step 3. Default **8**, maximum 32. Each download is a separate yt-dlp
+In the toolbar. Default **8**, maximum 32. Each download is a separate yt-dlp
 process. More is faster on a good connection but uses more bandwidth and CPU,
 and sites limit how fast one client may fetch: if downloads start failing with
 HTTP 429 (too many requests) or 403, lower it.
 
-### Advanced settings
+### The Settings window
 
-![The Advanced settings window](screenshot-advanced.png)
+![The Settings window](screenshot-settings.png)
 
-| Setting | Default | What it does |
-|---|---|---|
-| Fingerprint jobs at once | 4 | Batches fingerprinted side by side. Each can use around 5.5 GB of memory at 1000 recordings per file, so raise it only if you have the RAM. |
-| Recordings per file | 1000 | How many recordings go into one `.pklz`. Keep it high: a matcher loads every `.pklz` on each search, so many small files slow every search. |
-| Split long recordings after downloading | On | See [Splitting](#splitting). |
-| Show every line of download output | On | yt-dlp's full output in the console. Useful when a download fails. |
-| Open the audio folder when a link starts | On | |
-| Open the results folder when it finishes | On | |
-| Name downloaded files | `%(title)s [%(id)s].%(ext)s` | A yt-dlp [output template](https://github.com/yt-dlp/yt-dlp#output-template). |
-| Extra download options | empty | Passed to yt-dlp as they are. See [Content that needs a login](#content-that-needs-a-login). |
+| Tab | Setting | Default | What it does |
+|---|---|---|---|
+| Folders | Working folder for audio | `downloads\` | Where audio is downloaded. Each link's audio is deleted once it is fingerprinted, so keep nothing else in it. |
+| Folders | Keep finished fingerprints in | `pklz-files\` | Where finished `.pklz` files are collected. Nothing in it is ever deleted. |
+| Folders | This program's folder | filled in | The folder that holds this program and its `audfprint\`. |
+| Downloads | Name downloaded files | `%(title)s [%(id)s].%(ext)s` | A yt-dlp [output template](https://github.com/yt-dlp/yt-dlp#output-template). |
+| Downloads | Extra download options | empty | Passed to yt-dlp as they are. See [Content that needs a login](#content-that-needs-a-login). |
+| Downloads | Show every line of download output | On | yt-dlp's full output in the console. Useful when a download fails. |
+| Downloads | Open the audio folder when a link starts | On | |
+| Fingerprinting | Fingerprint jobs at once | 4 | Batches fingerprinted side by side. Each can use around 5.5 GB of memory at 1000 recordings per file, so raise it only if you have the RAM. |
+| Fingerprinting | Recordings per file | 1000 | How many recordings go into one `.pklz`. Keep it high: a matcher loads every `.pklz` on each search, so many small files slow every search. |
+| Fingerprinting | Split long recordings after downloading | On | See [Splitting](#splitting). |
+| Fingerprinting | Open the fingerprints folder when a run finishes | On | |
 
 audfprint's own `--ncores` is fixed at 1 on purpose: several single-core jobs
 are faster than one job spread over several cores (measured: 8 jobs at 1 core
@@ -194,13 +217,12 @@ Press **Check setup** first. It:
 | An install fails | The console shows why (no connection, proxy, antivirus) and how to do that part by hand. |
 | Many downloads fail, HTTP 429 or 403 | The site is rate-limiting you. Lower **Downloads at once** and try again later. |
 | Some items are skipped | Private, members-only, age-restricted or blocked in your country. The console gives the reason for each. |
-| A list gave far fewer results than expected | **Keep finished fingerprints in** was empty, so each link overwrote the previous one. |
 | The downloaded audio is gone | Expected: it is deleted once a link is fingerprinted. |
-| A run seems frozen | Big channels take a while to list. Turn on **Show every line of download output** to see progress. |
+| A run seems frozen | Big channels take a while to list; **Now** shows how many entries have been found so far. For more detail, turn on **Show every line of download output** (Settings, Downloads). |
 
 ### Content that needs a login
 
-Add this to **Extra download options**, with `chrome`, `edge` or `brave` in
+Add this to **Extra download options** (Settings, Downloads), with `chrome`, `edge` or `brave` in
 place of `firefox` if needed, and close that browser first:
 
 ```
@@ -216,15 +238,15 @@ service, whose account has no browser profile.
 - **Windows only.**
 - **Downloaded audio is deleted** once each link is fingerprinted. The `.pklz`
   files are the output; keep your own copy of the audio if you want it.
-- **The results folder is emptied before each link.** With more than one link,
-  set **Keep finished fingerprints in**, or only the last link's fingerprints
-  are left. The program warns before starting a list without it.
-- **Download and fingerprint clears the results folder** and its record of
-  finished work. To resume an interrupted run, use one of the buttons for audio
-  already on disk.
-- **The "folder is not empty" prompt answers itself** with "yes, delete" after
-  two minutes, so an unattended list never stalls on it. Move anything you want
-  to keep beforehand.
+- **Download and fingerprint empties `work\`** before each link, without
+  asking, including the record of finished work. A `.pklz` an interrupted run
+  left there is moved to your fingerprints folder as `recovered-...` rather
+  than deleted. To resume an interrupted run instead, use one of the buttons
+  for audio already on disk.
+- **If a link's download folder already holds files** from an earlier attempt,
+  the program asks whether to delete them, and answers "yes" itself after two
+  minutes so an unattended list never stalls. The working folder should hold
+  nothing of yours.
 - **Estimates are rough.** Size and time depend on bitrate, length and your
   connection.
 
@@ -237,8 +259,9 @@ service, whose account has no browser profile.
 | `audfprint_quiet.py` | Runs audfprint with its ffmpeg console windows hidden. |
 | `audfprint\` | WerZatSong's audfprint (installed by setup). |
 | `tools\` | ffmpeg and Node.js, if setup installed them. |
-| `pklz-files\` | Results, when no destination is set. |
-| `texts\` | File lists for audfprint. Cleared before fingerprinting. |
+| `downloads\` | The default working folder. Each link downloads into its own subfolder here, deleted once it is fingerprinted. |
+| `pklz-files\` | The default place finished fingerprints are kept. Nothing in it is deleted. |
+| `work\` | The program's scratch space: file lists for audfprint and unfinished `.pklz` files. |
 | `config.json`, `recent_urls.json` | Your settings, list and recent links. |
 | `CHANGELOG.md` | What changed in each version. |
 
