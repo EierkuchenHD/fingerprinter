@@ -1,26 +1,32 @@
 """
-YouTube Channel Fingerprinter
------------------------------
+Fingerprinter (Windows only)
+----------------------------
 Pipeline:
-  1. Extract video list from a YouTube channel/playlist URL via yt-dlp
-  2. Optionally let the user untick videos they don't want
-  3. Show a size/time estimate and confirm before proceeding
-  4. Download each selected video as native m4a/opus (no transcode) in
-     parallel into <output_dir>/<CHANNEL>_subfolder
+  1. List the entries behind a link via yt-dlp: a channel, playlist or single
+     page on YouTube, Archive.org, Mixcloud, SoundCloud or any other site
+     yt-dlp supports
+  2. Log how many entries were found and a rough size/time estimate, then
+     start without asking (so a list can run unattended)
+  3. If a previous run left files in this link's download subfolder, offer
+     to clear it
+  4. Download each entry as native m4a/opus (no transcode), several at once,
+     into <output_dir>/<name>_subfolder
   5. Probe each file with ffprobe; split anything over 12:00 in place into
-     pieces of at least 6:00 (audfprint has less to match on the shorter a
-     piece is), or warn in red if splitting is disabled
-  6. Confirm-clear the bat dir's texts/ and pklz-files/ folders if non-empty
+     6:00 pieces, the last one taking the remainder (audfprint has less to
+     match on the shorter a piece is)
+  6. Confirm-clear the program folder's texts/ and pklz-files/ if non-empty
   7. Scan that folder for audio and fingerprint it with audfprint, several
-     batches at a time (in-process: no .bat files and no node involved)
+     batches at a time
   8. List the resulting pklz-files folder and optionally open it
 
-Requirements:
-  - Python 3.10+
-  - yt-dlp on PATH (`pip install yt-dlp`)
-  - ffmpeg + ffprobe on PATH
-  - node on PATH (used by yt-dlp's --js-runtimes node; no longer needed for
-    fingerprinting, which now drives audfprint directly)
+Requirements (dependencies.py checks them and installs what is missing):
+  - Python 3.10+ with the packages in requirements.txt
+  - yt-dlp
+  - ffmpeg + ffprobe
+  - Node.js (yt-dlp runs it for YouTube via --js-runtimes node)
+  - audfprint from WerZatSong (github.com/Nel80s/WerZatSong, libs/audfprint)
+    in <program folder>/audfprint. Upstream dpwe/audfprint does not work:
+    see dependencies.py for why.
 """
 from __future__ import annotations
 
@@ -40,6 +46,10 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+import dependencies
+
+__version__ = "1.0.0-beta.1"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -71,10 +81,13 @@ def extract_handle(url: str, fallback: str = "") -> str:
     return "channel"
 
 
-def check_dependency(cmd: str) -> bool:
+def check_dependency(cmd: str | list[str]) -> bool:
+    """True if the program starts at all. A list is a full command, such as
+    ["python", "-m", "yt_dlp"]."""
+    argv = [cmd] if isinstance(cmd, str) else list(cmd)
     try:
         subprocess.run(
-            [cmd, "--version"],
+            [*argv, "--version"],
             capture_output=True,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -215,17 +228,23 @@ def fmt_time(seconds: float) -> str:
 class FingerprinterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("YouTube Channel Fingerprinter")
-        # Sized against the actual screen rather than a fixed guess. The
-        # step-by-step layout carries an explanation line under most controls,
-        # which is worth roughly 170px of height over the old dense version; at
-        # a hardcoded 780 the log box at the bottom got squeezed to nothing.
-        # Clamped so a laptop at 1366x768 still gets a usable window instead of
-        # one running off the bottom of the screen.
+        self.root.title(f"Fingerprinter {__version__}")
+        # Sized against the actual screen rather than a fixed guess, and clamped
+        # so a 1366x768 laptop still gets a window that fits. The controls
+        # scroll inside their own pane and the console takes the rest (see
+        # _build_ui), so a short screen costs scrolling, not console space.
         want_w = min(1100, max(900, self.root.winfo_screenwidth() - 80))
-        want_h = min(900, max(560, self.root.winfo_screenheight() - 70))
+        want_h = min(1000, max(600, self.root.winfo_screenheight() - 80))
         self.root.geometry(f"{want_w}x{want_h}")
-        self.root.minsize(900, 560)
+        self.root.minsize(900, 600)
+
+        # ffmpeg and Node.js installed by Check setup live in tools\; put them
+        # on PATH for this process and everything it starts.
+        dependencies.add_tools_to_path()
+        # How to run yt-dlp: the exe on PATH, or `python -m yt_dlp` when pip put
+        # it somewhere PATH does not reach. Resolved at startup (off the UI
+        # thread) and again after anything is installed.
+        self.ytdlp: list[str] = ["yt-dlp"]
 
         self.log_queue: queue.Queue[tuple[str, str, str | None]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
@@ -257,6 +276,16 @@ class FingerprinterApp:
             self.bat_dir_var.set(str(Path(__file__).resolve().parent))
         self._poll_log_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Quick look for anything missing, so a first run offers to install it
+        # instead of failing halfway through the first link. Started from the
+        # event loop, and handed the folder rather than reading the Tk variable
+        # itself: a worker that touches Tk before mainloop is running dies with
+        # "main thread is not in main loop", silently under pythonw.
+        self.root.after(200, lambda: threading.Thread(
+            target=self._startup_check,
+            args=(self.bat_dir_var.get().strip() or str(dependencies.APP_DIR),),
+            daemon=True,
+        ).start())
 
     # ------------------------- UI ---------------------------------------------
     #
@@ -268,6 +297,13 @@ class FingerprinterApp:
     # for; that is deliberately visible text rather than a tooltip, because a
     # tooltip only helps someone who already suspects there is something to
     # hover over.
+
+    # Parallel yt-dlp downloads. Each is one yt-dlp process (roughly 50-100 MB)
+    # plus a brief ffmpeg remux, so the machine is rarely the limit; the site is.
+    # Push a single host hard enough and it answers HTTP 429, which is why the
+    # default stays moderate and the ceiling finite.
+    DEFAULT_PARALLEL = 8
+    MAX_PARALLEL = 32
 
     HELP_FONT = ("Segoe UI", 8)
     HELP_GREY = "#5f6b7a"
@@ -306,11 +342,65 @@ class FingerprinterApp:
         hint.grid(row=row + 1, column=1, columnspan=2, sticky="w", padx=4, pady=(1, 2))
         return hint
 
+    # The console keeps at least this much of the window, and at least this
+    # share of it, however much the controls above would like.
+    CONSOLE_MIN_HEIGHT = 300
+    CONSOLE_MIN_SHARE = 0.4
+
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 4}
 
+        # Status bar first, so it keeps its place at the bottom at any size.
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(
+            self.root, textvariable=self.status_var, relief="sunken", anchor="w",
+        ).pack(side="bottom", fill="x")
+
+        # Two panes with a draggable divider: the controls on top, scrollable
+        # when they do not fit, and the console underneath. The console used to
+        # get whatever height was left under four stacked panels, which on most
+        # screens was a handful of lines.
+        # The classic PanedWindow rather than ttk's: with the Windows theme the
+        # ttk sash draws as blank background, so nothing says it can be dragged.
+        self.panes = tk.PanedWindow(
+            self.root, orient="vertical", sashrelief="raised", sashwidth=8,
+            borderwidth=0, opaqueresize=True,
+        )
+        self.panes.pack(fill="both", expand=True)
+
+        controls = ttk.Frame(self.panes)
+        controls.rowconfigure(0, weight=1)
+        controls.columnconfigure(0, weight=1)
+        self.controls_canvas = tk.Canvas(controls, highlightthickness=0, yscrollincrement=20)
+        self.controls_scroll = ttk.Scrollbar(
+            controls, orient="vertical", command=self.controls_canvas.yview,
+        )
+        self.controls_canvas.configure(yscrollcommand=self.controls_scroll.set)
+        self.controls_canvas.grid(row=0, column=0, sticky="nsew")
+        self.controls_scroll.grid(row=0, column=1, sticky="ns")
+        body = ttk.Frame(self.controls_canvas)
+        self.controls_body = body
+        body_id = self.controls_canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _body_config(_e: object) -> None:
+            self.controls_canvas.configure(scrollregion=self.controls_canvas.bbox("all"))
+            self._fit_controls_scrollbar()
+        body.bind("<Configure>", _body_config)
+
+        def _controls_canvas_config(e: object) -> None:
+            self.controls_canvas.itemconfigure(body_id, width=e.width)  # type: ignore[attr-defined]
+            self._fit_controls_scrollbar()
+        self.controls_canvas.bind("<Configure>", _controls_canvas_config)
+        # stretch="never": resizing the window grows or shrinks the console, not the controls.
+        self.panes.add(controls, stretch="never", minsize=120)
+
+        # One mouse-wheel handler for the whole program (see _on_mousewheel):
+        # these canvases scroll when the pointer is over them.
+        self._wheel_targets: list[tk.Canvas] = [self.controls_canvas]
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+
         # ---- Step 1: what to fingerprint ----------------------------------
-        src = ttk.LabelFrame(self.root, text="  Step 1   What do you want to fingerprint?  ")
+        src = ttk.LabelFrame(body, text="  Step 1   What to fingerprint  ")
         src.pack(fill="x", **pad)
 
         top = ttk.Frame(src)
@@ -335,9 +425,9 @@ class FingerprinterApp:
 
         self._help(
             src,
-            "A YouTube channel or playlist, or an archive.org page. Press Add to "
-            "list (or hit Enter). Add as many as you like — they are worked "
-            "through from top to bottom.",
+            "A channel, playlist or single page from YouTube, Archive.org, Mixcloud, "
+            "SoundCloud or any other site yt-dlp supports. The list runs from top "
+            "to bottom.",
         ).pack(anchor="w", padx=8, pady=(2, 4))
 
         ttk.Label(src, text="Your list:").pack(anchor="w", padx=8, pady=(2, 0))
@@ -369,13 +459,7 @@ class FingerprinterApp:
         def _q_canvas_config(e: object) -> None:
             self.queue_canvas.itemconfigure(_q_inner_id, width=e.width)  # type: ignore[attr-defined]
         self.queue_canvas.bind("<Configure>", _q_canvas_config)
-
-        def _q_wheel(event: object) -> None:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                self.queue_canvas.yview_scroll(int(-delta / 120), "units")
-        self.queue_canvas.bind("<Enter>", lambda _e: self.queue_canvas.bind_all("<MouseWheel>", _q_wheel, add="+"))
-        self.queue_canvas.bind("<Leave>", lambda _e: self.queue_canvas.unbind_all("<MouseWheel>"))
+        self._wheel_targets.append(self.queue_canvas)
 
         # List control buttons stacked on the right.
         q_btns = ttk.Frame(q_inner)
@@ -401,7 +485,7 @@ class FingerprinterApp:
         self.queue_active: int | None = None
 
         # ---- Step 2: where things go --------------------------------------
-        dirs = ttk.LabelFrame(self.root, text="  Step 2   Where should the files go?  ")
+        dirs = ttk.LabelFrame(body, text="  Step 2   Folders  ")
         dirs.pack(fill="x", **pad)
 
         self.output_dir_var = tk.StringVar()
@@ -410,13 +494,13 @@ class FingerprinterApp:
 
         self._folder_row(
             dirs, 0, "Working folder for audio:", self.output_dir_var,
-            "Audio is downloaded here while it works — and deleted again once a "
-            "link has been fingerprinted. Nothing you want to keep should live here.",
+            "Downloads land here and are deleted once each link is fingerprinted, "
+            "so keep nothing else in it.",
         )
         self._folder_row(
             dirs, 2, "This program's folder:", self.bat_dir_var,
-            "The folder holding this program and audfprint. Filled in for you; "
-            "change it only if you moved things around.",
+            "Holds this program and its audfprint folder, which must be WerZatSong's "
+            "version of audfprint. Filled in automatically.",
         )
         self.move_hint = self._folder_row(
             dirs, 4, "Keep finished fingerprints in:", self.move_pklz_dir_var,
@@ -430,7 +514,7 @@ class FingerprinterApp:
         self.move_pklz_dir_var.trace_add("write", lambda *_a: self._update_move_hint())
 
         # ---- Step 3: go ----------------------------------------------------
-        go = ttk.LabelFrame(self.root, text="  Step 3   Start  ")
+        go = ttk.LabelFrame(body, text="  Step 3   Start  ")
         go.pack(fill="x", **pad)
 
         btns = ttk.Frame(go)
@@ -441,9 +525,27 @@ class FingerprinterApp:
         self.skip_btn.pack(side="left", padx=4)
         self.cancel_btn = ttk.Button(btns, text="Stop", command=self._cancel, state="disabled")
         self.cancel_btn.pack(side="left", padx=4)
-        # Diagnostic rather than part of the run — pushed right, visually apart.
-        self.test_btn = ttk.Button(btns, text="Check my setup", command=self._start_test_connection)
+        # Diagnostic rather than part of the run: pushed right, visually apart.
+        self.test_btn = ttk.Button(btns, text="Check setup", command=self._start_test_connection)
         self.test_btn.pack(side="right", padx=(4, 0))
+
+        # Download concurrency sits next to the button it affects rather than in
+        # Advanced: it is the setting most worth changing, and the one people
+        # went looking for. Raised from 4 to 8 by default; the ceiling is 32.
+        speed = ttk.Frame(go)
+        speed.pack(fill="x", padx=4, pady=(6, 0))
+        ttk.Label(speed, text="Downloads at once:").pack(side="left", padx=(0, 4))
+        self.parallel_var = tk.IntVar(value=self.DEFAULT_PARALLEL)
+        self.parallel_spin = ttk.Spinbox(
+            speed, from_=1, to=self.MAX_PARALLEL, textvariable=self.parallel_var, width=5,
+        )
+        self.parallel_spin.pack(side="left")
+        self._help(
+            speed,
+            "More is faster on a good connection but uses more bandwidth and CPU. "
+            "If downloads start failing (for example HTTP 429, too many requests), lower it.",
+            wrap=760,
+        ).pack(side="left", padx=8)
 
         # Second row: the two ways of working on audio that is already on disk.
         # They are separate buttons rather than one button plus a setting
@@ -467,16 +569,14 @@ class FingerprinterApp:
 
         self._help(
             go,
-            "Download and fingerprint does the whole job for every ticked link. "
-            "For audio you already have, Split + fingerprint cuts anything over "
-            "12 minutes first, while Fingerprint only skips the length check "
-            "altogether — far quicker over a collection that is already in "
-            "pieces, since nothing has to be examined. Not sure everything is "
-            "installed? Press Check my setup.",
+            "Download and fingerprint runs every ticked link. For audio already in "
+            "the working folder, Split + fingerprint first splits files over 12 minutes "
+            "into 6-minute pieces, and Fingerprint only uses the files as they are. "
+            "Check setup finds anything missing and offers to install it.",
         ).pack(anchor="w", padx=8, pady=(3, 6))
 
         # ---- Advanced (folded away) ----------------------------------------
-        self.adv_holder = ttk.Frame(self.root)
+        self.adv_holder = ttk.Frame(body)
         self.adv_holder.pack(fill="x", padx=8, pady=(2, 0))
         self.adv_open = False
         self.adv_btn = ttk.Button(
@@ -486,7 +586,8 @@ class FingerprinterApp:
         self.adv_btn.pack(side="left")
         self._help(
             self.adv_holder,
-            "Everything here already has a sensible default.",
+            "Worth checking before a large job: memory use, output file size and "
+            "download options are set here.",
         ).pack(side="left", padx=8)
 
         # Advanced settings get their own small window instead of folding out
@@ -504,22 +605,17 @@ class FingerprinterApp:
         self.adv_frame = ttk.Frame(self.adv_win)
         self.adv_frame.pack(fill="both", expand=True)
 
-        # Row 1: how hard to work the machine
+        # Row 1: how hard to work the machine. (Downloads at once lives in
+        # Step 3, next to the button it affects.)
         opts_r1 = ttk.Frame(self.adv_frame)
         opts_r1.pack(fill="x", padx=4, pady=(6, 2))
-        ttk.Label(opts_r1, text="Downloads at once:").pack(side="left", padx=(0, 4))
-        self.parallel_var = tk.IntVar(value=4)
-        self.parallel_spin = ttk.Spinbox(
-            opts_r1, from_=1, to=16, textvariable=self.parallel_var, width=5,
-        )
-        self.parallel_spin.pack(side="left")
 
         # Concurrent batches is the one that matters. Measured here: the old
         # single sequential audfprint did 32 files in 117s; eight concurrent
         # batches did the same 32 in 28s. It is capped rather than opened up
         # because a 1000-file batch peaks around 5.5 GB, so 4 is roughly 22 GB
         # of this box's 64 GB and leaves room for everything else running.
-        ttk.Label(opts_r1, text="   Fingerprint jobs at once:").pack(side="left", padx=(12, 4))
+        ttk.Label(opts_r1, text="Fingerprint jobs at once:").pack(side="left", padx=(0, 4))
         self.fp_concurrency_var = tk.IntVar(value=4)
         self.fp_concurrency_spin = ttk.Spinbox(
             opts_r1, from_=1, to=16, textvariable=self.fp_concurrency_var, width=5,
@@ -543,10 +639,11 @@ class FingerprinterApp:
 
         self._help(
             self.adv_frame,
-            "Raise the first two to use more of the machine; lower them if "
-            "downloads start failing or memory runs short. Recordings per file "
-            "is best left alone: a matching tool reloads every .pklz each time "
-            "it runs, so many small ones slow every future search.",
+            "Each fingerprint job can use around 5.5 GB of memory at 1000 recordings "
+            "per file, so raise jobs only if you have the RAM. Keep recordings per file "
+            "high: a matcher reloads every .pklz on each search, so many small files "
+            "slow down every search later.",
+            wrap=640,
         ).pack(anchor="w", padx=8, pady=(0, 4))
 
         # Row 2: behavioural checkboxes
@@ -566,11 +663,11 @@ class FingerprinterApp:
 
         self._help(
             self.adv_frame,
-            "Splitting matters more than it sounds: a match against a three-hour "
-            "mix only tells you it is somewhere in three hours, while a match "
-            "against a 6-minute piece points straight at it. This applies to "
-            "downloads; for audio already on disk the two buttons in Step 3 "
-            "decide it instead.",
+            "Files over 12 minutes are split into 6-minute pieces (the last piece "
+            "takes the remainder), so a match points to a 6-minute window instead of "
+            "a whole recording. Applies to downloads; the two buttons for audio "
+            "already on disk decide for themselves.",
+            wrap=640,
         ).pack(anchor="w", padx=8, pady=(0, 4))
 
         # Row 3: filename template
@@ -584,8 +681,8 @@ class FingerprinterApp:
         self.filename_template_entry.pack(side="left", fill="x", expand=True)
         self._help(
             self.adv_frame,
-            "yt-dlp naming. The default gives “Title [videoid].m4a”. "
-            "Safe to ignore.",
+            "A yt-dlp output template. The default gives “Title [id].m4a”.",
+            wrap=640,
         ).pack(anchor="w", padx=8, pady=(1, 4))
 
         # Row 4: extra yt-dlp args
@@ -597,9 +694,9 @@ class FingerprinterApp:
         self.extra_args_entry.pack(side="left", fill="x", expand=True)
         self._help(
             self.adv_frame,
-            "Passed straight to yt-dlp. For videos that need you signed in, try "
-            "--cookies-from-browser firefox (or chrome, edge, brave), with that "
-            "browser closed.",
+            "Passed to yt-dlp as they are. For content that needs a login, try "
+            "--cookies-from-browser firefox (or chrome, edge, brave) with that browser closed.",
+            wrap=640,
         ).pack(anchor="w", padx=8, pady=(1, 6))
 
         # An explicit way out, so the window does not rely on the title-bar X.
@@ -609,13 +706,13 @@ class FingerprinterApp:
         ttk.Button(adv_close, text="Close", command=self._hide_advanced).pack(side="right")
 
         # ---- Progress ------------------------------------------------------
-        active_box = ttk.LabelFrame(self.root, text="  Downloading now  ")
+        active_box = ttk.LabelFrame(body, text="  Downloading now  ")
         active_box.pack(fill="x", **pad)
 
         # A fixed-height canvas holds the slot rows. With many parallel
-        # downloads (up to 16) the rows scroll inside this fixed area instead
-        # of stretching the panel and squashing the log box.
-        active_canvas = tk.Canvas(active_box, height=60, highlightthickness=0)
+        # downloads (up to MAX_PARALLEL) the rows scroll inside this fixed area
+        # instead of stretching the panel.
+        active_canvas = tk.Canvas(active_box, height=80, highlightthickness=0)
         active_scroll = ttk.Scrollbar(
             active_box, orient="vertical", command=active_canvas.yview,
         )
@@ -636,15 +733,7 @@ class FingerprinterApp:
         def _active_canvas_config(e: object) -> None:
             active_canvas.itemconfigure(active_inner_id, width=e.width)  # type: ignore[attr-defined]
         active_canvas.bind("<Configure>", _active_canvas_config)
-
-        # Mousewheel scrolls the panel only while the cursor is over it
-        # (scoped via Enter/Leave so it never steals wheel events globally).
-        def _active_wheel(event: object) -> None:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                active_canvas.yview_scroll(int(-delta / 120), "units")
-        active_canvas.bind("<Enter>", lambda _e: active_canvas.bind_all("<MouseWheel>", _active_wheel, add="+"))
-        active_canvas.bind("<Leave>", lambda _e: active_canvas.unbind_all("<MouseWheel>"))
+        self._wheel_targets.append(active_canvas)
 
         self.slot_vars: list[tk.StringVar] = []
         # placeholder line so the frame doesn't collapse before a run
@@ -653,35 +742,25 @@ class FingerprinterApp:
         )
         self._slot_placeholder.pack(anchor="w")
 
-        # ---- Log -----------------------------------------------------------
-        log_header = ttk.Frame(self.root)
-        log_header.pack(fill="x", padx=8, pady=(4, 0))
-        ttk.Label(log_header, text="What it is doing").pack(side="left")
+        # ---- Console (lower pane) ------------------------------------------
+        console = ttk.LabelFrame(self.panes, text="  Console  ")
+        self.panes.add(console, stretch="always", minsize=120)
 
-        # Pack the bottom-anchored widgets FIRST (status bar, then log buttons)
-        # using side="bottom". Tk reserves their space before the expanding log,
-        # so on small screens the log shrinks instead of pushing them off-screen.
-        self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(
-            self.root, textvariable=self.status_var, relief="sunken", anchor="w",
-        ).pack(side="bottom", fill="x")
-
-        log_btns = ttk.Frame(self.root)
-        log_btns.pack(side="bottom", fill="x", padx=8, pady=(0, 4))
+        # Buttons first with side="bottom", so a short pane shrinks the text
+        # rather than pushing them out of view.
+        log_btns = ttk.Frame(console)
+        log_btns.pack(side="bottom", fill="x", padx=4, pady=(0, 4))
         self.clear_btn = ttk.Button(log_btns, text="Clear", command=self._clear_log)
         self.clear_btn.pack(side="left", padx=(0, 4))
         self.copy_btn = ttk.Button(log_btns, text="Copy", command=self._copy_log)
         self.copy_btn.pack(side="left", padx=4)
         self._help(
             log_btns,
-            "Copy this and include it if you need to ask someone for help.",
+            "Drag the divider above to resize. Include this output when asking for help.",
         ).pack(side="left", padx=8)
 
-        # The log fills whatever vertical space is left between the top widgets
-        # and the bottom-pinned buttons/status bar. A minimum height keeps it
-        # usable; it shrinks (not the buttons) when the window is small.
-        self.log_text = scrolledtext.ScrolledText(self.root, height=10, font=("Consolas", 9))
-        self.log_text.pack(fill="both", expand=True, padx=8, pady=4)
+        self.log_text = scrolledtext.ScrolledText(console, height=12, font=("Consolas", 9))
+        self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
         self.log_text.configure(state="disabled")
         self.log_text.tag_configure("ytdlp", foreground="#1565c0")
         self.log_text.tag_configure("bat", foreground="#e67e22")
@@ -690,6 +769,81 @@ class FingerprinterApp:
         self.log_text.tag_configure("ts", foreground="#888888")
 
         self._update_move_hint()
+        # Where the divider goes can only be worked out once the window has a size.
+        self.root.after(50, self._place_divider)
+
+    def _place_divider(self, attempt: int = 0) -> None:
+        """Give the console its share of the window, and the controls the rest.
+
+        The controls get the height they need, up to what is left after the
+        console's minimum (CONSOLE_MIN_HEIGHT, or CONSOLE_MIN_SHARE of the
+        window, whichever is more); past that they scroll. A console height
+        the user dragged to last time wins, if it still fits."""
+        self.root.update_idletasks()
+        total = self.panes.winfo_height()
+        if total < 200:
+            if attempt < 20:
+                self.root.after(50, self._place_divider, attempt + 1)
+            return
+        console_min = max(self.CONSOLE_MIN_HEIGHT, int(total * self.CONSOLE_MIN_SHARE))
+        saved = getattr(self, "_saved_console_height", 0)
+        if 150 <= saved <= total - 150:
+            top = total - saved
+        else:
+            top = min(self.controls_body.winfo_reqheight() + 4, total - console_min)
+        self.panes.sash_place(0, 0, max(150, top))
+
+    def _console_height(self) -> int:
+        """Current console pane height, for remembering the divider across runs."""
+        try:
+            return int(self.panes.winfo_height() - self.panes.sash_coord(0)[1])
+        except (tk.TclError, ValueError, IndexError):
+            return 0
+
+    def _fit_controls_scrollbar(self) -> None:
+        """Show the controls' scrollbar only while they do not fit."""
+        need = self.controls_body.winfo_reqheight()
+        have = self.controls_canvas.winfo_height()
+        if need > have + 1:
+            self.controls_scroll.grid()
+        else:
+            self.controls_scroll.grid_remove()
+            self.controls_canvas.yview_moveto(0)
+
+    def _on_mousewheel(self, event: tk.Event) -> str | None:
+        """Scroll whatever is under the pointer.
+
+        One handler for the whole program. Each scrollable area used to bind
+        the wheel for itself while the pointer was over it, and unbind *every*
+        wheel binding when it left, so moving between them (the list inside
+        the controls pane, say) could leave nothing scrolling at all.
+
+        Walks up from the widget under the pointer to the nearest registered
+        canvas that can still move in that direction, so a short list lets the
+        pane around it scroll instead. Text boxes, spinboxes and comboboxes
+        handle the wheel themselves and are left alone."""
+        try:
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):   # a Tk-internal window with no Python object
+            return None
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            return None
+        steps = -int(delta / 120) or (-1 if delta > 0 else 1)
+        while widget is not None:
+            try:
+                cls = widget.winfo_class()
+            except tk.TclError:
+                return None
+            if cls in ("Text", "TSpinbox", "TCombobox", "Listbox"):
+                return None
+            if widget in self._wheel_targets:
+                first, last = widget.yview()
+                if (steps < 0 and first > 0) or (steps > 0 and last < 1):
+                    widget.yview_scroll(steps, "units")
+                    return "break"
+            widget = widget.master
+        return None
 
     def _toggle_advanced(self) -> None:
         (self._hide_advanced if self.adv_open else self._show_advanced)()
@@ -724,15 +878,15 @@ class FingerprinterApp:
         many = len(getattr(self, "queue_urls", [])) > 1
         if many and not self.move_pklz_dir_var.get().strip():
             hint.configure(
-                text="Needed here — you have more than one link. The results folder "
-                     "is emptied before each one, so without a destination you "
-                     "will keep only the last link's fingerprints.",
+                text="Required with more than one link: the results folder is emptied "
+                     "before each link, so without this you keep only the last link's "
+                     "fingerprints.",
                 foreground=self.HELP_WARN,
             )
         else:
             hint.configure(
-                text="Where your finished .pklz files are collected. Optional for a "
-                     "single link; required once the list has more than one.",
+                text="Where finished .pklz files are collected. Optional for a single "
+                     "link, required for more.",
                 foreground=self.HELP_GREY,
             )
 
@@ -822,6 +976,11 @@ class FingerprinterApp:
                 # disabled every button and before any worker existed, leaving
                 # the window dead until restart.
                 pass
+        # The console height the divider was last dragged to (see _place_divider).
+        try:
+            self._saved_console_height = int(cfg.get("console_height") or 0)
+        except (TypeError, ValueError):
+            self._saved_console_height = 0
         # Restore the saved channel queue (crash recovery / persistence).
         saved_queue = cfg.get("queue")
         if isinstance(saved_queue, list):
@@ -858,6 +1017,9 @@ class FingerprinterApp:
                 pass
         # Persist the queue so it survives restarts.
         out["queue"] = list(self.queue_urls)
+        height = self._console_height()
+        if height > 0:
+            out["console_height"] = height
         return out
 
     def _on_close(self) -> None:
@@ -865,10 +1027,9 @@ class FingerprinterApp:
         if self.worker_thread is not None and self.worker_thread.is_alive():
             confirm = messagebox.askyesno(
                 "Quit while running?",
-                "A process is still running.\n\n"
-                "Quitting now will stop the run and may leave background "
-                "yt-dlp or ffmpeg processes alive briefly until they finish.\n\n"
-                "Are you sure you want to quit?",
+                "A job is still running.\n\n"
+                "Quitting stops it. yt-dlp or ffmpeg may take a few seconds to exit.\n\n"
+                "Quit anyway?",
                 icon="warning",
                 default="no",
                 parent=self.root,
@@ -1042,16 +1203,16 @@ class FingerprinterApp:
         est_dl_seconds = (n * 25) / max(1, workers)
         time_str = fmt_time(est_dl_seconds)
 
-        self._log(f"[+] Estimate: {n} videos, {size_str}, {time_str} at parallel={workers}")
+        self._log(f"[+] Estimate: {n} item(s), {size_str}, {time_str} with {workers} downloads at once")
         if log_only:
             return True
         msg = (
-            f"{n} videos\n"
+            f"{n} item(s)\n"
             f"{size_str} estimated\n"
-            f"{time_str} at parallel={workers}\n\n"
-            f"Note: estimates are rough — real size/time depends on bitrate, length, "
+            f"{time_str} with {workers} downloads at once\n\n"
+            f"Estimates are rough: real size and time depend on bitrate, length "
             f"and connection speed.\n\n"
-            f"Proceed with download?"
+            f"Start the download?"
         )
         return self._ask_yes_no("Confirm download", msg)
 
@@ -1066,12 +1227,13 @@ class FingerprinterApp:
         def show() -> None:
             try:
                 dlg = tk.Toplevel(self.root)
-                dlg.title(f"Select videos to download ({len(entries)} found)")
+                dlg.title(f"Select what to download ({len(entries)} found)")
                 dlg.transient(self.root)
                 dlg.geometry("760x560")
                 dlg.minsize(560, 400)
 
                 def on_close() -> None:
+                    cleanup_bindings()
                     result[0] = None
                     done.set()
                     dlg.destroy()
@@ -1083,8 +1245,7 @@ class FingerprinterApp:
                 ttk.Label(
                     top,
                     text=(
-                        f"Untick any videos you don't want to download. "
-                        f"All {len(entries)} are selected by default."
+                        f"Untick anything you don't want. All {len(entries)} are selected."
                     ),
                     wraplength=720, justify="left",
                 ).pack(anchor="w")
@@ -1125,35 +1286,15 @@ class FingerprinterApp:
                     canvas.itemconfigure(inner_id, width=e.width)  # type: ignore[attr-defined]
                 canvas.bind("<Configure>", on_canvas_config)
 
-                def on_mousewheel(event: object) -> None:
-                    delta = getattr(event, "delta", 0)
-                    if delta:
-                        canvas.yview_scroll(int(-delta / 120), "units")
-                # Bind to the dialog and its scroll region only — not bind_all,
-                # which would steal wheel events from the main window too.
-                # Using <Enter>/<Leave> on the dialog so the wheel works only
-                # while the cursor is over the selector window.
-                wheel_binding: list[str | None] = [None]
+                # The program-wide wheel handler (_on_mousewheel) scrolls this
+                # list while the pointer is over it. It used to bind the wheel
+                # itself and unbind_all on leaving, which also removed every
+                # other wheel binding in the program.
+                self._wheel_targets.append(canvas)
 
-                def attach_wheel(_e: object = None) -> None:
-                    if wheel_binding[0] is None:
-                        wheel_binding[0] = dlg.bind_all(
-                            "<MouseWheel>", on_mousewheel, add="+",
-                        )
-
-                def detach_wheel(_e: object = None) -> None:
-                    if wheel_binding[0] is not None:
-                        try:
-                            dlg.unbind_all("<MouseWheel>")
-                        except Exception:
-                            pass
-                        wheel_binding[0] = None
-
-                dlg.bind("<Enter>", attach_wheel)
-                dlg.bind("<Leave>", detach_wheel)
-                # cleanup on close — also unbinds if the user closes via X
                 def cleanup_bindings() -> None:
-                    detach_wheel()
+                    if canvas in self._wheel_targets:
+                        self._wheel_targets.remove(canvas)
 
                 # build one row per entry
                 vars_: list[tk.BooleanVar] = []
@@ -1306,7 +1447,7 @@ class FingerprinterApp:
 
         if not self.queue_urls:
             ttk.Label(
-                self.queue_rows_frame, text="(queue is empty)", foreground="grey",
+                self.queue_rows_frame, text="(the list is empty)", foreground="grey",
             ).pack(anchor="w", padx=2, pady=2)
             return
 
@@ -1338,13 +1479,13 @@ class FingerprinterApp:
             return
         if not url.startswith(("http://", "https://", "www.")):
             messagebox.showerror(
-                "Invalid URL",
-                "That doesn't look like a YouTube URL.\n\n"
-                "Paste a channel, playlist, or video link.",
+                "Invalid link",
+                "That doesn't look like a link.\n\n"
+                "Paste a URL starting with http:// or https://.",
             )
             return
         if url in self.queue_urls:
-            self._log(f"[!] Already in queue: {url}")
+            self._log(f"[!] Already in the list: {url}")
             return
         self.queue_urls.append(url)
         self.queue_checks.append(tk.BooleanVar(value=True))  # checked by default
@@ -1384,7 +1525,7 @@ class FingerprinterApp:
         @handles. Blank lines and lines starting with '#' are ignored.
         Duplicates (already queued, or repeated in the file) are skipped."""
         path = filedialog.askopenfilename(
-            title="Import channel queue from file",
+            title="Import links from a file",
             filetypes=[
                 ("Text files", "*.txt"),
                 ("CSV files", "*.csv"),
@@ -1458,7 +1599,7 @@ class FingerprinterApp:
 
     def _queue_move(self, delta: int) -> None:
         if self.queue_active is None:
-            self._log("[!] Click a queue row first to select what to move.")
+            self._log("[!] Click a row in the list first to choose what to move.")
             return
         idx = self.queue_active
         new_idx = idx + delta
@@ -1476,7 +1617,7 @@ class FingerprinterApp:
     def _queue_clear(self) -> None:
         if not self.queue_urls:
             return
-        if not messagebox.askyesno("Clear queue", "Remove all channels from the queue?"):
+        if not messagebox.askyesno("Clear the list", "Remove every link from the list?"):
             return
         self.queue_urls.clear()
         self.queue_checks.clear()
@@ -1501,8 +1642,8 @@ class FingerprinterApp:
 
         if not self.queue_urls:
             messagebox.showerror(
-                "Empty queue",
-                "Add at least one YouTube channel/playlist URL to the queue first.",
+                "The list is empty",
+                "Add at least one link to the list first.",
             )
             return
 
@@ -1512,8 +1653,8 @@ class FingerprinterApp:
         ]
         if not checked_urls:
             messagebox.showerror(
-                "Nothing checked",
-                "Tick the checkbox next to at least one channel to run it.",
+                "Nothing ticked",
+                "Tick at least one link in the list.",
             )
             return
 
@@ -1523,34 +1664,24 @@ class FingerprinterApp:
             messagebox.showerror("Missing input", "Pick a valid working folder for audio.")
             return
         if not bat_dir or not Path(bat_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid program folder — the one containing audfprint.")
+            messagebox.showerror("Missing input", "Pick a valid program folder: the one that holds the audfprint folder.")
+            return
+        if not self._audfprint_ready(bat_dir):
             return
 
-        audfprint = Path(bat_dir) / "audfprint" / "audfprint.py"
-        if not audfprint.is_file():
-            messagebox.showerror(
-                "audfprint not found",
-                f"Could not find audfprint\\audfprint.py under:\n{bat_dir}\n\n"
-                f"Fingerprinting is run directly now, so this is the only script "
-                f"the pipeline needs.",
-            )
-            return
-
-        # Warn if running >1 channel without auto-move, since the pklz-files
-        # folder is shared and each channel's output must be evacuated between
-        # runs (the preflight clear would otherwise delete the prior channel's
+        # Warn if running >1 link without auto-move, since the pklz-files
+        # folder is shared and each link's output must be evacuated between
+        # runs (the preflight clear would otherwise delete the prior link's
         # results, or block on the not-empty prompt).
         move_dest = self.move_pklz_dir_var.get().strip()
         if len(checked_urls) > 1 and not move_dest:
             proceed = messagebox.askyesno(
-                "No 'Move pklzs to' set",
-                "You're queueing multiple channels but haven't set a "
-                "'Move pklzs to' directory.\n\n"
-                "Between channels the pklz-files folder is cleared, so each "
-                "channel's renamed pklz files will be DELETED before the next "
-                "channel runs unless they're moved out first.\n\n"
-                "Set a destination directory to keep every channel's output.\n\n"
-                "Continue anyway (only the last channel's pklz files will survive)?",
+                "Nowhere to keep finished fingerprints",
+                "Your list has more than one link, but Keep finished fingerprints in "
+                "is empty.\n\n"
+                "The results folder is emptied before each link, so only the last "
+                "link's fingerprints would be left.\n\n"
+                "Start anyway?",
                 icon="warning", default="no",
             )
             if not proceed:
@@ -1577,6 +1708,24 @@ class FingerprinterApp:
         )
         self.worker_thread.start()
 
+    def _audfprint_ready(self, bat_dir: str) -> bool:
+        """True if <bat_dir>\\audfprint is WerZatSong's audfprint; otherwise say
+        what is wrong and point at Check setup. A file check only, so it is fast
+        enough for the button click; Check setup does the thorough version."""
+        problem = dependencies.audfprint_problem(bat_dir)
+        if problem is None:
+            return True
+        messagebox.showerror(
+            "WerZatSong's audfprint is needed",
+            f"audfprint: {problem}.\n\n"
+            f"The Fingerprinter needs WerZatSong's version of audfprint "
+            f"({dependencies.WERZATSONG_AUDFPRINT_URL}). Upstream dpwe/audfprint "
+            f"does not work here.\n\n"
+            f"Press Check setup to install it.",
+            parent=self.root,
+        )
+        return False
+
     def _run_queue(self, urls: list[str], output_base: Path, bat_dir: Path) -> None:
         """Process each queued URL sequentially through the full pipeline.
         Skip-on-failure: a failed/skipped channel doesn't halt the batch."""
@@ -1592,9 +1741,9 @@ class FingerprinterApp:
 
                 self.skip_flag.clear()
                 self._log("=" * 60)
-                self._log(f"[*] QUEUE {i}/{total}: {url}")
+                self._log(f"[*] LINK {i}/{total}: {url}")
                 self._log("=" * 60)
-                self._set_status(f"Queue {i}/{total}: starting...")
+                self._set_status(f"Link {i}/{total}: starting...")
 
                 try:
                     status = self._run_pipeline(
@@ -1602,21 +1751,21 @@ class FingerprinterApp:
                         queue_position=(i, total),
                     )
                 except Exception as e:  # noqa: BLE001
-                    self._log(f"[X] Channel failed with error: {e!r}")
+                    self._log(f"[X] Link failed with error: {e!r}")
                     status = "failed"
                 results.append((url, status or "done"))
 
             # Final summary.
             self._log("=" * 60)
-            self._log("[+] QUEUE COMPLETE")
+            self._log("[+] LIST COMPLETE")
             done = sum(1 for _, s in results if s == "done")
-            self._log(f"    {done}/{total} channel(s) completed.")
+            self._log(f"    {done}/{total} link(s) completed.")
             for u, s in results:
                 if s != "done":
                     tag = "warning" if s in ("failed", "skipped") else None
                     self._log(f"    [{s}] {u}", tag=tag)
             self._log("=" * 60)
-            self._set_status(f"Queue done — {done}/{total} completed.")
+            self._set_status(f"List done: {done}/{total} completed.")
 
             # Open the folder where pklz files ended up, once, at the very end
             # (per-channel opening was suppressed to avoid window spam). Honors
@@ -1630,27 +1779,21 @@ class FingerprinterApp:
             ):
                 self._open_folder(self._last_report_dir)
         except Exception as e:  # noqa: BLE001
-            self._log(f"[X] Queue error: {e!r}")
-            self._set_status("Queue error.")
+            self._log(f"[X] List error: {e!r}")
+            self._set_status("List error.")
         finally:
             self.root.after(0, self._finish)
 
     def _start_bats_only(self, split: bool = True) -> None:
-        """Fingerprint audio already on disk. `split` picks the variant: the
-        two buttons that reach here differ only in this flag, and each says in
-        its own label which it is, so neither depends on the Advanced setting."""
-        """Skip downloads entirely; scan + fingerprint whatever is already on disk."""
+        """Fingerprint audio already on disk, skipping downloads. `split` picks
+        the variant: the two buttons that reach here differ only in this flag,
+        and each says in its own label which it is, so neither depends on the
+        Advanced setting."""
         bat_dir = self.bat_dir_var.get().strip()
         if not bat_dir or not Path(bat_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid program folder — the one containing audfprint.")
+            messagebox.showerror("Missing input", "Pick a valid program folder: the one that holds the audfprint folder.")
             return
-
-        audfprint = Path(bat_dir) / "audfprint" / "audfprint.py"
-        if not audfprint.is_file():
-            messagebox.showerror(
-                "audfprint not found",
-                f"Could not find audfprint\\audfprint.py under:\n{bat_dir}",
-            )
+        if not self._audfprint_ready(bat_dir):
             return
 
         source_dir = self.output_dir_var.get().strip()
@@ -1664,12 +1807,12 @@ class FingerprinterApp:
         # restructure it".
         splitting = split
         split_line = (
-            f"Anything longer than {SPLIT_TRIGGER // 60}:00 will first be SPLIT IN PLACE "
-            f"into pieces of at least {SPLIT_MIN_CHUNK // 60}:00, and the original file "
-            f"deleted.\n\n"
+            f"Files over {SPLIT_TRIGGER // 60}:00 are first SPLIT IN PLACE into "
+            f"{SPLIT_SEGMENT // 60}:00 pieces (the last piece takes the remainder), and "
+            f"the originals deleted.\n\n"
             if splitting else
-            "Nothing will be split, and no file is examined for length. Use this "
-            "when the audio has already been split; anything still over "
+            "Files are fingerprinted as they are, without checking their length. Use "
+            "this for audio that is already split; anything over "
             f"{SPLIT_TRIGGER // 60}:00 goes into the database whole.\n\n"
         )
         if not messagebox.askyesno(
@@ -1678,7 +1821,7 @@ class FingerprinterApp:
             f"Scan for audio under:\n{source_dir}\n\n"
             f"{split_line}"
             f"Then fingerprint it into:\n{Path(bat_dir) / 'pklz-files'}\n\n"
-            f"This skips the YouTube download step entirely.\n\nContinue?",
+            f"Nothing is downloaded.\n\nContinue?",
             parent=self.root,
         ):
             return
@@ -1717,10 +1860,12 @@ class FingerprinterApp:
         self.worker_thread.start()
 
     def _run_test_connection(self) -> None:
+        statuses: list[dependencies.Status] = []
+        bat_dir = self.bat_dir_var.get().strip() or str(dependencies.APP_DIR)
         try:
-            self._set_status("Running connection test...")
+            self._set_status("Checking setup...")
             self._log("=" * 60)
-            self._log("[*] Connection / dependency test")
+            self._log(f"[*] Setup check, Fingerprinter {__version__}")
             self._log("=" * 60)
 
             # 1. Python + platform
@@ -1737,151 +1882,223 @@ class FingerprinterApp:
             if self.cancel_flag.is_set():
                 return
 
-            # 2. yt-dlp version + update check
-            self._log("[*] yt-dlp:")
-            if check_dependency("yt-dlp"):
-                self._run_diagnostic(["yt-dlp", "--version"], prefix="    version: ")
-                if self.cancel_flag.is_set():
-                    return
-                self._log("    running 'yt-dlp -U' (update check, may take a moment)...")
-                self._run_diagnostic(["yt-dlp", "-U"], prefix="      ", tag="ytdlp", timeout=90)
-            else:
-                self._log("    ! NOT FOUND on PATH", tag="warning")
+            # 2. Every component, run for real rather than just found on PATH
+            #    (dependencies.py): packages, yt-dlp, ffmpeg/ffprobe, Node.js and
+            #    WerZatSong's audfprint.
+            self._log("[*] Components:")
+            statuses = dependencies.check_all(bat_dir)
+            self._log_statuses(statuses)
+            self._refresh_ytdlp()
+            ytdlp_ok = any(s.key == "yt-dlp" and s.ok for s in statuses)
 
             if self.cancel_flag.is_set():
                 return
 
-            # 3. ffmpeg / ffprobe
-            for tool in ("ffmpeg", "ffprobe"):
-                self._log(f"[*] {tool}:")
-                if check_dependency(tool):
-                    self._run_diagnostic(
-                        [tool, "-version"], prefix="    ", first_line_only=True,
-                    )
-                else:
-                    self._log("    ! NOT FOUND on PATH", tag="warning")
-                if self.cancel_flag.is_set():
-                    return
-
-            # 4. node (for --js-runtimes node)
-            self._log("[*] node (used by yt-dlp's --js-runtimes node):")
-            if check_dependency("node"):
-                self._run_diagnostic(["node", "--version"], prefix="    version: ")
-            else:
-                self._log(
-                    "    ! NOT FOUND on PATH (yt-dlp may fail on JS-required extractors).",
-                    tag="warning",
-                )
+            # 3. yt-dlp update check
+            if ytdlp_ok:
+                self._log("[*] Running 'yt-dlp -U' (update check, may take a moment)...")
+                self._run_diagnostic([*self.ytdlp, "-U"], prefix="    ", tag="ytdlp", timeout=90)
 
             if self.cancel_flag.is_set():
                 return
 
-            # 5. Test info retrieval against a known stable video.
+            # 4. Test info retrieval against a known stable video.
             test_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
-            self._log(f"[*] Fetching info for: {test_url}")
-            self._log("    (YouTube's first-ever upload — the most stable test target.)")
-            try:
-                proc = subprocess.run(
-                    ["yt-dlp", "--js-runtimes", "node",
-                     "--dump-single-json", "--no-warnings", "--no-playlist",
-                     test_url],
-                    capture_output=True, text=True, check=False,
-                    encoding="utf-8", errors="replace",
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    timeout=45,
-                )
-                if proc.returncode == 0 and proc.stdout.strip():
-                    info = json.loads(proc.stdout)
-                    self._log(f"    + Title:       {info.get('title')}")
-                    self._log(f"    + Uploader:    {info.get('uploader')}")
-                    self._log(f"    + Upload date: {info.get('upload_date')}")
-                    dur = info.get("duration")
-                    if dur:
-                        m, s = divmod(int(dur), 60)
-                        self._log(f"    + Duration:    {m}:{s:02d}")
-                    vc = info.get("view_count")
-                    if isinstance(vc, int):
-                        self._log(f"    + Views:       {vc:,}")
-                    fmts = info.get("formats") or []
-                    audio_fmts = [
-                        f for f in fmts
-                        if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")
-                    ]
-                    self._log(f"    + Audio formats available: {len(audio_fmts)}")
-                else:
-                    err = (proc.stderr or "").strip()
-                    self._log(f"    ! Info retrieval failed (exit {proc.returncode}).", tag="warning")
-                    if err:
-                        for line in err.splitlines()[:3]:
-                            self._log(f"      {line[:200]}", tag="warning")
-            except subprocess.TimeoutExpired:
-                self._log("    ! Info retrieval timed out (network issue?).", tag="warning")
-            except json.JSONDecodeError as e:
-                self._log(f"    ! Could not parse yt-dlp JSON: {e}", tag="warning")
-            except Exception as e:  # noqa: BLE001
-                self._log(f"    ! Test failed: {e!r}", tag="warning")
+            if not ytdlp_ok:
+                self._log("[*] Skipping the test download: yt-dlp is not working.")
+            else:
+                self._run_test_fetch(test_url)
 
             if self.cancel_flag.is_set():
                 return
 
-            # 6. Output dir checks
-            out_dir = self.output_dir_var.get().strip()
-            self._log(f"[*] Output directory: {out_dir or '(not set)'}")
-            if out_dir:
-                p = Path(out_dir)
-                if p.is_dir():
-                    try:
-                        free = shutil.disk_usage(p).free
-                        self._log(f"    + Free disk space: {fmt_size(free)}")
-                    except Exception as e:  # noqa: BLE001
-                        self._log(f"    ! Disk usage check failed: {e}", tag="warning")
-                    test_file = p / ".write_test_yt_fingerprinter"
-                    try:
-                        test_file.write_text("ok", encoding="utf-8")
-                        test_file.unlink()
-                        self._log("    + Writable: yes")
-                    except Exception as e:  # noqa: BLE001
-                        self._log(f"    ! Not writable: {e}", tag="warning")
-                else:
-                    self._log("    ! Path does not exist or is not a directory.", tag="warning")
-
-            # 7. Fingerprinter dir + audfprint presence
-            bat_dir = self.bat_dir_var.get().strip()
-            self._log(f"[*] Fingerprinter directory: {bat_dir or '(not set)'}")
-            if bat_dir:
-                p = Path(bat_dir)
-                if p.is_dir():
-                    afp = p / "audfprint" / "audfprint.py"
-                    if afp.is_file():
-                        self._log(f"    + audfprint.py: found ({afp.stat().st_size} bytes)")
-                    else:
-                        self._log("    ! audfprint/audfprint.py: NOT FOUND", tag="warning")
-                    for sub_name in ("texts", "pklz-files"):
-                        d = p / sub_name
-                        if d.is_dir():
-                            self._log(f"    + {sub_name}/: {len(list(d.iterdir()))} item(s)")
-                        else:
-                            self._log(f"    + {sub_name}/: not present (created on use)")
-                else:
-                    self._log("    ! Path does not exist or is not a directory.", tag="warning")
-
-            # 8. Config file status
-            self._log(f"[*] Config: {CONFIG_FILE}")
-            self._log(
-                f"    exists: {CONFIG_FILE.is_file()}, "
-                f"writable: {os.access(CONFIG_FILE.parent, os.W_OK)}"
-            )
+            # 5. Output dir checks
+            self._check_folders()
 
             self._log("=" * 60)
-            self._log("[+] Test complete.")
+            self._log("[+] Setup check complete.")
             self._log("=" * 60)
-            self._set_status("Test complete.")
+            self._set_status("Setup check complete.")
+
+            # 6. Offer to install or repair anything that is not working.
+            if not self.cancel_flag.is_set():
+                self._offer_install(statuses, bat_dir)
 
         except Exception as e:  # noqa: BLE001
-            self._log(f"[X] Test error: {e!r}")
-            self._set_status("Test error.")
+            self._log(f"[X] Setup check error: {e!r}")
+            self._set_status("Setup check error.")
         finally:
             self.root.after(0, self._finish)
+
+    def _run_test_fetch(self, test_url: str) -> None:
+        """Fetch one known video's metadata, to prove yt-dlp can reach YouTube."""
+        self._log(f"[*] Fetching info for: {test_url}")
+        self._log("    (YouTube's first upload, a stable test target.)")
+        try:
+            proc = subprocess.run(
+                [*self.ytdlp, "--js-runtimes", "node",
+                 "--dump-single-json", "--no-warnings", "--no-playlist",
+                 test_url],
+                capture_output=True, text=True, check=False,
+                encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=45,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                info = json.loads(proc.stdout)
+                self._log(f"    + Title:       {info.get('title')}")
+                self._log(f"    + Uploader:    {info.get('uploader')}")
+                self._log(f"    + Upload date: {info.get('upload_date')}")
+                dur = info.get("duration")
+                if dur:
+                    m, s = divmod(int(dur), 60)
+                    self._log(f"    + Duration:    {m}:{s:02d}")
+                vc = info.get("view_count")
+                if isinstance(vc, int):
+                    self._log(f"    + Views:       {vc:,}")
+                fmts = info.get("formats") or []
+                audio_fmts = [
+                    f for f in fmts
+                    if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")
+                ]
+                self._log(f"    + Audio formats available: {len(audio_fmts)}")
+            else:
+                err = (proc.stderr or "").strip()
+                self._log(f"    ! Info retrieval failed (exit {proc.returncode}).", tag="warning")
+                if err:
+                    for line in err.splitlines()[:3]:
+                        self._log(f"      {line[:200]}", tag="warning")
+        except subprocess.TimeoutExpired:
+            self._log("    ! Info retrieval timed out (network issue?).", tag="warning")
+        except json.JSONDecodeError as e:
+            self._log(f"    ! Could not parse yt-dlp JSON: {e}", tag="warning")
+        except Exception as e:  # noqa: BLE001
+            self._log(f"    ! Test failed: {e!r}", tag="warning")
+
+    def _check_folders(self) -> None:
+        """Working folder: space and write access. Program folder: its working
+        subfolders. Config: where it is and whether it can be saved."""
+        out_dir = self.output_dir_var.get().strip()
+        self._log(f"[*] Working folder: {out_dir or '(not set)'}")
+        if out_dir:
+            p = Path(out_dir)
+            if p.is_dir():
+                try:
+                    free = shutil.disk_usage(p).free
+                    self._log(f"    + Free disk space: {fmt_size(free)}")
+                except Exception as e:  # noqa: BLE001
+                    self._log(f"    ! Disk usage check failed: {e}", tag="warning")
+                test_file = p / ".write_test_yt_fingerprinter"
+                try:
+                    test_file.write_text("ok", encoding="utf-8")
+                    test_file.unlink()
+                    self._log("    + Writable: yes")
+                except Exception as e:  # noqa: BLE001
+                    self._log(f"    ! Not writable: {e}", tag="warning")
+            else:
+                self._log("    ! Path does not exist or is not a directory.", tag="warning")
+
+        # audfprint itself is covered by the component check above.
+        bat_dir = self.bat_dir_var.get().strip()
+        self._log(f"[*] Program folder: {bat_dir or '(not set)'}")
+        if bat_dir:
+            p = Path(bat_dir)
+            if p.is_dir():
+                for sub_name in ("texts", "pklz-files"):
+                    d = p / sub_name
+                    if d.is_dir():
+                        self._log(f"    + {sub_name}/: {len(list(d.iterdir()))} item(s)")
+                    else:
+                        self._log(f"    + {sub_name}/: not present (created on use)")
+            else:
+                self._log("    ! Path does not exist or is not a directory.", tag="warning")
+
+        self._log(f"[*] Config: {CONFIG_FILE}")
+        self._log(
+            f"    exists: {CONFIG_FILE.is_file()}, "
+            f"writable: {os.access(CONFIG_FILE.parent, os.W_OK)}"
+        )
+
+    # ------------------------- dependencies -----------------------------------
+
+    def _log_statuses(self, statuses: list[dependencies.Status]) -> None:
+        for s in statuses:
+            self._log("    " + dependencies.describe(s), tag=None if s.ok else "warning")
+
+    def _refresh_ytdlp(self) -> None:
+        """Re-resolve how to run yt-dlp (after a check or an install)."""
+        self.ytdlp = dependencies.ytdlp_command() or ["yt-dlp"]
+
+    def _startup_check(self, bat_dir: str) -> None:
+        """Worker thread, at launch: check every component and offer to install
+        whatever is missing. Silent apart from one line when all is well."""
+        try:
+            statuses = dependencies.check_all(bat_dir)
+            self._refresh_ytdlp()
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] Could not check the setup: {e!r}")
+            return
+        problems = [s for s in statuses if not s.ok]
+        if not problems:
+            self._log("[+] Setup OK: every component is installed and working.")
+            return
+        self._log("[!] Some components are missing or not working:", tag="warning")
+        self._log_statuses(problems)
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self._log("[!] Press Check setup once the current job has finished to install them.")
+            return
+        # Treated like any other job while it runs: buttons off, Stop and quit
+        # handled the usual way.
+        self.worker_thread = threading.current_thread()
+        self.root.after(0, self._lock_for_job)
+        try:
+            self._offer_install(statuses, bat_dir)
+        finally:
+            self.root.after(0, self._finish)
+
+    def _lock_for_job(self) -> None:
+        self.start_btn.config(state="disabled")
+        self.bats_btn.config(state="disabled")
+        self.fp_only_btn.config(state="disabled")
+        self.test_btn.config(state="disabled")
+        self._set_inputs_locked(True)
+
+    def _offer_install(self, statuses: list[dependencies.Status], bat_dir: str) -> None:
+        """Worker thread. List what is wrong, ask, and install on a yes.
+        Only things that are missing or not working are offered."""
+        problems = [s for s in statuses if not s.ok]
+        if not problems:
+            self._log("[+] Everything the Fingerprinter needs is installed and working.")
+            return
+        for s in problems:
+            if not s.fix:
+                self._log(f"[!] {s.name} has to be fixed by hand: {s.manual}", tag="warning")
+        fixable = [s for s in problems if s.fix]
+        if not fixable:
+            return
+        items = "\n".join(f"• {s.name} ({s.why}):\n   {s.fix}" for s in fixable)
+        if not self._ask_yes_no(
+            "Install missing components?",
+            f"These are missing or not working:\n\n{items}\n\n"
+            f"Install them now? Progress is shown in the console.",
+        ):
+            self._log("[!] Nothing was installed. Press Check setup to do it later.")
+            return
+        self._set_status("Installing...")
+        self._log("=" * 60)
+        self._log("[*] Installing")
+        self._log("=" * 60)
+        after = dependencies.install(statuses, self._log, bat_dir)
+        self._refresh_ytdlp()
+        self._log("[*] Components now:")
+        self._log_statuses(after)
+        left = [s for s in after if not s.ok]
+        if left:
+            self._log(f"[!] {len(left)} component(s) still need attention; see above.", tag="warning")
+            self._set_status("Some components still need attention.")
+        else:
+            self._log("[+] Everything the Fingerprinter needs is installed and working.")
+            self._set_status("Setup complete.")
 
     def _run_diagnostic(
         self,
@@ -1983,7 +2200,7 @@ class FingerprinterApp:
 
     def _skip_current(self) -> None:
         self.skip_flag.set()
-        self._log("[!] Skip requested. Moving to the next channel at the next safe checkpoint.")
+        self._log("[!] Skip requested. Moving to the next link at the next safe point.")
 
     def _set_inputs_locked(self, locked: bool) -> None:
         """Lock/unlock fields whose values are read mid-run, so the user can't
@@ -2034,16 +2251,17 @@ class FingerprinterApp:
             if self.cancel_flag.is_set():
                 return "cancelled"
             if self.skip_flag.is_set():
-                self._log(f"[!] {qp}Skipping this channel.", tag="warning")
+                self._log(f"[!] {qp}Skipping this link.", tag="warning")
                 return "skipped"
             return None
 
         try:
-            if not check_dependency("yt-dlp"):
-                self._log("[X] yt-dlp not found on PATH. Install with: pip install yt-dlp")
+            if not check_dependency(self.ytdlp):
+                self._log("[X] yt-dlp not found. Press Check setup to install it.")
                 return "failed"
             if not check_dependency("ffmpeg"):
-                self._log("[X] ffmpeg not found on PATH. Required for audio remux and splitting.")
+                self._log("[X] ffmpeg not found (needed to remux and split audio). "
+                          "Press Check setup to install it.")
                 return "failed"
 
             # 1. Extract video list
@@ -2069,7 +2287,7 @@ class FingerprinterApp:
             if not entries:
                 entries = [info]  # single video fallback
 
-            self._log(f"[+] Source: {channel_name_raw}  ({len(entries)} videos)")
+            self._log(f"[+] Source: {channel_name_raw}  ({len(entries)} item(s))")
             if (s := stopped()):
                 return s
 
@@ -2098,18 +2316,20 @@ class FingerprinterApp:
                     self._set_status("Aborted.")
                     return "cancelled"
                 if not selected:
-                    self._log("[X] No videos selected. Aborting.")
+                    self._log("[X] Nothing selected. Aborting.")
                     self._set_status("Aborted.")
                     return "failed"
                 if len(selected) != len(entries):
                     self._log(
-                        f"[+] Selection: {len(selected)} of {len(entries)} videos "
+                        f"[+] Selection: {len(selected)} of {len(entries)} item(s) "
                         f"({len(entries) - len(selected)} skipped)."
                     )
                 entries = selected
 
             # 1b. Size/time estimate — interactive only outside queue mode.
-            workers = self._safe_int(self.parallel_var, 4)
+            # Clamped here as well: a Spinbox's range does not stop typed values.
+            workers = min(self.MAX_PARALLEL,
+                          self._safe_int(self.parallel_var, self.DEFAULT_PARALLEL))
             if queue_mode:
                 self._confirm_estimate(entries, workers, log_only=True)
             else:
@@ -2130,7 +2350,7 @@ class FingerprinterApp:
                 self._open_folder(initial_folder)
 
             # 3. Parallel download (uses the same `workers` value shown in the estimate)
-            self._set_status(f"{qp}Downloading 0/{len(entries)} (parallel={workers})...")
+            self._set_status(f"{qp}Downloading 0/{len(entries)} ({workers} at once)...")
             ok, fail = self._download_parallel(entries, initial_folder, workers)
             self._log(f"[+] Downloads finished: {ok} OK, {fail} failed.")
 
@@ -2194,7 +2414,7 @@ class FingerprinterApp:
             # runner can open the final location once at the end.
             self._last_report_dir = report_dir
 
-            self._log(f"[+] {qp}Channel done.")
+            self._log(f"[+] {qp}Link done.")
             self._set_status(f"{qp}Done.")
             return "done"
         except Exception as e:  # noqa: BLE001
@@ -2793,8 +3013,8 @@ class FingerprinterApp:
             self._log(f"[!] Could not read duration of {unreadable} file(s).")
         if not long_files:
             self._log(
-                f"[+] All {len(audio_files)} file(s) are under "
-                f"{SPLIT_TRIGGER // 60}:00 — nothing to split."
+                f"[+] All {len(audio_files)} file(s) are {SPLIT_TRIGGER // 60}:00 "
+                f"or shorter; nothing to split."
             )
             return True
 
@@ -2803,8 +3023,8 @@ class FingerprinterApp:
         # No "splitting is disabled" branch here any more: that case now returns
         # at the top of this method, before anything is enumerated or probed.
         self._log(
-            f"[*] Splitting {len(long_files)} file(s) into pieces of at least "
-            f"{SPLIT_MIN_CHUNK // 60}:00...",
+            f"[*] Splitting {len(long_files)} file(s) over {SPLIT_TRIGGER // 60}:00 into "
+            f"{SPLIT_SEGMENT // 60}:00 pieces (the last piece takes the remainder)...",
             tag="splitter",
         )
         made = 0
@@ -3053,7 +3273,7 @@ class FingerprinterApp:
             "%(channel)s",
         ))
         cmd = [
-            "yt-dlp",
+            *self.ytdlp,
             "--js-runtimes", "node",
             "--flat-playlist",
             "--no-warnings",
@@ -3150,7 +3370,7 @@ class FingerprinterApp:
                 # Throttle progress logs to ~1/sec so we don't spam the log.
                 now = time.monotonic()
                 if now - last_log >= 1.0:
-                    self._set_status(f"Fetching channel info ({len(entries)} videos)...")
+                    self._set_status(f"Listing entries ({len(entries)} found)...")
                     self._log(f"[*] Fetched {len(entries)} entries...")
                     last_log = now
         finally:
@@ -3278,7 +3498,7 @@ class FingerprinterApp:
         verbose = self.verbose_var.get()
         template = self.filename_template_var.get().strip() or "%(title)s [%(id)s].%(ext)s"
         cmd = [
-            "yt-dlp",
+            *self.ytdlp,
             "--js-runtimes", "node",
             "-o", str(target_folder / template),
             "--no-playlist",
@@ -3364,11 +3584,11 @@ class FingerprinterApp:
             reason = self._classify_yt_dlp_error(joined)
             if reason:
                 self._log(
-                    f"  ! WARNING: skipping '{title}' — {reason}",
+                    f"  ! Skipped '{title}': {reason}",
                     tag="warning",
                 )
             elif err_lines:
-                self._log(f"  ! Skipped '{title}' — {err_lines[-1][:300]}", tag="warning")
+                self._log(f"  ! Skipped '{title}': {err_lines[-1][:300]}", tag="warning")
             else:
                 self._log(f"  ! Skipped '{title}' (no error detail captured).", tag="warning")
         return success

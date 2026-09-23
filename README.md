@@ -1,4 +1,4 @@
-# YouTube Channel Fingerprinter
+# Fingerprinter
 
 [![Stars](https://img.shields.io/github/stars/EierkuchenHD/fingerprinter?style=flat-square&logo=github&label=stars)](https://github.com/EierkuchenHD/fingerprinter/stargazers)
 [![Forks](https://img.shields.io/github/forks/EierkuchenHD/fingerprinter?style=flat-square&logo=github&label=forks)](https://github.com/EierkuchenHD/fingerprinter/network/members)
@@ -7,317 +7,252 @@
 ![Code size](https://img.shields.io/github/languages/code-size/EierkuchenHD/fingerprinter?style=flat-square)
 [![License](https://img.shields.io/github/license/EierkuchenHD/fingerprinter?style=flat-square)](LICENSE)
 
-Point it at a YouTube channel, playlist, or archive.org page. It downloads the
-audio, cuts long recordings into shorter pieces, and turns every piece into an
-audio **fingerprint** — a small `.pklz` file that
-[audfprint](https://github.com/dpwe/audfprint) can later use to recognise that
-audio when it turns up somewhere else.
+Builds audio fingerprint databases (`.pklz` files) for identifying unknown
+songs with [WerZatSong](https://github.com/Nel80s/WerZatSong) and WerZatSonGUI.
 
-It is a normal desktop window with buttons — once it is set up, you never touch
-a command line to use it. Setup itself needs the command line exactly twice, to
-install some Python packages; step 3 shows exactly what to type.
+Give it links to channels, playlists or single pages on YouTube, Archive.org,
+Mixcloud, SoundCloud or [any other site yt-dlp
+supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md). It
+downloads the audio, splits long recordings, and fingerprints everything in
+batches with WerZatSong's version of audfprint.
+
+**Windows only.** Setup is a batch file, and the tools it installs are Windows
+builds.
 
 ![The Fingerprinter window](screenshot.png)
 
-The window is three numbered steps in the order you actually do them: say what
-you want fingerprinted, say where things should go, press the button. Every box
-has a line underneath explaining what it is for, and anything with a sensible
-default is tucked away under **Advanced settings** so it is not in your way.
+## Requirements
 
-## What is a fingerprint, and why would I want one?
-
-A fingerprint is a compact summary of what a recording *sounds like* — a few
-thousand landmarks taken from the audio, not the audio itself. Two things make
-that useful:
-
-- **It is small.** A fingerprint is a tiny fraction of the size of the audio.
-- **It still matches.** Re-encoded, quieter, noisier, or cut down to a clip, the
-  same recording still lines up against its fingerprint.
-
-So once a channel is fingerprinted, you can take some unidentified audio, ask
-audfprint what it matches, and get an answer — which is the usual reason people
-build these collections (identifying "lostwave" tracks, for instance).
-
-This tool handles the tedious part: fetching the audio and producing the
-`.pklz` files in bulk, without you babysitting it.
-
-## Two things to know before your first run
-
-Neither is a bug, but both surprise people, and both can lose work.
-
-> **1. The downloaded audio is deleted when a link finishes.**
-> The audio is treated as working material, not as a result — once a link has
-> been fingerprinted, its download folder is removed to stop a long list
-> filling your disk. **The `.pklz` files are the output you keep.** If you also
-> want the audio, copy it out while the run is going, or use a separate
-> downloader.
-
-> **2. Fill in *Keep finished fingerprints in* before adding more than one link.**
-> The results folder is emptied before each link is fingerprinted. With a single
-> link that does not matter. With a list of five it very much does: without a
-> destination to move finished fingerprints to, **you end up with only the last
-> link's results.** The program turns that line red to remind you, and asks
-> before starting anyway.
-
-## What you need before you start
-
-Five things. All free, all on Windows.
-
-| What | Why it is needed | Where to get it |
+| Component | Used for | Installed by setup |
 |---|---|---|
-| **Python 3.10 or newer** | Runs this program. During install, tick **"Add Python to PATH"**. | [python.org/downloads](https://www.python.org/downloads/) |
-| **ffmpeg** (includes ffprobe) | Reads audio lengths and does the cutting | [gyan.dev/ffmpeg/builds](https://www.gyan.dev/ffmpeg/builds/) — under *release builds*, take **ffmpeg-release-full.7z** (or the `.zip`) |
-| **Node.js** | yt-dlp needs it to read YouTube pages; downloads fail without it | [nodejs.org](https://nodejs.org/) — the LTS installer, all defaults |
-| **yt-dlp** | Does the actual downloading | Nothing to fetch — step 3 installs it |
-| **audfprint** | Makes the fingerprints | [github.com/dpwe/audfprint](https://github.com/dpwe/audfprint) |
+| Windows 10 or 11 | | |
+| Python 3.10 or newer | Running the program and audfprint | Offered through winget, or install it from [python.org](https://www.python.org/downloads/windows/) |
+| numpy, scipy, docopt, joblib, psutil | audfprint | Yes, with pip |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Downloading | Yes, with pip |
+| ffmpeg and ffprobe | Reading lengths, splitting, decoding audio for audfprint | Yes, into `tools\ffmpeg` |
+| Node.js | yt-dlp needs it to read YouTube pages | Yes, into `tools\node` |
+| **WerZatSong's audfprint** | Making the fingerprints | Yes, into `audfprint\` |
 
-> **"On PATH" — what that means.** Windows needs to know where a program lives
-> before you can call it by name. The Python and Node.js installers do this for
-> you (tick the Python box). ffmpeg does not, so you do it yourself:
->
-> 1. Unzip ffmpeg somewhere permanent. It unpacks into a folder with a version
->    in the name, like `ffmpeg-7.1-full_build` — **move or rename it so that
->    `C:\ffmpeg\bin` genuinely exists** and has `ffmpeg.exe` in it.
-> 2. Press Start, type *"Edit the system environment variables"*, open it.
-> 3. **Environment Variables** → under *System variables* select **Path** →
->    **Edit** → **New** → paste `C:\ffmpeg\bin` → **OK** on all three windows.
->
-> **To check:** open a *new* Command Prompt (Start → type `cmd` → Enter) and
-> type `ffmpeg -version`. Version information means it worked; "not recognized"
-> means the path is wrong. Already-open Command Prompts keep the old PATH, so
-> always open a fresh one after changing it.
+### Why it has to be WerZatSong's audfprint
 
-## Setting it up
+The Fingerprinter uses audfprint as shipped with WerZatSong:
+[Nel80s/WerZatSong, `libs/audfprint`](https://github.com/Nel80s/WerZatSong/tree/main/libs/audfprint).
+The original [dpwe/audfprint](https://github.com/dpwe/audfprint) does **not**
+work as a replacement. On Windows it:
 
-**1. Download this project.** Green **Code** button at the top of this page →
-**Download ZIP** → unzip it somewhere sensible, for example
-`C:\fingerprints\Fingerprinter`.
+- prints every file name it reads in the console's code page, so a title with
+  characters outside it (`＂`, `？`, Japanese, and so on) crashes the batch;
+- reads the file lists this program writes in that same code page, so any
+  non-ASCII path comes back as "file not found";
+- rejects audio files that carry cover art, which many downloads do.
 
-**2. Put audfprint inside it.** Download audfprint the same way (Code →
-Download ZIP on [its page](https://github.com/dpwe/audfprint)).
+WerZatSong's copy fixes all three, and it is the audfprint WerZatSong and
+WerZatSonGUI search with. Setup installs it for you, and Check setup flags an
+upstream copy and offers to replace it.
 
-> **Watch out:** GitHub's ZIP unpacks into a folder called `audfprint-master`,
-> with the real files one level down. You need to rename it to `audfprint`, or
-> move its contents up — whichever you do, aim for this exact layout:
+## Setup
 
-```
-C:\fingerprints\Fingerprinter\
-├── yt-fingerprinter.pyw
-├── audfprint_quiet.py
-├── requirements.txt
-└── audfprint\
-    └── audfprint.py      <-- this file must be right here
-```
+1. Download `Fingerprinter-<version>.zip` from the latest
+   [release](https://github.com/EierkuchenHD/fingerprinter/releases) and unzip
+   it somewhere permanent, for example `C:\fingerprints\Fingerprinter`.
+   Pre-releases are test versions; see the [changelog](CHANGELOG.md).
+2. Double-click **`setup.bat`**. It:
+   - finds Python 3.10 or newer. If there is none, it offers to install Python
+     3.13 with winget, or opens python.org when winget is not available;
+   - checks every other component by actually running it, lists anything
+     missing or broken, and installs it once you confirm.
+3. Start **`yt-fingerprinter.pyw`**. Setup offers to start it for you.
 
-If `audfprint\audfprint-master\audfprint.py` is what you ended up with, it is
-one level too deep and the program will not find it.
+Running `setup.bat` again is safe: anything that already works is left alone.
+The program also checks its components each time it starts, and offers to
+install anything that has gone missing.
 
-**3. Install the Python packages.** Open File Explorer in that folder, click the
-address bar, type `cmd`, press Enter — a Command Prompt opens there. Then run
-these two lines, pressing Enter after each:
+### What gets installed, and where
+
+- **Python packages and yt-dlp:** into the Python that runs the program, with
+  pip.
+- **ffmpeg and Node.js:** into `tools\` in the program folder, and only when a
+  working copy is not already on PATH. No admin rights or PATH changes are
+  needed; the program puts `tools\` first on its own PATH. They come from
+  gyan.dev (the ffmpeg essentials build) and nodejs.org (the current LTS), and
+  each download is checked against its published SHA-256 before it is unpacked.
+- **WerZatSong's audfprint:** into `audfprint\` in the program folder. An
+  existing folder there is renamed to `audfprint.old`, not deleted.
+
+### Installing by hand instead
 
 ```bat
-pip install -r requirements.txt
-pip install yt-dlp
+pip install -r requirements.txt yt-dlp
 ```
 
-(If you get *"'pip' is not recognized"*, Python was installed without the
-**Add Python to PATH** box ticked. Re-run the Python installer, choose
-**Modify**, and tick it.)
-
-**4. Start it.** Double-click `yt-fingerprinter.pyw`.
-
-> Windows hides file extensions by default, so in Explorer it may appear simply
-> as **yt-fingerprinter**. If double-clicking opens a text editor instead of the
-> program, right-click it → **Open with** → **Python**.
-
-**5. Set your working folder.** In **Step 2**, use **Browse...** next to
-**Working folder for audio** and pick somewhere with room to spare, for example
-`C:\fingerprints\download`. *This program's folder* fills itself in, so you can
-normally leave it alone.
-
-Everything is remembered from then on: the program writes a `config.json` when
-you close it and reads it back next time. (`config.example.json` in this
-repository shows what that file looks like.)
+Then put ffmpeg (for example from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/))
+and Node.js LTS on PATH, and copy WerZatSong's `libs\audfprint` folder into the
+program folder so that `audfprint\audfprint.py` exists. GitHub's ZIP adds an
+extra top-level folder, so check that the file is not one level too deep.
 
 ## Using it
 
-### The short version
+1. **Step 1:** paste a link and press **Add to list** (or Enter). Add as many
+   as you like, or use **Import from file** for a text file with one link per
+   line. Untick a row to skip it this time.
+2. **Step 2:** choose the **Working folder for audio**. With more than one link
+   in the list, also set **Keep finished fingerprints in** (see
+   [Limitations](#limitations)).
+3. **Step 3:** press **Download and fingerprint** and follow the **Console**.
 
-1. **Step 1** — paste a link and press **Add to list**.
-2. **Step 2** — check the folders. If your list has more than one link, fill in
-   **Keep finished fingerprints in**.
-3. **Step 3** — press **Download and fingerprint**, and watch *What it is doing*
-   at the bottom. (Already have the audio? Use one of the *Audio already on
-   disk* buttons instead.)
+It does not stop to ask anything: for each link it logs how many items it found
+and a rough size and time estimate, then starts. Press **Stop** if the numbers
+are more than you expected.
 
-**It does not stop to ask you anything.** It lists the link, prints a size and
-an estimated download time to the log, and gets going. Read those numbers as
-they appear, and press **Stop** if they are bigger than you bargained for.
+Finished `.pklz` files go to **Keep finished fingerprints in**, or to
+`pklz-files\` in the program folder if that is empty. They are named after the
+channel handle in the link (for example `@name-1.pklz`), or after the
+uploader.
 
-When it finishes, your `.pklz` files are wherever **Keep finished fingerprints
-in** points (or in the `pklz-files` folder), and that folder opens for you.
+**Skip this link** moves on to the next link once the current stage finishes.
+**Stop** ends everything immediately.
 
-### The buttons in Step 3
+### Audio you already have
 
-**Download and fingerprint** — the whole job for every ticked link: download,
-cut, fingerprint, then delete the downloaded audio. This is the one you want
-almost always.
+Both buttons under **Audio already on disk** work on the working folder without
+downloading anything, and neither clears the results folder:
 
-Under **Audio already on disk** are two buttons that both skip downloading and
-work on what is already in your working folder. Neither clears the results
-folder, so fingerprints you already have survive either one.
+- **Split + fingerprint** splits long files first (see below), then
+  fingerprints.
+- **Fingerprint only** uses the files as they are and skips reading their
+  lengths, which saves a long wait on a collection that is already split.
 
-**Split + fingerprint** — checks how long every file is and cuts anything over
-12 minutes before fingerprinting. Use it for audio of your own that has not
-been split yet.
+These are also the way to resume after a crash: work that is already
+fingerprinted is recorded in `fingerprinted.json` next to the `.pklz` files and
+is not done twice.
 
-**Fingerprint only (already split)** — fingerprints the files exactly as they
-are. Use it when the audio has already been split. This is not just a matter of
-skipping the cutting: it skips the length check as well, and that check costs
-one read per file. Over a collection of several thousand pieces that is a long
-wait purely to be told there was nothing to do.
+## Splitting
 
-**Skip this link** — moves on to the next one in the list. It takes effect
-between stages rather than instantly, so a download already in flight finishes
-first.
+Files longer than **12 minutes** are split into **6-minute** pieces. The last
+piece takes the remainder, so a 15-minute file becomes 6:00 + 9:00 and a
+30-minute file becomes five 6:00 pieces. Files of 12 minutes or less are left
+whole, so with splitting on, nothing longer than 12 minutes is fingerprinted.
 
-**Stop** — stops everything.
+This makes a match point to a 6-minute window of a long mix instead of "somewhere
+in these three hours". Six minutes is the minimum because shorter pieces give
+audfprint less to match on. Pieces are cut by copying the audio stream, without
+re-encoding.
 
-**Check my setup** — the thing to press when something seems wrong. It checks
-Python, ffmpeg, ffprobe, node, yt-dlp and audfprint, plus free disk space and
-whether your working folder is writable. Note it also runs `yt-dlp -U`, which
-tries to **update yt-dlp over the internet** and can take up to 90 seconds.
+Splitting is on by default for downloads (**Advanced settings**). The two
+buttons for audio already on disk decide it for themselves.
 
-### Doing several links in one go
+## Settings
 
-**Your list** in Step 1 holds as many as you like. **Add to list** adds whatever
-is in the Link box; **Import from file...** reads a plain text file with one URL
-per line. Reorder with **Move up** / **Move down**, tidy up with **Remove
-ticked** or **Clear the list**, then press **Download and fingerprint**. It
-works from top to bottom, and the list is saved when you close the program, so
-an interrupted batch is still there in the morning.
+Settings and the list are saved to `config.json` when you close the program.
+The defaults suit most jobs, but check them before a large one: they decide
+memory use, download speed and how big the output files are.
 
-Untick a row to leave it in the list but skip it this time.
+### Downloads at once
 
-## Advanced settings
+In Step 3. Default **8**, maximum 32. Each download is a separate yt-dlp
+process. More is faster on a good connection but uses more bandwidth and CPU,
+and sites limit how fast one client may fetch: if downloads start failing with
+HTTP 429 (too many requests) or 403, lower it.
 
-The **Advanced settings** button opens a separate little window. Nothing in it
-needs changing to get a good result.
+### Advanced settings
 
 ![The Advanced settings window](screenshot-advanced.png)
 
-| Setting | What it does |
+| Setting | Default | What it does |
+|---|---|---|
+| Fingerprint jobs at once | 4 | Batches fingerprinted side by side. Each can use around 5.5 GB of memory at 1000 recordings per file, so raise it only if you have the RAM. |
+| Recordings per file | 1000 | How many recordings go into one `.pklz`. Keep it high: a matcher loads every `.pklz` on each search, so many small files slow every search. |
+| Split long recordings after downloading | On | See [Splitting](#splitting). |
+| Show every line of download output | On | yt-dlp's full output in the console. Useful when a download fails. |
+| Open the audio folder when a link starts | On | |
+| Open the results folder when it finishes | On | |
+| Name downloaded files | `%(title)s [%(id)s].%(ext)s` | A yt-dlp [output template](https://github.com/yt-dlp/yt-dlp#output-template). |
+| Extra download options | empty | Passed to yt-dlp as they are. See [Content that needs a login](#content-that-needs-a-login). |
+
+audfprint's own `--ncores` is fixed at 1 on purpose: several single-core jobs
+are faster than one job spread over several cores (measured: 8 jobs at 1 core
+took 28 s for what 1 job at 8 cores took 59 s).
+
+## Troubleshooting
+
+Press **Check setup** first. It:
+
+- checks every component by running it: Python, the Python packages, yt-dlp,
+  ffmpeg, ffprobe, Node.js, and whether `audfprint\` is WerZatSong's version and
+  starts;
+- runs `yt-dlp -U`, which **updates yt-dlp** if it can (this can take up to
+  90 seconds);
+- fetches one YouTube video's details as a test;
+- checks free space and write access in the working folder;
+- offers to install or repair whatever is missing or not working, and says what
+  it will do first.
+
+| Problem | Cause and fix |
 |---|---|
-| **Downloads at once** (4) | How many downloads run in parallel. Raise it on a fast connection; lower it if downloads start failing. |
-| **Fingerprint jobs at once** (4) | How many fingerprinting jobs run side by side. The main speed control once downloading is done. |
-| **Recordings per file** (1000 recommended) | How many recordings go into one `.pklz`. Keep it high: a matching tool reloads *every* `.pklz` each time it runs, so many small ones make every future search slower. |
-| **Split long recordings after downloading** (on) | **Leave this on.** Applies to *Download and fingerprint*; for audio already on disk the two Step 3 buttons decide it instead. Explained below. |
-| **Show every line of download output** | Useful when diagnosing a failure, noisy otherwise. |
-| **Open the audio folder when a link starts** | Opens it so you can watch files arrive. |
-| **Open the results folder when it finishes** | Opens your fingerprints at the end. |
-| **Name downloaded files** | yt-dlp [output notation](https://github.com/yt-dlp/yt-dlp#output-template). The default gives `Title [videoid].m4a` — or `.opus`, depending on what the site offers. Safe to ignore. |
-| **Extra download options** | Passed straight to yt-dlp. Usually empty — see *Private or age-restricted videos*. |
+| "WerZatSong's audfprint is needed" | `audfprint\` is missing, one folder too deep, or the upstream version. Press Check setup to install the right one. |
+| `setup.bat` says Python was not found | Install Python from python.org with **Add python.exe to PATH** ticked, then run `setup.bat` again. |
+| An install fails | The console shows why (no connection, proxy, antivirus) and how to do that part by hand. |
+| Many downloads fail, HTTP 429 or 403 | The site is rate-limiting you. Lower **Downloads at once** and try again later. |
+| Some items are skipped | Private, members-only, age-restricted or blocked in your country. The console gives the reason for each. |
+| A list gave far fewer results than expected | **Keep finished fingerprints in** was empty, so each link overwrote the previous one. |
+| The downloaded audio is gone | Expected: it is deleted once a link is fingerprinted. |
+| A run seems frozen | Big channels take a while to list. Turn on **Show every line of download output** to see progress. |
 
-There is deliberately no control for audfprint's own core count. It splits one
-batch across processes and then merges their results back one at a time, so it
-is the slowest way to spend extra cores: measured here, eight jobs at one core
-each did in 28s what one job at eight cores took 59s to do. *Fingerprint jobs
-at once* is the setting that actually helps.
+### Content that needs a login
 
-### Why the splitting matters
-
-Anything longer than 12 minutes is cut into pieces of at least 6 minutes each.
-This is not about file size — it is about how matching works.
-
-A fingerprint tells you *that* a match happened, but a match against a
-three-hour mix only tells you "it is somewhere in this three-hour mix". Cutting
-long uploads into 6-minute pieces means a hit points at a 6-minute window
-instead, which is a far more useful answer. Six minutes is the floor because
-shorter pieces give audfprint too little to work with.
-
-The cutting copies the audio rather than re-encoding it, so nothing is lost and
-it takes seconds rather than minutes.
-
-## Where everything ends up
-
-Inside the program's own folder:
-
-- **`pklz-files\`** — your results, unless *Keep finished fingerprints in* is set.
-- **`texts\`** — working lists written for audfprint. Housekeeping.
-- **`logs\`** — a record of each run, worth keeping if you need to ask for help.
-
-Once the downloading stage is done, these are cleared before fingerprinting
-begins — `texts\` and `pklz-files\` for **Download and fingerprint**, only
-`texts\` for either of the *Audio already on disk* buttons.
-
-> If they are not already empty you get a prompt first — **but that prompt
-> answers itself with "yes, delete" after two minutes** if nobody is at the
-> keyboard, so an unattended list is never blocked by it. Move anything you want
-> to keep out of the way before starting, rather than relying on the prompt.
-
-## If something goes wrong
-
-**Press *Check my setup* first.** It checks each requirement in turn and names
-whichever is missing, which usually answers the question on its own.
-
-| Problem | What is going on |
-|---|---|
-| *"'pip' is not recognized"* | Python was installed without **Add Python to PATH**. Re-run its installer → **Modify** → tick the box. |
-| *"Could not find audfprint\audfprint.py"* | audfprint is missing, or one folder too deep — see the warning in step 2. |
-| *"ffmpeg is not recognized"* | ffmpeg is not on PATH, or `C:\ffmpeg\bin` does not really exist because of the versioned folder. See *What you need*. |
-| Downloads fail, or nothing downloads at all | Usually Node.js missing, or YouTube rate-limiting. Check node in *Check my setup*, then lower **Downloads at once**. |
-| Some videos are skipped | Members-only, private, or region-blocked. See below. |
-| A list produced far fewer results than expected | *Keep finished fingerprints in* was empty, so each link overwrote the previous one. |
-| My downloaded audio vanished | Expected — it is deleted once a link is fingerprinted. See the warnings near the top. |
-| A run seems frozen | Big channels take a while to list before anything visible happens. Turn on **Show every line of download output** to confirm it is still working. |
-
-### Private or age-restricted videos
-
-If videos need you to be signed in, put this in **Extra download options** under
-Advanced settings:
+Add this to **Extra download options**, with `chrome`, `edge` or `brave` in
+place of `firefox` if needed, and close that browser first:
 
 ```
 --cookies-from-browser firefox
 ```
 
-replacing `firefox` with `chrome`, `edge`, or `brave` as appropriate. yt-dlp
-then borrows the login from that browser. Close the browser first — it may lock
-its own cookie database while running.
+yt-dlp then uses that browser's login. It reads the cookies of the Windows
+account the program runs under, so it does not work from a scheduled task or a
+service, whose account has no browser profile.
 
-One catch: this reads the cookies of *the Windows account the program runs
-under*. If you run it as a scheduled task or a service, that account has no
-browser profile, and it fails with a "file not found" error mentioning
-`systemprofile`.
+## Limitations
 
-## Good to know
+- **Windows only.**
+- **Downloaded audio is deleted** once each link is fingerprinted. The `.pklz`
+  files are the output; keep your own copy of the audio if you want it.
+- **The results folder is emptied before each link.** With more than one link,
+  set **Keep finished fingerprints in**, or only the last link's fingerprints
+  are left. The program warns before starting a list without it.
+- **Download and fingerprint clears the results folder** and its record of
+  finished work. To resume an interrupted run, use one of the buttons for audio
+  already on disk.
+- **The "folder is not empty" prompt answers itself** with "yes, delete" after
+  two minutes, so an unattended list never stalls on it. Move anything you want
+  to keep beforehand.
+- **Estimates are rough.** Size and time depend on bitrate, length and your
+  connection.
 
-- **Audio is never re-encoded.** It is downloaded in its original form and
-  split by copying, so quality is exactly what the site served.
-- **Nothing pops up while it works.** The helper programs it runs, and the ones
-  audfprint runs in turn, are all started hidden, so a long run does not
-  flicker black windows across your screen.
-- **Closing the window saves your settings**, including your list.
-- **It does not fingerprint the same batch twice.** Finished work is recorded in
-  `fingerprinted.json` beside the `.pklz` files. To resume after a crash, use
-  one of the *Audio already on disk* buttons — not **Download and fingerprint**,
-  which clears the results folder and takes that record with it.
+## Files and folders
+
+| In the program folder | |
+|---|---|
+| `yt-fingerprinter.pyw` | The program. |
+| `setup.bat`, `dependencies.py` | Setup, and the component check and installer that the program also uses. |
+| `audfprint_quiet.py` | Runs audfprint with its ffmpeg console windows hidden. |
+| `audfprint\` | WerZatSong's audfprint (installed by setup). |
+| `tools\` | ffmpeg and Node.js, if setup installed them. |
+| `pklz-files\` | Results, when no destination is set. |
+| `texts\` | File lists for audfprint. Cleared before fingerprinting. |
+| `config.json`, `recent_urls.json` | Your settings, list and recent links. |
+| `CHANGELOG.md` | What changed in each version. |
 
 ## Credits
 
-Fingerprinting is done by **[audfprint](https://github.com/dpwe/audfprint)** by
-Dan Ellis, and downloading by **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**.
-This project is the desktop window around them; credit for the hard parts
-belongs to those projects.
+Fingerprinting is done by [audfprint](https://github.com/dpwe/audfprint) by Dan
+Ellis, in the version maintained with [WerZatSong](https://github.com/Nel80s/WerZatSong)
+by Nel, and downloading by [yt-dlp](https://github.com/yt-dlp/yt-dlp). This
+project is the window around them.
 
 Only download and store material you have the right to. This tool does not
 decide that for you.
 
 ## License
 
-[MIT](LICENSE) — do what you like with it, including commercially, as long as
-the copyright notice comes along. It is provided as-is, with no warranty.
-
-This covers *this* project only. audfprint and yt-dlp are separate projects
-under their own licences; you download them yourself, and their terms are
-theirs.
+[MIT](LICENSE). This covers this project only. audfprint, WerZatSong and yt-dlp
+are separate projects under their own licences.

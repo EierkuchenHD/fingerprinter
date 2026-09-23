@@ -1,3 +1,6 @@
+# Python packages that audfprint needs (WerZatSong's version; see the README).
+# setup.bat and Check setup install whichever of these are missing.
+# yt-dlp is handled separately: pip install yt-dlp
 docopt
 joblib
 numpy

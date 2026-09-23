@@ -10,8 +10,14 @@ pklz-files/
 logs/
 console_logs/
 
-# audfprint is fetched separately (see the README); it is not part of this repo.
+# WerZatSong's audfprint is fetched separately (setup.bat or Check setup does it);
+# it is not part of this repo. A replaced copy is kept as audfprint.old.
 audfprint/
+audfprint.old*/
+audfprint.download/
+
+# ffmpeg and Node.js, when Check setup installs them for this program only.
+tools/
 
 __pycache__/
 *.pyc

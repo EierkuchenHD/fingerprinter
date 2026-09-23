@@ -8,13 +8,13 @@ window. That is the black box that blinks on screen once per file.
 
 The flag has to be set on the ffmpeg spawn itself, which happens inside
 audfprint's audio_read.py. Editing that file works but is the wrong place to
-put the fix: audfprint is a third-party checkout that each user downloads
-themselves, so a hand edit is easy to get wrong, easy to forget, and lost the
-moment anyone updates it.
+put the fix: audfprint is a separate download (WerZatSong's version, from
+github.com/Nel80s/WerZatSong, libs/audfprint), so a hand edit is easy to get
+wrong, easy to forget, and lost the moment anyone updates it.
 
 So instead this wrapper installs the flag process-wide, by making every
 subprocess.Popen in this interpreter default to a hidden window, and then runs
-audfprint unmodified. Stock audfprint, no windows.
+audfprint unmodified. WerZatSong's audfprint as published, no windows.
 
 Usage (argv[1] is the audfprint script, the rest is passed through untouched):
 

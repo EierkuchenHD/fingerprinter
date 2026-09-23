@@ -4,7 +4,7 @@
   "move_pklz_dir": "",
   "extra_args": "",
   "filename_template": "%(title)s [%(id)s].%(ext)s",
-  "parallel": 10,
+  "parallel": 8,
   "verbose": false,
   "open_folder": true,
   "split_long": true,
