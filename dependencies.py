@@ -219,18 +219,82 @@ def check_packages() -> Status:
 def _find_ytdlp() -> tuple[list[str] | None, str]:
     """(command that runs a working yt-dlp, its version), or (None, "").
 
-    A yt-dlp.exe on PATH wins if it works. Otherwise the copy pip installed into
-    this Python, which works even when Python's Scripts folder is not on PATH."""
+    The newer of two: the copy pip installed into this Python, and a
+    yt-dlp.exe on PATH. The pip copy wins a tie: it is the one setup.bat and
+    Check setup bring to the newest release (update_ytdlp), and it works even
+    when Python's Scripts folder is not on PATH. The exe may have come from
+    anywhere (winget, Chocolatey, a download) and pip cannot update it, but
+    when it is the newer one, as after updating from a version that used it
+    without running setup again, switching to an older pip copy would only
+    make downloads fail."""
+    found: list[tuple[list[str], str]] = []
+    module = [console_python(), "-m", "yt_dlp"]
+    code, out = _run([*module, "--version"], timeout=30)
+    if code == 0:
+        found.append((module, _last_line(out)))
     exe = shutil.which("yt-dlp")
     if exe:
         code, out = _run([exe, "--version"], timeout=30)
         if code == 0:
-            return [exe], _last_line(out)
-    module = [console_python(), "-m", "yt_dlp"]
-    code, out = _run([*module, "--version"], timeout=30)
-    if code == 0:
-        return module, _last_line(out)
-    return None, ""
+            found.append(([exe], _last_line(out)))
+    if not found:
+        return None, ""
+    return max(found, key=lambda f: _version_key(f[1]))     # the first, the pip copy, on a tie
+
+
+def _ytdlp_module_version() -> str:
+    """The version of the yt-dlp installed into this Python, or "" if none."""
+    code, out = _run([console_python(), "-m", "yt_dlp", "--version"], timeout=30)
+    return _last_line(out) if code == 0 else ""
+
+
+def _newest_ytdlp_on_pypi() -> str:
+    """The newest yt-dlp release on PyPI, or "" when PyPI cannot be reached."""
+    try:
+        return str(json.loads(_fetch_text("https://pypi.org/pypi/yt-dlp/json"))["info"]["version"])
+    except Exception:  # noqa: BLE001 - offline, blocked, or an unexpected reply
+        return ""
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    """2026.08.19 and PyPI's 2026.8.19 compare equal; nightlies sort after."""
+    return tuple(int(part) for part in re.findall(r"\d+", version))
+
+
+def update_ytdlp(log: Log) -> bool:
+    """Install the newest yt-dlp release into this Python, whatever version is
+    there now. Sites change what they send all the time, and an old yt-dlp is
+    the commonest reason downloads fail. pip installs the newest release, or
+    installs one when there is none; the program runs this copy (_find_ytdlp).
+
+    PyPI is asked for the newest version number first, because pip cannot be
+    taken at its word: with no connection it still says "Requirement already
+    satisfied" and succeeds, which would read as "already the newest"."""
+    before = _ytdlp_module_version()
+    newest = _newest_ytdlp_on_pypi()
+    log("Updating yt-dlp to the newest release" + (f" (now {before})..." if before else "..."))
+    if not _pip(["--upgrade", "yt-dlp"], log):
+        log("    ! yt-dlp could not be updated" +
+            (f"; version {before} stays in use." if before else "."))
+        return False
+    after = _ytdlp_module_version()
+    if not after:
+        log("    ! pip finished, but yt-dlp does not start.")
+        return False
+    if newest and _version_key(after) < _version_key(newest):
+        log(f"    ! yt-dlp {newest} is the newest release, but pip left {after} in place.")
+        return False
+    if not newest and after == before:
+        log(f"    ! PyPI could not be reached to look for a newer yt-dlp; version {after} "
+            f"stays in use.")
+        return False
+    if after == before:
+        log(f"    yt-dlp {after} is already the newest release.")
+    elif before:
+        log(f"    yt-dlp updated from {before} to {after}.")
+    else:
+        log(f"    yt-dlp {after} installed.")
+    return True
 
 
 def ytdlp_command() -> list[str] | None:
@@ -561,11 +625,147 @@ def describe(status: Status) -> str:
 # console entry point (setup.bat)
 # ----------------------------------------------------------------------------
 
+ICON_FILE = APP_DIR / "fingerprinter.ico"
+SHORTCUT_FILE = APP_DIR / "Fingerprinter.lnk"
+# The program's AppUserModelID. The running program takes it (main() in
+# yt-fingerprinter.pyw) so its taskbar button has its own icon rather than
+# Python's; the shortcut carries it too, so that a pinned shortcut and the
+# window it opens are one taskbar button, not two.
+APP_ID = "EierkuchenHD.Fingerprinter"
+
+# Sets System.AppUserModel.ID on a saved .lnk, which WScript.Shell cannot.
+_SET_APP_ID_CS = """
+using System;
+using System.Runtime.InteropServices;
+public static class FpShortcut {
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct PropertyKey { public Guid Fmtid; public uint Pid; }
+    [StructLayout(LayoutKind.Explicit)]
+    public struct PropVariant {
+        [FieldOffset(0)] public ushort Vt;
+        [FieldOffset(8)] public IntPtr Value;
+        [FieldOffset(16)] public IntPtr Unused;
+    }
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPropertyStore {
+        void GetCount(out uint count);
+        void GetAt(uint index, out PropertyKey key);
+        void GetValue(ref PropertyKey key, out PropVariant value);
+        void SetValue(ref PropertyKey key, ref PropVariant value);
+        void Commit();
+    }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    static extern void SHGetPropertyStoreFromParsingName(
+        string path, IntPtr bindContext, int flags, ref Guid iid,
+        [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
+    public static void SetAppId(string lnk, string appId) {
+        Guid iid = typeof(IPropertyStore).GUID;
+        IPropertyStore store;
+        SHGetPropertyStoreFromParsingName(lnk, IntPtr.Zero, 2, ref iid, out store);   // GPS_READWRITE
+        try {
+            PropertyKey key = new PropertyKey();
+            key.Fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");         // System.AppUserModel.ID
+            key.Pid = 5;
+            PropVariant value = new PropVariant();
+            value.Vt = 31;                                                         // VT_LPWSTR
+            value.Value = Marshal.StringToCoTaskMemUni(appId);
+            try {
+                store.SetValue(ref key, ref value);
+                store.Commit();
+            } finally {
+                Marshal.FreeCoTaskMem(value.Value);
+            }
+        } finally {
+            Marshal.ReleaseComObject(store);
+        }
+    }
+}
+"""
+
+
+def _shortcut_target() -> Path:
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    return pythonw if pythonw.is_file() else Path(sys.executable)
+
+
+def shortcut_is_current() -> bool:
+    """Whether Fingerprinter.lnk exists and was made for this folder, this
+    Python and the app ID. A .lnk holds absolute paths, so one that came along
+    when the folder was moved or copied, or that outlived the Python it
+    starts, would start the old copy or nothing at all. The paths are looked
+    for in the file itself (as UTF-16, or in the ANSI code page, which is how a
+    shortcut stores its target), so checking costs no PowerShell."""
+    try:
+        data = SHORTCUT_FILE.read_bytes().lower()
+    except OSError:
+        return False
+
+    def holds(text: str) -> bool:
+        forms = [text.encode("utf-16-le")]
+        try:
+            forms.append(text.encode("mbcs"))
+        except (UnicodeEncodeError, LookupError):
+            pass
+        return any(form.lower() in data for form in forms)
+
+    return all(holds(text) for text in (str(_shortcut_target()),
+                                        str(APP_DIR / "yt-fingerprinter.pyw"), APP_ID))
+
+
+def make_shortcut(log: Log = print) -> bool:
+    """Fingerprinter.lnk in the program folder: starts the program without a
+    console window, and shows the fingerprint icon, which the .pyw file itself
+    cannot (Windows gives every .pyw file Python's icon). Made through Windows'
+    own WScript.Shell, from PowerShell; paths go in as environment variables so
+    no quoting can break them. The app ID is then written into it, which only
+    affects pinning: the shortcut works without it."""
+    script = (
+        "try { "
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:FP_LNK); "
+        "$s.TargetPath = $env:FP_TARGET; $s.Arguments = '\"' + $env:FP_SCRIPT + '\"'; "
+        "$s.WorkingDirectory = $env:FP_DIR; $s.IconLocation = $env:FP_ICON + ',0'; "
+        "$s.Description = 'Fingerprinter'; $s.Save() "
+        "} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }; "
+        "try { "
+        "Add-Type -TypeDefinition $env:FP_CS; [FpShortcut]::SetAppId($env:FP_LNK, $env:FP_APPID) "
+        "} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 2 }"
+    )
+    env = dict(os.environ, FP_LNK=str(SHORTCUT_FILE), FP_TARGET=str(_shortcut_target()),
+               FP_SCRIPT=str(APP_DIR / "yt-fingerprinter.pyw"), FP_DIR=str(APP_DIR),
+               FP_ICON=str(ICON_FILE), FP_CS=_SET_APP_ID_CS, FP_APPID=APP_ID)
+    try:
+        # PowerShell writes its errors in the console's (OEM) code page.
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, encoding="oem", errors="replace",
+            env=env, timeout=120, creationflags=_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"    ! Could not create the shortcut: {e}")
+        return False
+    if proc.returncode == 2 and SHORTCUT_FILE.is_file():
+        log(f"    ! Made the shortcut, but could not give it the program's app ID, so a pinned "
+            f"copy shows as a separate taskbar button: {_last_line(proc.stderr or proc.stdout)}")
+        return True
+    if proc.returncode != 0 or not SHORTCUT_FILE.is_file():
+        log(f"    ! Could not create the shortcut: {_last_line(proc.stderr or proc.stdout)}")
+        return False
+    return True
+
+
 def main(argv: list[str]) -> int:
     if sys.platform != "win32":
         print("The Fingerprinter runs on Windows only.")
         return 1
     check_only = "--check" in argv
+    if "--shortcut" in argv and make_shortcut():
+        # setup.bat asks for this: the program's shortcut, with its icon.
+        print(f"Made {SHORTCUT_FILE.name} in the program folder: start the Fingerprinter from it.\n")
+    if "--update-ytdlp" in argv:
+        # setup.bat asks for this every time it runs (see update_ytdlp).
+        update_ytdlp(print)
+        print()
     print("Checking what the Fingerprinter needs...\n")
     statuses = check_all(APP_DIR)
     for s in statuses:

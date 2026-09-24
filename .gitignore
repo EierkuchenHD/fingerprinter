@@ -1,12 +1,18 @@
 # Your own settings and lists — written by the app as you use it.
 config.json
 recent_urls.json
+fingerprinted-items.txt
+unfinished-list.json
+unfinished-list.tmp
+# The shortcut setup makes; it holds this computer's paths.
+Fingerprinter.lnk
 *.txt
 !requirements.txt
 
 # Folders the app creates: your downloads and finished fingerprints, and its
 # own scratch space. texts/ is where older versions kept their file lists.
 downloads/
+audio/
 pklz-files/
 work/
 texts/

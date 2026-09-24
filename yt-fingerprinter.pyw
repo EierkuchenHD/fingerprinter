@@ -32,6 +32,7 @@ Requirements (dependencies.py checks them and installs what is missing):
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -40,6 +41,7 @@ import queue
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -50,7 +52,7 @@ import webbrowser
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import dependencies
 
@@ -59,7 +61,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.0.0-beta.3"
+__version__ = "1.0.0-beta.4"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -147,6 +149,11 @@ CONFIG_VERSION = 3
 # Items already fingerprinted, one "<extractor> <id>" per line: the format of
 # yt-dlp's --download-archive, so the file also works with yt-dlp itself.
 DONE_FILE = SCRIPT_DIR / "fingerprinted-items.txt"
+# A list run in progress: its links, which finished, and which one is running.
+# Written as each link starts and ends and deleted when the list completes, so
+# finding it at start-up means the last run stopped part-way (Stop, a crash,
+# the PC shutting down) and can be continued (see _offer_resume).
+LIST_STATE_FILE = SCRIPT_DIR / "unfinished-list.json"
 
 
 def load_config() -> dict:
@@ -230,12 +237,50 @@ _INGESTING_RE = re.compile(r"ingesting #(\d+)\s*:\s*(.+?)\s*\.\.\.\s*$")
 # script, python -m yt_dlp or the standalone exe.
 YTDLP_UTF8 = ("--encoding", "utf-8")
 
+# Settings, General: the window's colours. "Follow Windows" reads whether
+# Windows apps are set to dark, and keeps following it while the program runs.
+THEME_CHOICES = ("Follow Windows", "Light", "Dark")
+# Colours for everything the ttk theme does not draw: the list and Now rows,
+# the console and its colour tags, borders, dividers, tooltips, and the text
+# colours of help lines and links. Light matches the look before dark mode:
+# menus, drop-down lists and selected text keep Windows' own colours there.
+PALETTES = {
+    "light": {
+        "bg": "#f0f0f0", "fg": "#000000", "field": "#ffffff", "button": "#e1e1e1",
+        "hover": "#e5f1fb", "pressed": "#cce4f7", "disabled_fg": "#8a8a8a",
+        "row_bg": "#ffffff", "row_selected": "#cce8ff", "link": "#0b57d0",
+        "muted": "#707070", "help": "#5f6b7a", "warn": "#b02a37", "remove_hover": "#c0392b",
+        "border": "#c8c8c8", "sash": "#f0f0f0", "accent": "#06b025",
+        "console_bg": "SystemWindow", "console_fg": "SystemWindowText", "select": "#cce8ff",
+        "menu": "SystemMenu", "menu_fg": "SystemMenuText", "list": "SystemWindow",
+        "list_fg": "SystemWindowText", "highlight": "SystemHighlight", "highlight_fg": "SystemHighlightText",
+        "tip_bg": "#ffffe1", "tip_fg": "#000000",
+        "tags": {"ytdlp": "#1565c0", "bat": "#e67e22", "warning": "#c0392b",
+                 "splitter": "#16a085", "ts": "#888888"},
+    },
+    "dark": {
+        "bg": "#202124", "fg": "#e8eaed", "field": "#2b2c30", "button": "#35363a",
+        "hover": "#3f4146", "pressed": "#4a4c52", "disabled_fg": "#76797e",
+        "row_bg": "#1b1c1f", "row_selected": "#264f78", "link": "#8ab4f8",
+        "muted": "#9aa0a6", "help": "#9aa0a6", "warn": "#f28b82", "remove_hover": "#f28b82",
+        "border": "#3c4043", "sash": "#3c4043", "accent": "#5bb974",
+        "console_bg": "#16171a", "console_fg": "#e8eaed", "select": "#264f78",
+        "menu": "#2b2c30", "menu_fg": "#e8eaed", "list": "#2b2c30",
+        "list_fg": "#e8eaed", "highlight": "#264f78", "highlight_fg": "#e8eaed",
+        "tip_bg": "#303134", "tip_fg": "#e8eaed",
+        "tags": {"ytdlp": "#8ab4f8", "bat": "#fbbc04", "warning": "#f28b82",
+                 "splitter": "#81c995", "ts": "#8c8f94"},
+    },
+}
+
 # Browsers yt-dlp can take cookies from (Settings, Downloads); "None" means
 # no --cookies-from-browser.
 COOKIE_BROWSERS = ("None", "Firefox", "Chrome", "Edge", "Brave", "Opera", "Vivaldi", "Chromium")
 
 DOWNLOADS_DIR = "downloads"
 PKLZ_DIR = "pklz-files"
+# Where downloaded audio is kept when Settings asks for it (off by default).
+KEEP_AUDIO_DIR = "audio"
 WORK_DIR = "work"
 WORK_TEXTS = Path(WORK_DIR, "texts")
 WORK_PKLZ = Path(WORK_DIR, "pklz")
@@ -276,6 +321,8 @@ class Tooltip:
     under every control and cost a line of height each."""
 
     DELAY_MS = 600
+    # Set by the app from the current theme (see _apply_theme).
+    colours = {"bg": "#ffffe1", "fg": "#000000"}
 
     def __init__(self, widget: tk.Misc, text: str | Callable[[], str]) -> None:
         self.widget = widget
@@ -303,7 +350,7 @@ class Tooltip:
         tip = tk.Toplevel(self.widget)
         tip.wm_overrideredirect(True)
         tip.attributes("-topmost", True)
-        tk.Label(tip, text=text, justify="left", bg="#ffffe1", fg="#000000",
+        tk.Label(tip, text=text, justify="left", bg=Tooltip.colours["bg"], fg=Tooltip.colours["fg"],
                  relief="solid", bd=1, wraplength=380, padx=6, pady=3).pack()
         tip.update_idletasks()
         # Below the widget, kept on screen at the right-hand edge.
@@ -326,6 +373,9 @@ class FingerprinterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"Fingerprinter {__version__}")
+        # The fingerprint icon, for this window, Settings and the taskbar
+        # (main() gives the program a taskbar button of its own for it).
+        self._set_window_icon()
         # Sized against the actual screen rather than a fixed guess, and clamped
         # so a 1366x768 laptop still gets a window that fits with nothing to
         # scroll (see _build_ui). Wide enough for the list and Now side by side.
@@ -344,6 +394,16 @@ class FingerprinterApp:
 
         self.log_queue: queue.Queue[tuple[str, str, str | None]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
+        # The running list's record (_run_queue), and whether the unfinished
+        # list has been offered this session (_offer_resume).
+        self._list_state: dict | None = None
+        self._resume_asked = False
+        # Which job is running, for what the Stop question says (_cancel).
+        self._job_kind = ""
+        # Whether the main window carries the app ID (_set_window_app_id).
+        self._window_app_id = False
+        # The record of finished batches per work\pklz, this session (_load_fingerprinted).
+        self._fp_records: dict[str, dict[str, str]] = {}
         self.cancel_flag = threading.Event()
         # EVERY live child process, so Stop and Quit can actually end them.
         # This used to hold audfprint batches only, which meant Stop during the
@@ -375,13 +435,14 @@ class FingerprinterApp:
 
         self._build_ui()
         self._apply_config(load_config())
-        # First run, or a config that predates this: the program already knows
-        # where it lives, and audfprint sits next to it, so fill that in rather
-        # than presenting an empty box the user has to guess at (and then
-        # refusing to start until they do).
-        if not self.bat_dir_var.get().strip():
-            self.bat_dir_var.set(str(Path(__file__).resolve().parent))
         self._fill_default_folders()
+        # The ttk theme main() picked: light mode goes back to it (_apply_theme).
+        self._native_theme = ttk.Style().theme_use()
+        self._apply_console_font()
+        self._apply_theme()
+        for window in (self.root, self.settings_win):
+            window.bind("<Map>", self._on_map_title_bar, add="+")
+        self.root.after(10_000, self._follow_windows_theme)
         self._poll_log_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         # Quick look for anything missing, so a first run offers to install it
@@ -428,17 +489,23 @@ class FingerprinterApp:
     CONSOLE_MIN_HEIGHT = 260
     CONSOLE_MIN_SHARE = 0.4
     LIST_SHARE = 0.55
+    # The console's text size (Settings, General), in points.
+    CONSOLE_FONT_SIZE = 9
+    CONSOLE_FONT_RANGE = (7, 20)
 
     def _help(
         self, parent: tk.Misc, text: str,
         colour: str | None = None, wrap: int = 980,
     ) -> ttk.Label:
         """One small grey explanation line, to sit under the control it explains."""
-        return ttk.Label(
+        label = ttk.Label(
             parent, text=text, font=self.HELP_FONT,
             foreground=colour or self.HELP_GREY,
             wraplength=wrap, justify="left",
         )
+        # Its colour follows the theme (see _apply_theme).
+        self._themed_labels.append((label, "warn" if colour == self.HELP_WARN else "help"))
+        return label
 
     def _folder_row(
         self, parent: ttk.Frame, row: int, label: str,
@@ -469,6 +536,10 @@ class FingerprinterApp:
         return head
 
     def _build_ui(self) -> None:
+        # ttk labels whose text colour is set by hand, with the palette role it
+        # comes from, so a change of theme can recolour them (_apply_theme).
+        self._themed_labels: list[tuple[ttk.Label, str]] = []
+        self._console_font = tkfont.Font(family="Consolas", size=self.CONSOLE_FONT_SIZE)
         self._bold_font = tkfont.nametofont("TkDefaultFont").copy()
         self._bold_font.configure(weight="bold")
         self._link_font = tkfont.nametofont("TkDefaultFont").copy()
@@ -483,6 +554,7 @@ class FingerprinterApp:
         ttk.Label(status, textvariable=self.status_var, anchor="w").pack(
             side="left", fill="x", expand=True, padx=(8, 0), pady=3)
         self.keep_label = ttk.Label(status, cursor="hand2", foreground=self.QLINK_FG)
+        self._themed_labels.append((self.keep_label, "link"))
         self.keep_label.pack(side="right", padx=8, pady=3)
         self.keep_label.bind("<Button-1>", lambda _e: self._open_keep_folder())
         Tooltip(self.keep_label, lambda: (
@@ -533,14 +605,17 @@ class FingerprinterApp:
             validate="key", validatecommand=(url_validator, "%P"),
         )
         self.url_combo.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        # Enter in the link box adds to the list too.
-        self.url_combo.bind("<Return>", lambda _e: self._add_to_queue())
+        # Enter in the link box adds to the list too, whenever Add could.
+        self.url_combo.bind("<Return>", lambda _e: self.add_queue_btn.invoke())
         Tooltip(self.url_combo,
                 "A channel, playlist or single page from YouTube, Archive.org, "
                 "Mixcloud, SoundCloud or any other site yt-dlp supports. "
                 "The arrow lists recent links.")
-        self.add_queue_btn = ttk.Button(bar, text="Add", width=8, command=self._add_to_queue)
+        self.add_queue_btn = ttk.Button(bar, text="Add", width=8, command=self._add_to_queue,
+                                        state="disabled")
         self.add_queue_btn.pack(side="left")
+        # Only clickable with something in the link box (_update_add_btn).
+        self.url_var.trace_add("write", lambda *_a: self._update_add_btn())
         self.queue_import_btn = ttk.Button(
             bar, text="Import...", command=self._import_queue_from_file)
         self.queue_import_btn.pack(side="left", padx=(6, 0))
@@ -600,7 +675,7 @@ class FingerprinterApp:
         # stay two separate choices: one rewrites files in place and the other
         # never touches them, and each asks before it starts.
         self.disk_btn = ttk.Menubutton(bar, text="Audio on disk")
-        disk_menu = tk.Menu(self.disk_btn, tearoff=0)
+        disk_menu = self.disk_menu = tk.Menu(self.disk_btn, tearoff=0)
         disk_menu.add_command(
             label="Split + fingerprint the working folder",
             command=lambda: self._start_bats_only(split=True))
@@ -675,7 +750,9 @@ class FingerprinterApp:
         self.now_title_var = tk.StringVar(value="Now")
         head = self._panel_header(box, self.now_title_var)
         self.now_detail_var = tk.StringVar(value="Idle")
-        ttk.Label(head, textvariable=self.now_detail_var, foreground=self.HELP_GREY).pack(side="right")
+        detail = ttk.Label(head, textvariable=self.now_detail_var, foreground=self.HELP_GREY)
+        detail.pack(side="right")
+        self._themed_labels.append((detail, "help"))
         self.now_bar = ttk.Progressbar(box, mode="determinate", maximum=100)
         self.now_bar.pack(fill="x", pady=(0, 4))
         self._progress_stage: tuple[str, float, int] | None = None
@@ -713,12 +790,28 @@ class FingerprinterApp:
         self.clear_btn.pack(side="right")
         self.copy_btn = ttk.Button(head, text="Copy", style="Toolbutton", command=self._copy_log)
         self.copy_btn.pack(side="right")
+        # Follow: keep the newest line in view (_poll_log_queue). Off, the view
+        # stays where it was scrolled to while lines are added below.
+        self.console_follow_var = tk.BooleanVar(value=True)
+        follow = ttk.Checkbutton(head, text="Follow", variable=self.console_follow_var,
+                                 command=self._console_follow_changed)
+        follow.pack(side="right", padx=(0, 8))
+        Tooltip(follow, "Scroll to each new line as it is added. Turn off to read "
+                        "earlier lines while a job runs.")
         # wrap="word": long file names wrap onto the next line whole instead of
-        # breaking mid-word at the edge of the console.
-        self.log_text = scrolledtext.ScrolledText(
-            box, height=12, font=("Consolas", 9), wrap="word",
-        )
-        self.log_text.pack(fill="both", expand=True)
+        # breaking mid-word at the edge of the console. A plain Text with a ttk
+        # scrollbar rather than ScrolledText, whose classic Windows scrollbar
+        # cannot be coloured for dark mode.
+        frame = ttk.Frame(box)
+        frame.pack(fill="both", expand=True)
+        self.log_text = tk.Text(frame, height=12, font=self._console_font, wrap="word",
+                                borderwidth=1, relief="solid", highlightthickness=0)
+        log_scroll = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True)
+        # Ctrl and the wheel change the text size, like in a browser.
+        self.log_text.bind("<Control-MouseWheel>", self._console_zoom)
         self.log_text.configure(state="disabled")
         self.log_text.tag_configure("ytdlp", foreground="#1565c0")
         self.log_text.tag_configure("bat", foreground="#e67e22")
@@ -741,11 +834,63 @@ class FingerprinterApp:
         self.settings_tabs = ttk.Notebook(self.settings_win)
         self.settings_tabs.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
+        # ---- General ----
+        tab = ttk.Frame(self.settings_tabs, padding=8)
+        self.settings_tabs.add(tab, text="General")
+        row = ttk.Frame(tab)
+        row.pack(fill="x")
+        ttk.Label(row, text="Appearance:").pack(side="left", padx=(0, 4))
+        self.theme_var = tk.StringVar(value=THEME_CHOICES[0])
+        self.theme_combo = ttk.Combobox(row, textvariable=self.theme_var, values=THEME_CHOICES,
+                                        state="readonly", width=16)
+        self.theme_combo.pack(side="left")
+        self.theme_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_theme())
+        self._help(
+            tab,
+            "Follow Windows goes dark when Windows apps are set to dark (Windows Settings, "
+            "Personalisation, Colours), and changes along with it.",
+            wrap=560,
+        ).pack(anchor="w", padx=4, pady=(1, 8))
+
+        row = ttk.Frame(tab)
+        row.pack(fill="x")
+        ttk.Label(row, text="Console text size:").pack(side="left", padx=(0, 4))
+        self.console_font_var = tk.IntVar(value=self.CONSOLE_FONT_SIZE)
+        self.console_font_spin = ttk.Spinbox(
+            row, from_=self.CONSOLE_FONT_RANGE[0], to=self.CONSOLE_FONT_RANGE[1],
+            textvariable=self.console_font_var, width=4, command=self._apply_console_font)
+        self.console_font_spin.pack(side="left")
+        self.console_font_spin.bind("<FocusOut>", lambda _e: self._apply_console_font())
+        self.console_font_spin.bind("<Return>", lambda _e: self._apply_console_font())
+        self._help(tab, "Ctrl and the mouse wheel over the console change it too.",
+                   wrap=560).pack(anchor="w", padx=4, pady=(1, 8))
+
+        self.keep_awake_var = tk.BooleanVar(value=True)
+        self.confirm_stop_var = tk.BooleanVar(value=True)
+        self.offer_resume_var = tk.BooleanVar(value=True)
+        for var, label, explanation in (
+            (self.keep_awake_var, "Keep the PC awake while a job runs",
+             "Windows does not go to sleep until the job has finished. The screen can "
+             "still turn off."),
+            (self.confirm_stop_var, "Ask before Stop",
+             "Stop ends everything at once, so this asks first."),
+            (self.offer_resume_var, "Offer to continue an unfinished list",
+             "If a list stopped part-way (Stop, a crash, the PC shutting down), the program "
+             "offers to carry on where it stopped: when it starts, and when you press "
+             "Download and fingerprint. Links that finished are not run again; the one it "
+             "stopped in starts over."),
+        ):
+            ttk.Checkbutton(tab, text=label, variable=var).pack(anchor="w", pady=1)
+            self._help(tab, explanation, wrap=560).pack(anchor="w", padx=22, pady=(0, 6))
+
         # ---- Folders ----
         tab = ttk.Frame(self.settings_tabs, padding=8)
         self.settings_tabs.add(tab, text="Folders")
         self.output_dir_var = tk.StringVar()
-        self.bat_dir_var = tk.StringVar()
+        # The program's own folder, which holds audfprint\, tools\ and work\.
+        # Always where this file is; not a setting (it was one, from the days
+        # of the .bat scripts, and a stale value could only point elsewhere).
+        self.bat_dir_var = tk.StringVar(value=str(SCRIPT_DIR))
         self.move_pklz_dir_var = tk.StringVar()
         self._folder_row(
             tab, 0, "Working folder for audio:", self.output_dir_var,
@@ -757,11 +902,29 @@ class FingerprinterApp:
             "Where finished .pklz files are collected. Nothing here is ever deleted. "
             "Default: pklz-files in this program's folder.",
         )
-        self._folder_row(
-            tab, 4, "This program's folder:", self.bat_dir_var,
-            "Holds this program and its audfprint folder, which must be WerZatSong's "
-            "version of audfprint. Filled in automatically.",
-        )
+        # Keeping the downloads: off by default, and the folder only matters
+        # (and can only be changed) while it is on.
+        self.keep_audio_var = tk.BooleanVar(value=False)
+        self.keep_audio_dir_var = tk.StringVar()
+        self.keep_audio_check = ttk.Checkbutton(
+            tab, text="Keep downloaded audio in:", variable=self.keep_audio_var)
+        self.keep_audio_check.grid(row=4, column=0, sticky="w", padx=4, pady=(10, 0))
+        self.keep_audio_entry = ttk.Entry(tab, textvariable=self.keep_audio_dir_var, width=58)
+        self.keep_audio_entry.grid(row=4, column=1, sticky="we", padx=4, pady=(10, 0))
+        self.keep_audio_entry.bind("<FocusOut>", lambda _e: self._normalize_var(self.keep_audio_dir_var))
+        self.keep_audio_browse = ttk.Button(
+            tab, text="Browse...", command=lambda: self._browse(self.keep_audio_dir_var))
+        self.keep_audio_browse.grid(row=4, column=2, padx=4, pady=(10, 0))
+        self._help(
+            tab,
+            "Off by default: downloaded audio is deleted once it has been fingerprinted. "
+            "When on, each link's downloads are also kept here, in a folder named after "
+            "the channel, as they were downloaded, before splitting. Default: audio in "
+            "this program's folder.",
+            wrap=560,
+        ).grid(row=5, column=1, columnspan=2, sticky="w", padx=4, pady=(1, 2))
+        self.keep_audio_var.trace_add("write", lambda *_a: self._update_keep_audio_row())
+        self._update_keep_audio_row()
         tab.columnconfigure(1, weight=1)
 
         # ---- Downloads ----
@@ -832,8 +995,9 @@ class FingerprinterApp:
         self.forget_done_btn = ttk.Button(row, text="Forget them", command=self._forget_done)
         self.forget_done_btn.pack(side="right")
         self.done_count_var = tk.StringVar()
-        ttk.Label(row, textvariable=self.done_count_var, foreground=self.HELP_GREY).pack(
-            side="right", padx=6)
+        done_count = ttk.Label(row, textvariable=self.done_count_var, foreground=self.HELP_GREY)
+        done_count.pack(side="right", padx=6)
+        self._themed_labels.append((done_count, "help"))
         self._help(
             tab,
             "Each item is remembered once its link has been fingerprinted, in "
@@ -916,6 +1080,18 @@ class FingerprinterApp:
         self.notify_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(tab, text="Play a sound and flash the taskbar button when a run finishes",
                         variable=self.notify_var).pack(anchor="w", pady=1)
+        # The record of finished batches that lets Audio on disk carry on
+        # after a restart (_load_fingerprinted). Off, it is kept in memory.
+        self.fp_record_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tab, text=f"Write {self.FINGERPRINTED_RECORD} while fingerprinting",
+                        variable=self.fp_record_var).pack(anchor="w", pady=(7, 1))
+        self._help(
+            tab,
+            f"Off by default. A record in work\\pklz of which batches are finished. Without "
+            f"it, Audio on disk still carries on after Stop as long as the program stays "
+            f"open; with it, also after the program was closed or crashed.",
+            wrap=560,
+        ).pack(anchor="w", padx=22, pady=(0, 6))
 
         close = ttk.Frame(self.settings_win)
         close.pack(fill="x", padx=8, pady=8)
@@ -935,12 +1111,342 @@ class FingerprinterApp:
 
     def _hide_settings(self) -> None:
         # Folders typed into the boxes are tidied when the window closes too.
-        for var in (self.output_dir_var, self.bat_dir_var, self.move_pklz_dir_var):
+        for var in (self.output_dir_var, self.bat_dir_var, self.move_pklz_dir_var,
+                    self.keep_audio_dir_var):
             self._normalize_var(var)
         self.settings_win.withdraw()
 
     def _program_dir(self) -> Path:
         return Path(norm_path(self.bat_dir_var.get()) or SCRIPT_DIR)
+
+    def _set_window_icon(self) -> None:
+        """Give every window the fingerprint icon, one image per size.
+
+        iconbitmap with the .ico left the taskbar button blurred: Windows was
+        handed one size and scaled it. iconphoto takes each size separately,
+        and Windows picks the one that fits. The sizes come straight out of
+        fingerprinter.ico, which stores each as PNG, a format Tk reads itself,
+        so this needs neither a second copy of the icon nor Pillow."""
+        try:
+            data = dependencies.ICON_FILE.read_bytes()
+            count = struct.unpack_from("<H", data, 4)[0]
+            photos = []
+            for i in range(count):
+                width, _h, _c, _r, _p, _b, size, offset = struct.unpack_from("<BBBBHHII", data, 6 + 16 * i)
+                png = data[offset:offset + size]
+                if (width or 256) in (16, 24, 32, 48, 256) and png.startswith(b"\x89PNG"):
+                    photos.append(tk.PhotoImage(master=self.root, data=base64.b64encode(png).decode("ascii")))
+            if photos:
+                self._icon_photos = photos          # Tk forgets images nothing holds on to
+                self.root.iconphoto(True, *sorted(photos, key=lambda p: -p.width()))
+                return
+        except (OSError, struct.error, tk.TclError):
+            pass
+        try:
+            self.root.iconbitmap(default=str(dependencies.ICON_FILE))
+        except tk.TclError:
+            pass                            # no icon file: Tk's own icon then
+
+    # ---- appearance and power (Settings, General) --------------------------------
+
+    def _apply_console_font(self) -> None:
+        low, high = self.CONSOLE_FONT_RANGE
+        size = min(high, max(low, self._safe_int(self.console_font_var, self.CONSOLE_FONT_SIZE)))
+        self._console_font.configure(size=size)
+
+    def _console_zoom(self, event: tk.Event) -> str:
+        """Ctrl and the wheel over the console: one point bigger or smaller."""
+        low, high = self.CONSOLE_FONT_RANGE
+        size = int(self._console_font.cget("size")) + (1 if event.delta > 0 else -1)
+        size = min(high, max(low, size))
+        self.console_font_var.set(size)
+        self._console_font.configure(size=size)
+        return "break"
+
+    @staticmethod
+    def _windows_uses_dark() -> bool:
+        """Whether Windows apps are set to dark (Settings, Personalisation, Colours)."""
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+                return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+        except (OSError, ImportError):
+            return False
+
+    def _theme_mode(self) -> str:
+        choice = self.theme_var.get()
+        if choice in ("Light", "Dark"):
+            return choice.lower()
+        return "dark" if self._windows_uses_dark() else "light"
+
+    def _follow_windows_theme(self) -> None:
+        """While Appearance is Follow Windows, notice Windows changing over."""
+        if self.theme_var.get() == THEME_CHOICES[0] and self._theme_mode() != self._theme_now:
+            self._apply_theme()
+        self.root.after(10_000, self._follow_windows_theme)
+
+    def _apply_theme(self) -> None:
+        """Colour the whole program for Settings, General, Appearance.
+
+        ttk draws most of it: light uses the native Windows theme (as before),
+        dark uses clam, the one built-in theme that takes colours at all. The
+        rest is coloured by hand from PALETTES: the rows of the list and Now,
+        the console and its colour tags, borders, dividers, tooltips, and the
+        text colour of help lines and links. Message boxes are drawn by Windows
+        and stay light."""
+        mode = self._theme_mode()
+        self._theme_now = mode
+        p = PALETTES[mode]
+        self._style_ttk(mode, p)
+        self.QROW_BG, self.QROW_SELECTED = p["row_bg"], p["row_selected"]
+        self.QLINK_FG, self.QMUTED_FG, self.QFG, self.QFIELD = p["link"], p["muted"], p["fg"], p["field"]
+        self.QREMOVE_HOVER_FG = p["remove_hover"]
+        self.HELP_GREY, self.HELP_WARN = p["help"], p["warn"]
+        for window in (self.root, self.settings_win):
+            window.configure(bg=p["bg"])
+        for panes in (self.panes, self.hpanes):
+            panes.configure(bg=p["sash"])
+        for canvas in (self.queue_canvas, self.now_canvas):
+            canvas.configure(bg=p["row_bg"], highlightbackground=p["border"], highlightcolor=p["border"])
+        self.queue_rows_frame.configure(bg=p["row_bg"])
+        self.active_frame.configure(bg=p["row_bg"])
+        self.log_text.configure(bg=p["console_bg"], fg=p["console_fg"], insertbackground=p["console_fg"],
+                                selectbackground=p["highlight"], selectforeground=p["highlight_fg"])
+        for tag, colour in p["tags"].items():
+            self.log_text.tag_configure(tag, foreground=colour)
+        self._themed_labels = [(label, role) for label, role in self._themed_labels if label.winfo_exists()]
+        for label, role in self._themed_labels:
+            label.configure(foreground=p[role])
+        Tooltip.colours = {"bg": p["tip_bg"], "fg": p["tip_fg"]}
+        self.disk_menu.configure(**self._menu_colours())
+        for combo in (self.url_combo, self.cookies_combo, self.theme_combo):
+            self._style_combo_popdown(combo, p)
+        # The rows are rebuilt in the new colours, keeping what they show.
+        self._refresh_queue()
+        texts = [v.get() for v in self.slot_vars]
+        self._init_slots(len(texts), texts or None)
+        for window in (self.root, self.settings_win):
+            self._dark_title_bar(window, mode == "dark")
+
+    def _menu_colours(self) -> dict:
+        p = PALETTES[self._theme_now]
+        return {"bg": p["menu"], "fg": p["menu_fg"], "activebackground": p["highlight"],
+                "activeforeground": p["highlight_fg"]}
+
+    def _on_map_title_bar(self, event: tk.Event) -> None:
+        """A window's title bar can only be made dark once Windows has made
+        the frame that draws it, when the window is first shown; setting it
+        in _apply_theme before that does nothing. Hence again on every <Map>
+        (bound on the main window, Settings and the timed Yes/No box). The
+        main window's first also gives it its app ID (_set_window_app_id)."""
+        window = event.widget
+        if isinstance(window, (tk.Tk, tk.Toplevel)):
+            self._dark_title_bar(window, self._theme_now == "dark")
+        if window is self.root and not self._window_app_id:
+            self._window_app_id = self._set_window_app_id(True)
+
+    def _set_window_app_id(self, on: bool) -> bool:
+        """The main window's app ID and how to start the program again, which
+        Windows reads when the window's taskbar button is pinned. Without
+        them, pinning the running program made a pin to a bare pythonw.exe
+        that opened nothing. Set once the window has its frame (its first
+        <Map>); removed again before it closes (_on_close), as Windows asks
+        of a program that sets them. True if they were set."""
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class Guid(ctypes.Structure):
+                _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort),
+                            ("d3", ctypes.c_ushort), ("d4", ctypes.c_ubyte * 8)]
+
+            class PropertyKey(ctypes.Structure):
+                _fields_ = [("fmtid", Guid), ("pid", wintypes.DWORD)]
+
+            class PropVariant(ctypes.Structure):
+                _fields_ = [("vt", ctypes.c_ushort), ("reserved", ctypes.c_ushort * 3),
+                            ("value", ctypes.c_void_p), ("unused", ctypes.c_void_p)]
+
+            def guid(text: str) -> Guid:
+                g = Guid()
+                ctypes.oledll.ole32.CLSIDFromString(text, ctypes.byref(g))
+                return g
+
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            store = ctypes.c_void_p()
+            ctypes.oledll.shell32.SHGetPropertyStoreForWindow(          # IID_IPropertyStore
+                hwnd, ctypes.byref(guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")), ctypes.byref(store))
+            vtable = ctypes.cast(ctypes.cast(store, ctypes.POINTER(ctypes.c_void_p))[0],
+                                 ctypes.POINTER(ctypes.c_void_p))
+            set_value = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(PropertyKey),
+                                           ctypes.POINTER(PropVariant))(vtable[6])
+            commit = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(vtable[7])
+            release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
+            # System.AppUserModel.RelaunchCommand, RelaunchIconResource,
+            # RelaunchDisplayNameResource, then ID, which is read with them.
+            values = [
+                (2, f'"{dependencies._shortcut_target()}" "{SCRIPT_DIR / "yt-fingerprinter.pyw"}"'),
+                (3, f"{dependencies.ICON_FILE},0"),
+                (4, "Fingerprinter"),
+                (5, dependencies.APP_ID),
+            ]
+            try:
+                for pid, text in (values if on else values[::-1]):
+                    key = PropertyKey(guid("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"), pid)
+                    buf = ctypes.create_unicode_buffer(text)
+                    var = PropVariant(31 if on else 0)                   # VT_LPWSTR, or VT_EMPTY
+                    if on:
+                        var.value = ctypes.cast(buf, ctypes.c_void_p)
+                    set_value(store, ctypes.byref(key), ctypes.byref(var))
+                commit(store)
+            finally:
+                release(store)
+            return on
+        except Exception:  # noqa: BLE001 - pinning is not worth an error
+            return False
+
+    def _style_ttk(self, mode: str, p: dict) -> None:
+        style = ttk.Style()
+        if mode == "light":
+            if style.theme_use() != self._native_theme:
+                style.theme_use(self._native_theme)
+            return
+        style.theme_use("clam")
+        bg, fg, field, button = p["bg"], p["fg"], p["field"], p["button"]
+        border, hover, pressed, dim = p["border"], p["hover"], p["pressed"], p["disabled_fg"]
+        style.configure(".", background=bg, foreground=fg, fieldbackground=field, bordercolor=border,
+                        darkcolor=bg, lightcolor=bg, troughcolor=field, selectbackground=p["select"],
+                        selectforeground=fg, insertcolor=fg, arrowcolor=fg, focuscolor=border)
+        # clam's own state maps win over configure, so every one that carries
+        # a light colour is replaced: unfocused selections, pressed bevels, tabs.
+        style.map(".", background=[("disabled", bg)], foreground=[("disabled", dim)],
+                  selectbackground=[("!focus", p["select"])], selectforeground=[("!focus", fg)])
+        for name in ("TButton", "TMenubutton"):
+            style.configure(name, background=button, lightcolor=button, darkcolor=button)
+            style.map(name, background=[("disabled", bg), ("pressed", pressed), ("active", hover)],
+                      foreground=[("disabled", dim)], lightcolor=[("pressed", pressed)],
+                      darkcolor=[("pressed", pressed)])
+        style.configure("Toolbutton", background=bg, bordercolor=bg, lightcolor=bg, darkcolor=bg)
+        style.map("Toolbutton", background=[("disabled", bg), ("pressed", pressed), ("active", hover)],
+                  foreground=[("disabled", dim)], lightcolor=[("pressed", pressed)],
+                  darkcolor=[("pressed", pressed)])
+        for name in ("TEntry", "TCombobox", "TSpinbox"):
+            style.configure(name, fieldbackground=field, foreground=fg, background=button,
+                            insertcolor=fg, arrowcolor=fg, lightcolor=field, darkcolor=field)
+            style.map(name, fieldbackground=[("readonly", field), ("disabled", bg)],
+                      foreground=[("disabled", dim)], background=[("active", hover)],
+                      selectbackground=[("readonly", field)], selectforeground=[("readonly", fg)])
+        style.configure("TCheckbutton", background=bg, foreground=fg, indicatorbackground=field,
+                        indicatorforeground=fg, upperbordercolor=border, lowerbordercolor=border)
+        style.map("TCheckbutton", background=[("active", bg)],
+                  indicatorbackground=[("disabled", bg), ("pressed", pressed)])
+        self._tick_indicator(style, p)
+        style.configure("TNotebook", background=bg, bordercolor=border)
+        style.configure("TNotebook.Tab", background=button, foreground=fg, lightcolor=button, bordercolor=border)
+        style.map("TNotebook.Tab", background=[("selected", bg), ("active", hover)],
+                  lightcolor=[("selected", bg), ("!selected", button)])
+        style.configure("TLabelframe", background=bg, bordercolor=border)
+        style.configure("TLabelframe.Label", background=bg, foreground=fg)
+        style.configure("Vertical.TScrollbar", background=button, troughcolor=bg, arrowcolor=fg,
+                        lightcolor=button, darkcolor=button)
+        style.map("Vertical.TScrollbar", background=[("active", hover)])
+        style.configure("Horizontal.TProgressbar", background=p["accent"], troughcolor=field,
+                        lightcolor=p["accent"], darkcolor=p["accent"])
+        style.configure("TSeparator", background=border)
+
+    def _tick_indicator(self, style: ttk.Style, p: dict) -> None:
+        """clam, the theme dark mode is built on, marks a ticked box with a
+        cross, which reads as "off" (and next to Follow, as "close"). Its
+        checkbuttons get a box with a tick instead, drawn here in the
+        palette's colours at the screen's scaling. The images are made, and
+        the element added to clam, once; they must be kept referenced."""
+        if getattr(self, "_tick_images", None) is None:
+            size = max(11, round(9.5 * float(self.root.tk.call("tk", "scaling"))))
+            stroke = max(2, size // 6)
+
+            def draw(fill: str, border: str, tick: str | None = None) -> tk.PhotoImage:
+                # 4 transparent pixels on the right keep the label off the box.
+                img = tk.PhotoImage(master=self.root, width=size + 4, height=size)
+                img.put(border, to=(0, 0, size, size))
+                img.put(fill, to=(1, 1, size - 1, size - 1))
+                if tick:
+                    points = [(0.22, 0.52), (0.42, 0.72), (0.80, 0.30)]
+                    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+                        for i in range(2 * size + 1):
+                            x = round((x0 + (x1 - x0) * i / (2 * size)) * size) - stroke // 2
+                            y = round((y0 + (y1 - y0) * i / (2 * size)) * size) - stroke // 2
+                            img.put(tick, to=(x, y, x + stroke, y + stroke))
+                return img
+
+            self._tick_images = images = {
+                "off": draw(p["field"], p["muted"]),
+                "on": draw(p["link"], p["link"], p["bg"]),
+                "off_disabled": draw(p["bg"], p["border"]),
+                "on_disabled": draw(p["border"], p["border"], p["disabled_fg"]),
+            }
+            style.element_create("Fp.tick", "image", images["off"],
+                                 ("disabled", "selected", images["on_disabled"]),
+                                 ("disabled", images["off_disabled"]),
+                                 ("selected", images["on"]), sticky="w")
+
+        def swap(layout: list) -> list:
+            return [("Fp.tick" if name == "Checkbutton.indicator" else name,
+                     dict(opts, children=swap(opts["children"])) if "children" in opts else opts)
+                    for name, opts in layout]
+        style.layout("TCheckbutton", swap(style.layout("TCheckbutton")))
+
+    @staticmethod
+    def _style_combo_popdown(combo: ttk.Combobox, p: dict) -> None:
+        """A combobox's drop-down list is a classic Listbox the theme misses."""
+        try:
+            popdown = combo.tk.eval(f"ttk::combobox::PopdownWindow {combo}")
+            combo.tk.call(f"{popdown}.f.l", "configure", "-background", p["list"], "-foreground", p["list_fg"],
+                          "-selectbackground", p["highlight"], "-selectforeground", p["highlight_fg"])
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _dark_title_bar(window: tk.Misc, dark: bool) -> None:
+        """Windows 10 (20H1 on; attribute 19 before that) and 11 can draw a
+        window's title bar dark. Older Windows ignores it. The bar keeps its
+        old colour until its caption is drawn again, so that is forced by
+        switching the caption to its other look (active or inactive) and
+        back; a plain redraw of the frame did not do it."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(window.winfo_id())
+            value = ctypes.c_int(1 if dark else 0)
+            for attribute in (20, 19):
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                    break
+            active = user32.GetForegroundWindow() == hwnd
+            for state in (not active, active):
+                user32.SendMessageW(hwnd, 0x0086, state, 0)     # WM_NCACTIVATE
+        except Exception:  # noqa: BLE001 - a light title bar is not worth an error
+            pass
+
+    def _keep_awake(self, on: bool) -> None:
+        """While a job runs, ask Windows not to go to sleep (Settings, General).
+        The request belongs to the thread that makes it, always the UI thread
+        here, which lasts as long as the program; it is withdrawn when the job
+        ends, and lapses by itself if the program closes. The screen can still
+        turn off."""
+        if sys.platform != "win32":
+            return
+        es_continuous, es_system_required = 0x80000000, 0x00000001
+        flags = es_continuous | (es_system_required if on and self.keep_awake_var.get() else 0)
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(flags))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _update_keep_label(self) -> None:
         """Status bar: where finished fingerprints go, shortened to fit."""
@@ -1078,9 +1584,12 @@ class FingerprinterApp:
         """Tidy the saved folder paths into Windows form, and fill an empty
         working folder or fingerprints folder with the one that ships inside
         the program folder, creating it if it is missing."""
-        for var in (self.output_dir_var, self.bat_dir_var, self.move_pklz_dir_var):
+        for var in (self.output_dir_var, self.bat_dir_var, self.move_pklz_dir_var,
+                    self.keep_audio_dir_var):
             self._normalize_var(var)
         base = Path(self.bat_dir_var.get())
+        if not self.keep_audio_dir_var.get():
+            self.keep_audio_dir_var.set(str(base / KEEP_AUDIO_DIR))   # made when first used
         for var, name in ((self.output_dir_var, DOWNLOADS_DIR),
                           (self.move_pklz_dir_var, PKLZ_DIR)):
             default = base / name
@@ -1122,7 +1631,26 @@ class FingerprinterApp:
                     parent=self.root,
                 )
                 return True
+        if self.keep_audio_var.get():
+            kept = self._keep_dir_audio(Path(bat_dir)).resolve()
+            working = Path(norm_path(self.output_dir_var.get()) or bat_dir).resolve()
+            if kept == work or work in kept.parents or kept == working or working in kept.parents:
+                messagebox.showerror(
+                    "Pick another folder",
+                    f"Keep downloaded audio in is inside the working folder or the "
+                    f"program's work folder:\n{kept}\n\nAudio in those is deleted during "
+                    f"runs, and Audio on disk would fingerprint it again. Choose a folder "
+                    f"outside them.",
+                    parent=self.root,
+                )
+                return True
         return False
+
+    def _update_keep_audio_row(self) -> None:
+        """The kept-audio folder can only be changed while keeping is on."""
+        state = "normal" if self.keep_audio_var.get() else "disabled"
+        self.keep_audio_entry.config(state=state)
+        self.keep_audio_browse.config(state=state)
 
     def _browse(self, var: tk.StringVar) -> None:
         current = norm_path(var.get())
@@ -1170,11 +1698,17 @@ class FingerprinterApp:
                     self.log_text.insert("end", msg + "\n", tag)
                 else:
                     self.log_text.insert("end", msg + "\n")
-                self.log_text.see("end")
+                if self.console_follow_var.get():
+                    self.log_text.see("end")
                 self.log_text.configure(state="disabled")
         except queue.Empty:
             pass
         self.root.after(100, self._poll_log_queue)
+
+    def _console_follow_changed(self) -> None:
+        """Turned back on: catch up with the newest line straight away."""
+        if self.console_follow_var.get():
+            self.log_text.see("end")
 
     def _set_status(self, text: str) -> None:
         self.root.after(0, self.status_var.set, text)
@@ -1184,7 +1718,8 @@ class FingerprinterApp:
     # (var_name, json_key, expected_type)
     _CONFIG_FIELDS: tuple = (
         ("output_dir_var", "output_dir", str),
-        ("bat_dir_var", "bat_dir", str),
+        # "bat_dir", the program folder, is no longer a setting: an old value
+        # in config.json is ignored, and dropped at the next save.
         ("move_pklz_dir_var", "move_pklz_dir", str),
         ("extra_args_var", "extra_args", str),
         ("filename_template_var", "filename_template", str),
@@ -1200,6 +1735,15 @@ class FingerprinterApp:
         ("max_minutes_var", "skip_longer_than", int),
         ("skip_done_var", "skip_done", bool),
         ("notify_var", "notify", bool),
+        ("keep_audio_var", "keep_audio", bool),
+        ("keep_audio_dir_var", "keep_audio_dir", str),
+        ("theme_var", "theme", str),
+        ("console_font_var", "console_font_size", int),
+        ("keep_awake_var", "keep_awake", bool),
+        ("confirm_stop_var", "confirm_stop", bool),
+        ("offer_resume_var", "offer_resume", bool),
+        ("fp_record_var", "write_fingerprinted_json", bool),
+        ("console_follow_var", "console_follow", bool),
     )
 
     def _apply_config(self, cfg: dict) -> None:
@@ -1226,6 +1770,7 @@ class FingerprinterApp:
                 # disabled every button and before any worker existed, leaving
                 # the window dead until restart.
                 pass
+        self._migrate_program_folder(cfg)
         # Where the dividers were last dragged to (see _place_divider).
         for key, attr, conv in (("console_height", "_saved_console_height", int),
                                 ("list_share", "_saved_list_share", float)):
@@ -1260,6 +1805,28 @@ class FingerprinterApp:
         except (tk.TclError, ValueError, TypeError):
             return default
 
+    def _migrate_program_folder(self, cfg: dict) -> None:
+        """"This program's folder" is no longer a setting. A config that had
+        it pointed at another folder read an empty working, fingerprints and
+        kept-audio folder as the default one inside that folder; those stay
+        where they were, set outright, rather than moving without a word. The
+        next save drops "bat_dir", so this happens once."""
+        old = norm_path(str(cfg.get("bat_dir") or ""))
+        if not old or Path(old) == SCRIPT_DIR or not Path(old).is_dir():
+            return
+        kept = []
+        for var, name, label in ((self.output_dir_var, DOWNLOADS_DIR, "Working folder for audio"),
+                                 (self.move_pklz_dir_var, PKLZ_DIR, "Keep finished fingerprints in"),
+                                 (self.keep_audio_dir_var, KEEP_AUDIO_DIR, "Keep downloaded audio in")):
+            if not norm_path(var.get()):
+                var.set(str(Path(old) / name))
+                kept.append(label)
+        self._log(f"[!] \"This program's folder\" ({old}) is no longer a setting: the program "
+                  f"now works from its own folder, {SCRIPT_DIR}, and uses the audfprint there.",
+                  tag="warning")
+        if kept:
+            self._log(f"    These stay in {old}, now set in Settings, Folders: {', '.join(kept)}.")
+
     def _gather_config(self) -> dict:
         """Read current Tk var values into a serializable dict."""
         out: dict = {}
@@ -1276,11 +1843,9 @@ class FingerprinterApp:
                 pass
         # A folder left at its default is saved as "", so the defaults follow
         # the program if its folder is moved or copied to another computer.
-        program = Path(__file__).resolve().parent
-        bat_dir = Path(norm_path(out.get("bat_dir", "")) or program)
-        for key, default in (("bat_dir", program),
-                             ("output_dir", bat_dir / DOWNLOADS_DIR),
-                             ("move_pklz_dir", bat_dir / PKLZ_DIR)):
+        for key, default in (("output_dir", SCRIPT_DIR / DOWNLOADS_DIR),
+                             ("move_pklz_dir", SCRIPT_DIR / PKLZ_DIR),
+                             ("keep_audio_dir", SCRIPT_DIR / KEEP_AUDIO_DIR)):
             value = norm_path(out.get(key, ""))
             out[key] = "" if value and Path(value) == default else value
         # Persist the queue so it survives restarts.
@@ -1317,6 +1882,8 @@ class FingerprinterApp:
                 self._log(f"[!] Killed {killed} running process(es) on exit.")
         self._stop_counting()
         save_config(self._gather_config())
+        if self._window_app_id:
+            self._set_window_app_id(False)
         self.root.destroy()
 
     def _ask_yes_no(self, title: str, message: str) -> bool:
@@ -1349,10 +1916,11 @@ class FingerprinterApp:
 
         def show() -> None:
             try:
-                dlg = tk.Toplevel(self.root)
+                dlg = tk.Toplevel(self.root, bg=PALETTES[self._theme_now]["bg"])
                 dlg.title(title)
                 dlg.transient(self.root)
                 dlg.resizable(False, False)
+                dlg.bind("<Map>", self._on_map_title_bar, add="+")
 
                 def cancel_timer() -> None:
                     if timer_id[0] is not None:
@@ -1434,7 +2002,7 @@ class FingerprinterApp:
         self.slot_vars = []
         if n <= 0:
             tk.Label(
-                self.active_frame, bg=self.QROW_BG, fg="grey", justify="left", anchor="w",
+                self.active_frame, bg=self.QROW_BG, fg=self.QMUTED_FG, justify="left", anchor="w",
                 text="Nothing running. Downloads and fingerprinting show here once "
                      "you start.",
                 wraplength=360,
@@ -1442,7 +2010,7 @@ class FingerprinterApp:
             return
         for i in range(n):
             var = tk.StringVar(value=(texts[i] if texts else f"{i + 1:>2}  idle"))
-            tk.Label(self.active_frame, textvariable=var, bg=self.QROW_BG,
+            tk.Label(self.active_frame, textvariable=var, bg=self.QROW_BG, fg=self.QFG,
                      anchor="w").pack(fill="x", padx=4)
             self.slot_vars.append(var)
 
@@ -1855,6 +2423,8 @@ class FingerprinterApp:
     # it lands on the link, and otherwise selects the row for Move up/down.
 
     QROW_BG = "#ffffff"
+    QFG = "#000000"
+    QFIELD = "#ffffff"
     QROW_SELECTED = "#cce8ff"
     QLINK_FG = "#0b57d0"
     QMUTED_FG = "#707070"
@@ -1875,7 +2445,7 @@ class FingerprinterApp:
             # The explanation the list used to carry in a permanent grey line
             # above it, shown where it is needed: while there is nothing here.
             tk.Label(
-                self.queue_rows_frame, bg=self.QROW_BG, fg="grey", justify="left",
+                self.queue_rows_frame, bg=self.QROW_BG, fg=self.QMUTED_FG, justify="left",
                 anchor="w", wraplength=420,
                 text="Your list is empty.\n\n"
                      "Paste a link to a channel, playlist or single page in the Link box "
@@ -1921,9 +2491,10 @@ class FingerprinterApp:
                           cursor="fleur", padx=5)
         handle.pack(side="left")
         check = tk.Checkbutton(frame, variable=var, bg=bg, activebackground=bg,
+                               fg=self.QFG, activeforeground=self.QFG, selectcolor=self.QFIELD,
                                highlightthickness=0, bd=0)
         check.pack(side="left")
-        num = tk.Label(frame, bg=bg, width=3, anchor="e")
+        num = tk.Label(frame, bg=bg, fg=self.QFG, width=3, anchor="e")
         num.pack(side="left")
         # Packed from the right before the link, so a long link is cut short
         # rather than pushing them out of view.
@@ -2029,7 +2600,7 @@ class FingerprinterApp:
     def _queue_menu(self, event: tk.Event, row: dict) -> None:
         url = row["url"]
         editable = "normal" if self._queue_editable else "disabled"
-        menu = tk.Menu(self.root, tearoff=0)
+        menu = tk.Menu(self.root, tearoff=0, **self._menu_colours())
         menu.add_command(label="Open link", command=lambda: self._open_link(url))
         menu.add_command(label="Copy link", command=lambda: self._copy_text(url))
         menu.add_command(label="Count again", command=lambda: self._request_counts([url], force=True))
@@ -2353,44 +2924,59 @@ class FingerprinterApp:
         self._queue_editable = enabled
         state = "normal" if enabled else "disabled"
         for btn in (
-            self.add_queue_btn, self.queue_import_btn, self.queue_remove_btn,
+            self.queue_import_btn, self.queue_remove_btn,
             self.tick_all_btn, self.queue_clear_btn,
         ):
             btn.config(state=state)
+        self._update_add_btn()
+
+    def _update_add_btn(self) -> None:
+        """Add is clickable when the link box holds something and the list
+        can be changed (not during a run)."""
+        ready = bool(self.url_var.get().strip()) and getattr(self, "_queue_editable", True)
+        self.add_queue_btn.config(state="normal" if ready else "disabled")
 
     # ------------------------- pipeline control -------------------------------
 
-    def _start(self) -> None:
-        # Convenience: if the URL field has something, add it to the queue first.
-        if self.url_var.get().strip():
-            self._add_to_queue()
+    def _start(self, resume: dict | None = None) -> None:
+        """Download and fingerprint the ticked links, or with `resume` the links
+        an unfinished list had left. Pressed while there is such a list, it
+        asks first whether to continue that instead: a new run would replace
+        its record."""
+        if resume is None:
+            # Convenience: if the URL field has something, add it to the queue first.
+            if self.url_var.get().strip():
+                self._add_to_queue()
+            if self.offer_resume_var.get():
+                state = self._unfinished_list()
+                if state is not None and self._ask_to_continue(state):
+                    resume = state
+        if resume is not None:
+            checked_urls = list(resume["remaining"])
+        else:
+            if not self.queue_urls:
+                messagebox.showerror(
+                    "The list is empty",
+                    "Add at least one link to the list first.",
+                )
+                return
 
-        if not self.queue_urls:
-            messagebox.showerror(
-                "The list is empty",
-                "Add at least one link to the list first.",
-            )
-            return
-
-        # Only checked entries run.
-        checked_urls = [
-            u for u, v in zip(self.queue_urls, self.queue_checks) if v.get()
-        ]
-        if not checked_urls:
-            messagebox.showerror(
-                "Nothing ticked",
-                "Tick at least one link in the list.",
-            )
-            return
+            # Only checked entries run.
+            checked_urls = [
+                u for u, v in zip(self.queue_urls, self.queue_checks) if v.get()
+            ]
+            if not checked_urls:
+                messagebox.showerror(
+                    "Nothing ticked",
+                    "Tick at least one link in the list.",
+                )
+                return
 
         self._fill_default_folders()
         output_dir = self.output_dir_var.get()
         bat_dir = self.bat_dir_var.get()
         if not output_dir or not Path(output_dir).is_dir():
             messagebox.showerror("Missing input", "Pick a valid working folder for audio.")
-            return
-        if not bat_dir or not Path(bat_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid program folder: the one that holds the audfprint folder.")
             return
         if not self._audfprint_ready(bat_dir) or self._folders_clash(bat_dir):
             return
@@ -2407,11 +2993,17 @@ class FingerprinterApp:
         self._set_queue_controls_enabled(False)
 
         save_config(self._gather_config())
+        self._keep_awake(True)
+        # Any unfinished-list record from here on is this run's, which Start
+        # itself asks about next time; the start-up offer is for a record an
+        # earlier session left, so it must not pick this one up.
+        self._resume_asked = True
 
         # Snapshot the checked URLs so edits mid-run don't matter.
+        self._job_kind = "list"
         self.worker_thread = threading.Thread(
             target=self._run_queue,
-            args=(checked_urls, Path(output_dir), Path(bat_dir)),
+            args=(checked_urls, Path(output_dir), Path(bat_dir), resume),
             daemon=True,
         )
         self.worker_thread.start()
@@ -2434,12 +3026,31 @@ class FingerprinterApp:
         )
         return False
 
-    def _run_queue(self, urls: list[str], output_base: Path, bat_dir: Path) -> None:
+    def _run_queue(self, urls: list[str], output_base: Path, bat_dir: Path,
+                   resume: dict | None = None) -> None:
         """Process each queued URL sequentially through the full pipeline.
-        Skip-on-failure: a failed/skipped channel doesn't halt the batch."""
+        Skip-on-failure: a failed/skipped channel doesn't halt the batch.
+
+        Its progress is kept in LIST_STATE_FILE as it goes: each link is noted
+        as it starts and marked when it ends. A list that completes deletes the
+        file; one that stops part-way (Stop, a crash, the PC shutting down)
+        leaves it, and the next start offers to continue (_offer_resume). With
+        `resume`, this is that continuation: `urls` are the links left, and the
+        one it stopped in starts over from scratch."""
         results: list[tuple[str, str]] = []  # (url, status)
+        state = resume or {"links": list(urls), "finished": {}}
+        state = {"links": list(state["links"]), "finished": dict(state.get("finished", {})),
+                 "current": state.get("current")}
+        restart = state["current"] if resume else None
+        # Whether the link it stopped in had begun fingerprinting: only then is
+        # what work\pklz holds that link's own (_note_list_fingerprinting).
+        discard = bool(resume and resume.get("fingerprinting"))
+        self._list_state = state
         try:
             total = len(urls)
+            if resume:
+                self._log(f"[*] Continuing the unfinished list: {total} of "
+                          f"{len(state['links'])} link(s) left.")
             for i, url in enumerate(urls, start=1):
                 if self.cancel_flag.is_set():
                     # Mark the rest as not-run.
@@ -2454,15 +3065,38 @@ class FingerprinterApp:
                 self._set_status(f"Link {i}/{total}: starting...")
                 self._set_now_title(f"Now · link {i} of {total}")
 
+                state["current"] = url
+                if url == restart and discard:
+                    # Its unfinished .pklz files are still in work\pklz until
+                    # _prepare_work discards them, so the note stays: stopped
+                    # again before then, the next continuation discards them too.
+                    state["fingerprinting"] = True
+                else:
+                    state.pop("fingerprinting", None)
+                self._save_list_state(state)
                 try:
                     status = self._run_pipeline(
                         url, output_base, bat_dir, queue_mode=True,
-                        queue_position=(i, total),
+                        queue_position=(i, total), restarting=(url == restart),
+                        discard_work=(url == restart and discard),
                     )
                 except Exception as e:  # noqa: BLE001
                     self._log(f"[X] Link failed with error: {e!r}")
                     status = "failed"
                 results.append((url, status or "done"))
+                # A link Stop cut short stays "current": continuing starts it
+                # over. That includes one that failed because Stop killed its
+                # work. A link the user declined (a question answered No) counts
+                # as finished, like a skipped one.
+                if not (self.cancel_flag.is_set() and status in ("cancelled", "failed")):
+                    state["finished"][url] = status or "done"
+                    state["current"] = None
+                    state.pop("fingerprinting", None)
+                    self._save_list_state(state)
+
+            # Only a list that ran to its end has nothing left to continue.
+            if not self.cancel_flag.is_set():
+                self._clear_list_state()
 
             # Final summary.
             self._log("=" * 60)
@@ -2492,6 +3126,7 @@ class FingerprinterApp:
             self._log(f"[X] List error: {e!r}")
             self._set_status("List error.")
         finally:
+            self._list_state = None
             self.root.after(0, self._finish)
 
     def _start_bats_only(self, split: bool = True) -> None:
@@ -2501,9 +3136,6 @@ class FingerprinterApp:
         Advanced setting."""
         self._fill_default_folders()
         bat_dir = self.bat_dir_var.get()
-        if not bat_dir or not Path(bat_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid program folder: the one that holds the audfprint folder.")
-            return
         if not self._audfprint_ready(bat_dir) or self._folders_clash(bat_dir):
             return
 
@@ -2546,7 +3178,9 @@ class FingerprinterApp:
         self._set_inputs_locked(True)
 
         save_config(self._gather_config())
+        self._keep_awake(True)
 
+        self._job_kind = "disk"
         self.worker_thread = threading.Thread(
             target=self._run_bats_only_pipeline,
             args=(Path(bat_dir), splitting),
@@ -2563,6 +3197,7 @@ class FingerprinterApp:
         self.cancel_btn.config(state="normal")
         self._set_inputs_locked(True)
 
+        self._job_kind = "setup"
         self.worker_thread = threading.Thread(
             target=self._run_test_connection,
             daemon=True,
@@ -2606,10 +3241,12 @@ class FingerprinterApp:
             if self.cancel_flag.is_set():
                 return
 
-            # 3. yt-dlp update check
+            # 3. yt-dlp to its newest release, as setup.bat does. (`yt-dlp -U`,
+            #    which this used to run, only updates the standalone exe; for
+            #    the copy pip installed it just says to use pip.)
             if ytdlp_ok:
-                self._log("[*] Running 'yt-dlp -U' (update check, may take a moment)...")
-                self._run_diagnostic([*self.ytdlp, "-U"], prefix="    ", tag="ytdlp", timeout=90)
+                dependencies.update_ytdlp(lambda line: self._log("[*] " + line if not line.startswith(" ") else line))
+                self._refresh_ytdlp()
 
             if self.cancel_flag.is_set():
                 return
@@ -2745,8 +3382,25 @@ class FingerprinterApp:
         self.ytdlp = dependencies.ytdlp_command() or ["yt-dlp"]
 
     def _startup_check(self, bat_dir: str) -> None:
-        """Worker thread, at launch: check every component and offer to install
-        whatever is missing. Silent apart from one line when all is well."""
+        """Worker thread, at launch: check the components (offering to install
+        whatever is missing), then offer to continue an unfinished list."""
+        try:
+            self._check_components_at_start(bat_dir)
+            # The program folder's shortcut with the fingerprint icon, for a
+            # copy that was unzipped without running setup.bat again, and made
+            # again when it no longer fits: the folder was moved or copied, or
+            # the Python it started is gone.
+            existed = dependencies.SHORTCUT_FILE.exists()
+            if not dependencies.shortcut_is_current() and dependencies.make_shortcut(lambda _m: None):
+                name = dependencies.SHORTCUT_FILE.name
+                self._log(f"[+] Updated {name} for this folder." if existed else
+                          f"[+] Made {name} in the program folder: start the Fingerprinter from it.")
+        finally:
+            self.root.after(500, self._offer_resume)
+
+    def _check_components_at_start(self, bat_dir: str) -> None:
+        """Check every component and offer to install whatever is missing.
+        Silent apart from one line when all is well."""
         try:
             statuses = dependencies.check_all(bat_dir)
             self._refresh_ytdlp()
@@ -2767,12 +3421,134 @@ class FingerprinterApp:
             return
         # Treated like any other job while it runs: buttons off, Stop and quit
         # handled the usual way.
+        self._job_kind = "setup"
         self.worker_thread = threading.current_thread()
         self.root.after(0, self._lock_for_job)
         try:
             self._offer_install(statuses, bat_dir)
         finally:
             self.root.after(0, self._finish)
+
+    # ---- continuing an unfinished list ------------------------------------------
+
+    @staticmethod
+    def _save_list_state(state: dict, stamp: bool = True) -> None:
+        """Written whole to a temporary name and then swapped in, so a crash
+        mid-write cannot leave half a file. `stamp` records the time as when
+        the list was last running."""
+        data = dict(state, updated=time.strftime("%Y-%m-%d %H:%M")) if stamp else state
+        tmp = LIST_STATE_FILE.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+            os.replace(tmp, LIST_STATE_FILE)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _load_list_state() -> dict | None:
+        try:
+            data = json.loads(LIST_STATE_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("links"), list):
+            return None
+        data["finished"] = data.get("finished") if isinstance(data.get("finished"), dict) else {}
+        return data
+
+    @staticmethod
+    def _clear_list_state() -> None:
+        try:
+            LIST_STATE_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _note_list_fingerprinting(self, bat_dir: Path) -> None:
+        """Worker thread: the list's current link begins fingerprinting, into
+        a work\\pklz that _prepare_work has just emptied. Noted in the record,
+        so that if the list stops now, what work\\pklz holds is known to be
+        this link's own and a continuation deletes it (_prepare_work, discard).
+        Not noted if something could not be moved out: that is not its own."""
+        state = self._list_state
+        if state is None or any((bat_dir / WORK_PKLZ).glob("*.pklz")):
+            return
+        state["fingerprinting"] = True
+        self._save_list_state(state)
+
+    def _note_list_link_done(self, url: str) -> None:
+        """Worker thread: the list's current link is fingerprinted and its
+        .pklz files are about to be moved out. Recorded as finished now, not
+        when the link returns, so that a list stopped during the move (Quit,
+        a crash, Windows restarting) is not continued by making the link
+        again next to the fingerprints already moved. What is left in
+        work\\pklz then goes out as recovered-* at the next link."""
+        state = self._list_state
+        if state is None or state.get("current") != url:
+            return
+        state["finished"][url] = "done"
+        state["current"] = None
+        state.pop("fingerprinting", None)
+        self._save_list_state(state)
+
+    def _forget_list_fingerprinting(self) -> None:
+        """Another job is about to use work\\pklz, so what it holds may no longer
+        be only the stopped link's: a continuation then moves it out as
+        recovered-* like any other leftover, rather than deleting it."""
+        state = self._load_list_state()
+        if state is not None and state.pop("fingerprinting", None):
+            self._save_list_state(state, stamp=False)
+
+    def _unfinished_list(self) -> dict | None:
+        """The record of a list that stopped part-way, with the links it has
+        left under "remaining": those still in the list, the one it stopped in
+        first (it starts over), then the rest in the list's order. None if
+        there is nothing to continue, when the record is deleted."""
+        state = self._load_list_state()
+        if state is None:
+            return None
+        links = [u for u in state["links"] if isinstance(u, str)]
+        finished = state["finished"]
+        remaining = [u for u in links if u not in finished and u in self.queue_urls]
+        if not remaining:
+            self._clear_list_state()
+            return None
+        remaining.sort(key=lambda u: u != state.get("current"))
+        return dict(state, links=links, remaining=remaining)
+
+    def _ask_to_continue(self, state: dict) -> bool:
+        """Ask whether to continue the unfinished list in `state`. No deletes
+        the record: then it is not asked about again."""
+        self._resume_asked = True
+        links, remaining = state["links"], state["remaining"]
+        done = sum(1 for u in links if u in state["finished"])
+        stopped_in = state.get("current") or remaining[0]
+        when = f" on {state['updated']}" if state.get("updated") else ""
+        if messagebox.askyesno(
+            "Continue the unfinished list?",
+            f"The last run of your list stopped part-way{when}. {done} of {len(links)} "
+            f"link(s) had finished, and it stopped in:\n{stopped_in}\n\n"
+            f"Continue with the {len(remaining)} link(s) left now? The one it stopped "
+            f"in starts over.\n\nNo forgets where it stopped; your list stays as it is.",
+            parent=self.root,
+        ):
+            return True
+        self._clear_list_state()
+        return False
+
+    def _offer_resume(self, attempt: int = 0) -> None:
+        """UI thread, at start-up: if the last list stopped part-way, offer to
+        carry on with the links it had left (Settings, General). Start asks the
+        same when pressed while there is one, so this steps aside if that has
+        already happened."""
+        if self._resume_asked or not self.offer_resume_var.get():
+            return
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            # The start-up install offer may still be running; ask after it.
+            if attempt < 60:
+                self.root.after(1000, self._offer_resume, attempt + 1)
+            return
+        state = self._unfinished_list()
+        if state is not None and self._ask_to_continue(state):
+            self._start(resume=state)
 
     def _lock_for_job(self) -> None:
         self.start_btn.config(state="disabled")
@@ -2816,39 +3592,6 @@ class FingerprinterApp:
         else:
             self._log("[+] Everything the Fingerprinter needs is installed and working.")
             self._set_status("Setup complete.")
-
-    def _run_diagnostic(
-        self,
-        cmd: list[str],
-        prefix: str = "",
-        tag: str | None = None,
-        timeout: int = 30,
-        first_line_only: bool = False,
-    ) -> None:
-        """Run `cmd`, log its combined output line-by-line. Used by the test runner."""
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, check=False,
-                encoding="utf-8", errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                timeout=timeout,
-            )
-        except FileNotFoundError:
-            self._log(f"{prefix}! command not found: {cmd[0]}", tag="warning")
-            return
-        except subprocess.TimeoutExpired:
-            self._log(f"{prefix}! timed out after {timeout}s", tag="warning")
-            return
-
-        out = (proc.stdout or "") + (proc.stderr or "")
-        lines = [ln for ln in out.splitlines() if ln.strip()]
-        if first_line_only and lines:
-            lines = lines[:1]
-        if not lines:
-            self._log(f"{prefix}(no output, exit code {proc.returncode})")
-            return
-        for ln in lines:
-            self._log(f"{prefix}{ln}", tag=tag)
 
     @staticmethod
     def _kill_tree(proc: subprocess.Popen) -> None:
@@ -2903,6 +3646,23 @@ class FingerprinterApp:
         return len(running)
 
     def _cancel(self) -> None:
+        # Settings, General: Ask before Stop. The job carries on meanwhile.
+        # What survives depends on the job, so the question says so.
+        detail = {
+            "list": "\n\nLinks that have finished keep their fingerprints, and the list can "
+                    "be continued later. The link running now is cut short: when it runs "
+                    "again, it is downloaded and fingerprinted from the start.",
+            "disk": "\n\nBatches that have finished are kept, and fingerprinting the audio on "
+                    "disk again carries on from them while the program stays open (after a "
+                    f"restart too, with Write {self.FINGERPRINTED_RECORD} on).",
+        }.get(self._job_kind, "")
+        if self.confirm_stop_var.get() and not messagebox.askyesno(
+            "Stop the job?", "Stop everything that is running now?" + detail,
+            icon="warning", default="no", parent=self.root,
+        ):
+            return
+        if self.worker_thread is None or not self.worker_thread.is_alive():
+            return      # the job finished while the question was open
         self.cancel_flag.set()
         self._log("[!] Stopping. Running work is being killed now; "
                   "nothing further will start.")
@@ -3055,8 +3815,16 @@ class FingerprinterApp:
         for widget in (self.min_seconds_spin, self.max_minutes_spin,
                        self.skip_done_check, self.forget_done_btn):
             widget.config(state="disabled" if locked else "normal")
+        # Read as each link's downloads finish.
+        self.keep_audio_check.config(state="disabled" if locked else "normal")
+        if locked:
+            self.keep_audio_entry.config(state="disabled")
+            self.keep_audio_browse.config(state="disabled")
+        else:
+            self._update_keep_audio_row()
 
     def _finish(self) -> None:
+        self._keep_awake(False)
         self.pause_flag.clear()
         self._reset_progress()
         self.pause_btn.config(text="Pause", state="disabled")
@@ -3077,8 +3845,13 @@ class FingerprinterApp:
         bat_dir: Path,
         queue_mode: bool = False,
         queue_position: tuple[int, int] | None = None,
+        restarting: bool = False,
+        discard_work: bool = False,
     ) -> str | None:
-        """Run the full pipeline for one channel.
+        """Run the full pipeline for one channel. `restarting` is the link an
+        unfinished list stopped in: its download folder is cleared, not asked
+        about. `discard_work` when it had begun fingerprinting, so the .pklz
+        files in work\\pklz are its own unfinished ones: those are deleted.
 
         Returns a status string ("done", "failed", "skipped", "cancelled") when
         called in queue mode; the queue runner uses it for the summary. When not
@@ -3113,7 +3886,8 @@ class FingerprinterApp:
             self._log(f"[*] Fetching info for: {url}")
             info = self._extract_info(url)
             if info is None:
-                return "failed"
+                # Stop kills the listing, which then has nothing to return.
+                return "cancelled" if self.cancel_flag.is_set() else "failed"
             if (s := stopped()):
                 return s
 
@@ -3156,7 +3930,11 @@ class FingerprinterApp:
             #     runs in queue mode too — it only touches THIS channel's
             #     subfolder, never other channels' folders.
             if initial_folder.is_dir():
-                if not self._preflight_clean(
+                if restarting:
+                    # Left by the run that stopped in this link; it starts over.
+                    self._log("[*] Clearing what the stopped run left in this link's download folder.")
+                    self._clear_download_folder(initial_folder)
+                elif not self._preflight_clean(
                     initial_folder, ("",), label_for_root="download folder",
                 ):
                     return "cancelled"
@@ -3217,13 +3995,18 @@ class FingerprinterApp:
 
             # 4. Folder stays where it was downloaded; the scan below picks it up there.
             self._log(f"[+] Folder stays at: {initial_folder}")
+            # Settings, Folders: keep a copy of the audio as it was downloaded,
+            # before splitting rewrites it and the link's folder is deleted.
+            if self.keep_audio_var.get():
+                self._keep_audio(initial_folder, bat_dir, channel_name)
 
             # 4a. Audio length sanity check (right after downloads finish)
             if not self._check_long_audio(initial_folder):
                 return "cancelled"
 
             # 4b. The work folders must start empty (nothing in them is asked about)
-            self._prepare_work(bat_dir, resume=False)
+            self._prepare_work(bat_dir, resume=False, discard=discard_work)
+            self._note_list_fingerprinting(bat_dir)
 
             # 5 + 6. Scan and fingerprint. Scan THIS channel's download
             # subfolder -- the same folder we downloaded into, split in place,
@@ -3246,6 +4029,10 @@ class FingerprinterApp:
 
             # 6b. Rename the newly-created pklz files using the channel handle.
             self._rename_new_pklz(pklz_dir, pklz_before, pklz_prefix)
+            # From here its fingerprints start reaching the fingerprints
+            # folder, so a list that stops now must not run this link again.
+            if queue_mode:
+                self._note_list_link_done(url)
 
             # 6c. Move the pklz files out of work\pklz, which the next link
             #     empties, to where finished fingerprints are kept.
@@ -3295,6 +4082,7 @@ class FingerprinterApp:
             # failed, and that is exactly what this path should be resuming from
             # rather than being made to rebuild. The fingerprint stage decides
             # per batch whether an existing .pklz still matches its file list.
+            self._forget_list_fingerprinting()
             self._prepare_work(bat_dir, resume=True)
 
             pklz_dir = bat_dir / WORK_PKLZ
@@ -3460,6 +4248,14 @@ class FingerprinterApp:
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def _load_fingerprinted(self, pklz_dir: Path) -> dict[str, str]:
+        """The record is kept in memory for as long as the program runs, and
+        also written to FINGERPRINTED_RECORD in work\\pklz when that is turned
+        on (Settings, Fingerprinting), so it outlives the program. Without the
+        file, a run that resumes after a restart has no record and makes the
+        .pklz files it finds again (see _fingerprint_batches)."""
+        remembered = self._fp_records.get(str(pklz_dir))
+        if remembered is not None:
+            return dict(remembered)
         try:
             data = json.loads((pklz_dir / self.FINGERPRINTED_RECORD).read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
@@ -3467,11 +4263,24 @@ class FingerprinterApp:
             return {}
 
     def _save_fingerprinted(self, pklz_dir: Path, record: dict[str, str]) -> None:
+        self._fp_records[str(pklz_dir)] = dict(record)
+        path = pklz_dir / self.FINGERPRINTED_RECORD
+        if not self.fp_record_var.get():
+            # Off: memory only. A file left from when it was on would fall
+            # behind the record from here on, so it goes.
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
         try:
-            (pklz_dir / self.FINGERPRINTED_RECORD).write_text(
-                json.dumps(record, indent=1), encoding="utf-8")
+            path.write_text(json.dumps(record, indent=1), encoding="utf-8")
         except OSError as e:
             self._log(f"[!] Could not update {self.FINGERPRINTED_RECORD}: {e}")
+
+    def _forget_fingerprinted(self, bat_dir: Path) -> None:
+        """work\\pklz is being emptied: its record goes with it."""
+        self._fp_records.pop(str(bat_dir / WORK_PKLZ), None)
 
     def _run_audfprint_batch(
         self,
@@ -3726,16 +4535,20 @@ class FingerprinterApp:
         record = self._load_fingerprinted(pklz_dir)
         record_lock = threading.Lock()
         pending: list[int] = []
-        stale = 0
+        stale = unknown = 0
         for i in range(1, total_batches + 1):
             existing = pklz_dir / f"{i}.pklz"
             current = self._batch_list_hash(texts_dir, i)
             if existing.exists() and current and record.get(str(i)) == current:
                 continue                      # genuinely already done
             if existing.exists():
-                # Present but built from a different file set, so it is wrong
-                # for this batch number now. Rebuilt rather than trusted.
-                stale += 1
+                # Present but built from a different file set, or with no
+                # record of what it was built from, so it may be wrong for this
+                # batch number now. Rebuilt rather than trusted.
+                if str(i) in record:
+                    stale += 1
+                else:
+                    unknown += 1
                 try:
                     existing.unlink()
                 except OSError as e:
@@ -3744,6 +4557,12 @@ class FingerprinterApp:
         if stale:
             self._log(f"[!] {stale} existing pklz file(s) were built from a different "
                       f"set of files (the audio changed) and are being rebuilt.")
+        if unknown:
+            hint = (f" To keep that record when the program closes, turn on Write "
+                    f"{self.FINGERPRINTED_RECORD} in Settings, Fingerprinting."
+                    if not self.fp_record_var.get() else "")
+            self._log(f"[!] {unknown} pklz file(s) from an earlier run are being made again: "
+                      f"there is no record of which files they hold.{hint}")
         # Drop records for batches that no longer exist, so the file cannot grow
         # forever across runs with different batch counts.
         for key in [k for k in record if not k.isdigit() or int(k) > total_batches]:
@@ -4758,7 +5577,7 @@ class FingerprinterApp:
                 self._log(f"[!] Could not move {src.name}: {e}", tag="warning")
         self._log(f"[+] Moved {moved} pklz file(s) to {dest_dir}.")
 
-    def _prepare_work(self, bat_dir: Path, resume: bool) -> None:
+    def _prepare_work(self, bat_dir: Path, resume: bool, discard: bool = False) -> None:
         """Empty the program's scratch folders before fingerprinting, without
         asking: nothing in them is the user's to decide about. A .pklz file an
         interrupted run left in work\\pklz is a finished fingerprint file, so
@@ -4766,13 +5585,27 @@ class FingerprinterApp:
         deleted.
 
         `resume` (the buttons for audio already on disk) keeps work\\pklz as it
-        is: its .pklz files and fingerprinted.json are what that run resumes
-        from. Only the file lists are rebuilt."""
+        is: its .pklz files and their record (_load_fingerprinted) are what
+        that run resumes from. Only the file lists are rebuilt.
+
+        `discard` (a continued list starting over the link it stopped in, which
+        had begun fingerprinting) deletes the leftovers instead: they are that
+        link's own unfinished work, and keeping them would put its audio in the
+        database twice."""
         shutil.rmtree(bat_dir / WORK_TEXTS, ignore_errors=True)
         pklz_dir = bat_dir / WORK_PKLZ
-        if resume or not pklz_dir.is_dir():
+        if resume:
+            return
+        self._forget_fingerprinted(bat_dir)
+        if not pklz_dir.is_dir():
             return
         leftovers = sorted(p for p in pklz_dir.glob("*.pklz") if p.is_file())
+        if discard:
+            if leftovers:
+                self._log(f"[*] Discarding {len(leftovers)} unfinished .pklz file(s) of the stopped "
+                          f"link; it is fingerprinted again in full.")
+            shutil.rmtree(pklz_dir, ignore_errors=True)
+            return
         if leftovers:
             keep = self._keep_dir(bat_dir)
             keep.mkdir(parents=True, exist_ok=True)
@@ -4803,8 +5636,54 @@ class FingerprinterApp:
         if pklz_dir.is_dir() and any(pklz_dir.glob("*.pklz")):
             self._log(f"[!] Some .pklz files are still in {pklz_dir}; left in place.", tag="warning")
             return
+        self._forget_fingerprinted(bat_dir)
         for sub in (WORK_TEXTS, WORK_PKLZ):
             shutil.rmtree(bat_dir / sub, ignore_errors=True)
+
+    def _keep_dir_audio(self, bat_dir: Path) -> Path:
+        """Where kept audio goes: the chosen folder, or audio in the program folder."""
+        return Path(norm_path(self.keep_audio_dir_var.get()) or bat_dir / KEEP_AUDIO_DIR)
+
+    def _keep_audio(self, folder: Path, bat_dir: Path, channel_name: str) -> None:
+        """Worker thread: put a copy of every downloaded file in `folder` into
+        <kept audio folder>\\<channel name>, before splitting rewrites them and
+        the folder is deleted once fingerprinted.
+
+        A hard link where it can be, so keeping costs no time and no space
+        (splitting only removes the download's own name for the file, and
+        nothing writes into a download in place); a copy where it cannot, as
+        between drives. A file already kept, same name and size, is left as it
+        is, so running a link again keeps nothing twice."""
+        dest = self._keep_dir_audio(bat_dir) / channel_name
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._log(f"[!] Could not create {dest} to keep the audio in: {e}", tag="warning")
+            return
+        kept = already = 0
+        for src in sorted(p for p in folder.iterdir()
+                          if p.is_file() and p.suffix.lower() in self.AUDIO_EXTENSIONS):
+            target = dest / src.name
+            if target.exists():
+                if target.stat().st_size == src.stat().st_size:
+                    already += 1
+                    continue
+                n = 2
+                while target.exists():
+                    target = dest / f"{src.stem} ({n}){src.suffix}"
+                    n += 1
+            try:
+                try:
+                    os.link(src, target)
+                except OSError:
+                    shutil.copy2(src, target)
+                kept += 1
+            except OSError as e:
+                self._log(f"[!] Could not keep {src.name}: {e}", tag="warning")
+        if kept:
+            self._log(f"[+] Kept {kept} downloaded file(s) in {dest}")
+        if already:
+            self._log(f"[*] {already} file(s) were already kept there.")
 
     def _clear_download_folder(self, folder: Path) -> None:
         """Delete the channel's download subfolder entirely after its audio has
@@ -4837,6 +5716,15 @@ class FingerprinterApp:
 # ---------------------------- entry point -------------------------------------
 
 def main() -> None:
+    # A taskbar button of the program's own, showing its fingerprint icon.
+    # Without this Windows files the window under pythonw.exe and shows
+    # Python's icon there. It has to be set before the first window exists.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(dependencies.APP_ID)
+        except Exception:  # noqa: BLE001
+            pass
     root = tk.Tk()
     try:
         style = ttk.Style()

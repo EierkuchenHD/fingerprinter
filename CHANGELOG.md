@@ -3,6 +3,77 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.0.0-beta.4] - 2026-09-24
+
+### Added
+
+- **Keep downloaded audio** (Settings, Folders), off by default: a copy of
+  each link's downloads is kept in a folder named after the channel, as they
+  were downloaded, before splitting. On the same drive it is a hard link, so
+  it takes no extra space or time; the working copy is still fingerprinted and
+  deleted as before.
+- **Continuing an unfinished list.** When a list stops part-way (Stop, a
+  crash, Windows restarting), the program offers to carry on at its next start,
+  or when **Download and fingerprint** is pressed. Links that finished are not
+  run again. The link it stopped in starts over, and its unfinished downloads
+  and `.pklz` files are thrown away, so nothing is fingerprinted twice.
+- A **General** tab in Settings, the first one, which Settings opens on:
+  - **Appearance**: Light, Dark, or Follow Windows, which switches along with
+    Windows' own setting while the program runs.
+  - **Console text size**, also Ctrl and the mouse wheel over the console.
+  - **Keep the PC awake while a job runs**, on by default. The screen can
+    still turn off.
+  - **Ask before Stop**, on by default.
+  - **Offer to continue an unfinished list**, on by default.
+- A fingerprint icon for the window and its taskbar button, and a
+  **Fingerprinter** shortcut with that icon in the program folder. `setup.bat`
+  makes the shortcut, and the program makes it again at start when it is
+  missing or no longer fits: the folder was moved or copied, or the Python it
+  started is gone. Pinned to the taskbar, the shortcut or the running window
+  is one button that starts the Fingerprinter. The icon is based on
+  [Fingerprint](https://www.flaticon.com/free-icon/fingerprint_2313362) by
+  Pixel perfect from Flaticon.
+- **Follow** on the console, on by default. Untick it to read back through
+  the console while new lines keep coming.
+- **Write fingerprinted.json while fingerprinting** (Settings,
+  Fingerprinting), off by default. See Changed.
+
+### Changed
+
+- `fingerprinted.json`, the record of finished batches in `work\pklz`, is no
+  longer written unless that new setting is on. The record is kept in memory
+  instead, so **Audio on disk** still carries on after Stop while the program
+  stays open; only carrying on after the program was closed or crashed needs
+  the file.
+- **Add** is only clickable while the Link box holds something.
+- `setup.bat` updates yt-dlp to its newest release every time it runs,
+  whatever version is installed. **Check setup** does the same with pip; the
+  `yt-dlp -U` it ran before only updates the standalone exe, not the copy pip
+  installed. The program uses that copy, or a `yt-dlp.exe` found on PATH if
+  that one is newer; before, the exe always won, however old.
+
+### Removed
+
+- **This program's folder** (Settings, Folders). The program always works from
+  the folder it is in, where setup puts `audfprint\` and `tools\`. If it pointed
+  somewhere else, the working, fingerprints and kept-audio folders that
+  followed it stay where they were, now set in Settings, Folders, and the
+  console says so once.
+
+### Fixed
+
+- `setup.bat` ignored a failed Python installation and said "Python is
+  installed, but this window cannot see it yet". It now checks winget's result
+  and says what went wrong. When a Windows policy blocks the installation
+  ("Organization policies are preventing installation", Windows Installer code
+  1625), it explains that, shows any Windows Installer policy set on the PC,
+  and offers to install for all users, get Python from the Microsoft Store, or
+  open python.org. A cancelled install, a missing connection, a full disk and
+  a pending restart each get their own message. A policy set to allow
+  installs is no longer reported as the cause.
+- `setup.bat` also finds a Python installed for all users before the window's
+  PATH knows about it, and starts the program even without `pythonw`.
+
 ## [1.0.0-beta.3] - 2026-09-23
 
 ### Added
@@ -163,6 +234,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.0.0-beta.4]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.4
 [1.0.0-beta.3]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.1

@@ -60,9 +60,14 @@ upstream copy and offers to replace it.
 2. Double-click **`setup.bat`**. It:
    - finds Python 3.10 or newer. If there is none, it offers to install Python
      3.13 with winget, or opens python.org when winget is not available;
+   - updates yt-dlp to its newest release, every time you run it, as an old
+     yt-dlp is the commonest reason downloads fail;
    - checks every other component by actually running it, lists anything
-     missing or broken, and installs it once you confirm.
-3. Start **`yt-fingerprinter.pyw`**. Setup offers to start it for you.
+     missing or broken, and installs it once you confirm;
+   - makes a **Fingerprinter** shortcut with the fingerprint icon in the program
+     folder. Copy it to your desktop if you like.
+3. Start the Fingerprinter with that shortcut, or with **`yt-fingerprinter.pyw`**.
+   Setup offers to start it for you.
 
 Running `setup.bat` again is safe: anything that already works is left alone.
 The program also checks its components each time it starts, and offers to
@@ -113,7 +118,9 @@ The window has three panels, and the dividers between them can be dragged:
 - **Now**, on the right: which link is running, what it is doing (listing,
   downloading, splitting or fingerprinting) with a progress bar and a rough
   time left, and a row for each download or fingerprint batch under way.
-- **Console**, along the bottom: everything that happens, in detail.
+- **Console**, along the bottom: everything that happens, in detail. It
+  keeps the newest line in view; untick **Follow** to read back while new lines
+  keep coming.
 
 Hover over a control to see what it does.
 
@@ -131,7 +138,25 @@ fingerprinting) and starts nothing new until you press **Resume**; it then
 carries on from the same point. A download paused for a long time may lose its
 connection, in which case yt-dlp retries and continues from its partial file.
 **Skip link** moves on to the next link once the current stage finishes.
-**Stop** ends everything immediately.
+**Stop** asks first, then ends everything immediately.
+
+While a job runs, Windows does not go to sleep (the screen can still turn
+off). Both this and the question before Stop can be turned off in Settings,
+General.
+
+### Continuing an unfinished list
+
+If a list stops part-way, whether you pressed Stop, the program crashed or
+Windows restarted, the program remembers where. The next time it starts, or
+when you press **Download and fingerprint**, it asks whether to continue:
+
+- links that had finished are not run again;
+- the link it stopped in starts over from scratch. Its unfinished downloads and
+  `.pklz` files are thrown away, so none of it ends up in your fingerprints
+  twice.
+
+Answering **No** forgets where it stopped; your list stays as it is. Turn the
+question off in Settings, General.
 
 ### Running a channel again
 
@@ -151,9 +176,12 @@ without downloading anything, and both ask before they start:
 - **Fingerprint only** uses the files as they are and skips reading their
   lengths, which saves a long wait on a collection that is already split.
 
-These are also the way to resume after a crash. Neither empties `work\pklz`,
-where unfinished `.pklz` files wait, and work that is already fingerprinted is
-recorded in `work\pklz\fingerprinted.json` and not done twice.
+These are also the way to carry on after Stop or a crash. Neither empties
+`work\pklz`, where unfinished `.pklz` files wait. Batches that are already
+finished are not done twice as long as the program stays open. To carry on
+after the program was closed or crashed as well, turn on **Write
+fingerprinted.json while fingerprinting** (Settings, Fingerprinting); without
+it, the `.pklz` files an earlier session left are made again.
 
 ## Splitting
 
@@ -187,11 +215,19 @@ HTTP 429 (too many requests) or 403, lower it.
 
 ![The Settings window](screenshot-settings.png)
 
+The program always works from its own folder: `audfprint\`, `tools\` and
+`work\` are the ones next to `yt-fingerprinter.pyw`.
+
 | Tab | Setting | Default | What it does |
 |---|---|---|---|
+| General | Appearance | Follow Windows | Light or Dark. Follow Windows goes dark when Windows apps are set to dark (Windows Settings, Personalisation, Colours), and switches along with it while the program runs. |
+| General | Console text size | 9 | Ctrl and the mouse wheel over the console change it too. |
+| General | Keep the PC awake while a job runs | On | Windows does not go to sleep until the job has finished. The screen can still turn off. |
+| General | Ask before Stop | On | |
+| General | Offer to continue an unfinished list | On | See [Continuing an unfinished list](#continuing-an-unfinished-list). |
 | Folders | Working folder for audio | `downloads\` | Where audio is downloaded. Each link's audio is deleted once it is fingerprinted, so keep nothing else in it. |
 | Folders | Keep finished fingerprints in | `pklz-files\` | Where finished `.pklz` files are collected. Nothing in it is ever deleted. |
-| Folders | This program's folder | filled in | The folder that holds this program and its `audfprint\`. |
+| Folders | Keep downloaded audio in | Off, `audio\` | Keeps a copy of each link's downloads, as they were downloaded (before splitting), in a folder named after the channel. On the same drive this takes no extra space. |
 | Downloads | Name downloaded files | `%(title)s [%(id)s].%(ext)s` | A yt-dlp [output template](https://github.com/yt-dlp/yt-dlp#output-template). |
 | Downloads | Extra download options | empty | Passed to yt-dlp as they are. |
 | Downloads | Sign in with cookies from | None | A browser whose login yt-dlp uses. See [Content that needs a login](#content-that-needs-a-login). |
@@ -204,6 +240,9 @@ HTTP 429 (too many requests) or 403, lower it.
 | Fingerprinting | Split long recordings after downloading | On | See [Splitting](#splitting). |
 | Fingerprinting | Open the fingerprints folder when a run finishes | On | |
 | Fingerprinting | Play a sound and flash the taskbar button when a run finishes | On | |
+| Fingerprinting | Write fingerprinted.json while fingerprinting | Off | A record in `work\pklz` of which batches are finished, so **Audio on disk** can carry on after the program was closed or crashed. Without it, it carries on after Stop only while the program stays open. |
+
+![The Fingerprinter in dark mode](screenshot-dark.png)
 
 audfprint's own `--ncores` is fixed at 1 on purpose: several single-core jobs
 are faster than one job spread over several cores (measured: 8 jobs at 1 core
@@ -216,8 +255,7 @@ Press **Check setup** first. It:
 - checks every component by running it: Python, the Python packages, yt-dlp,
   ffmpeg, ffprobe, Node.js, and whether `audfprint\` is WerZatSong's version and
   starts;
-- runs `yt-dlp -U`, which **updates yt-dlp** if it can (this can take up to
-  90 seconds);
+- **updates yt-dlp** to its newest release with pip, like `setup.bat`;
 - fetches one YouTube video's details as a test;
 - checks free space and write access in the working folder;
 - offers to install or repair whatever is missing or not working, and says what
@@ -227,10 +265,11 @@ Press **Check setup** first. It:
 |---|---|
 | "WerZatSong's audfprint is needed" | `audfprint\` is missing, one folder too deep, or the upstream version. Press Check setup to install the right one. |
 | `setup.bat` says Python was not found | Install Python from python.org with **Add python.exe to PATH** ticked, then run `setup.bat` again. |
+| `setup.bat`: "Organization policies are preventing installation" | A Windows policy on that PC forbids the installation (Windows Installer code 1625), as on many work, school or managed PCs. `setup.bat` explains it, shows any Windows Installer policy it finds, and offers to install for all users (with an administrator's permission) or to get Python from the Microsoft Store, which these policies do not cover. |
 | An install fails | The console shows why (no connection, proxy, antivirus) and how to do that part by hand. |
 | Many downloads fail, HTTP 429 or 403 | The site is rate-limiting you. Lower **Downloads at once** and try again later. |
 | Some items are skipped | Private, members-only, age-restricted or blocked in your country. The console gives the reason for each. |
-| The downloaded audio is gone | Expected: it is deleted once a link is fingerprinted. |
+| The downloaded audio is gone | Expected: it is deleted once a link is fingerprinted. Turn on **Keep downloaded audio** in Settings, Folders, to keep it. |
 | A run seems frozen | Big channels take a while to list; **Now** shows how many entries have been found so far. For more detail, turn on **Show every line of download output** (Settings, Downloads). |
 
 ### Content that needs a login
@@ -244,13 +283,16 @@ service, whose account has no browser profile.
 ## Limitations
 
 - **Windows only.**
-- **Downloaded audio is deleted** once each link is fingerprinted. The `.pklz`
-  files are the output; keep your own copy of the audio if you want it.
+- **Downloaded audio is deleted** once each link is fingerprinted, unless
+  **Keep downloaded audio** is on (Settings, Folders). Kept audio is in the
+  format it was downloaded in, usually `.m4a` or `.opus`; nothing is converted.
 - **Download and fingerprint empties `work\`** before each link, without
   asking, including the record of finished work. A `.pklz` an interrupted run
   left there is moved to your fingerprints folder as `recovered-...` rather
   than deleted. To resume an interrupted run instead, use one of the buttons
-  for audio already on disk.
+  for audio already on disk. The exception is continuing an unfinished list:
+  the unfinished `.pklz` files of the link it stopped in are deleted, as that
+  link is fingerprinted again in full.
 - **If a link's download folder already holds files** from an earlier attempt,
   the program asks whether to delete them, and answers "yes" itself after two
   minutes so an unattended list never stalls. The working folder should hold
@@ -263,14 +305,18 @@ service, whose account has no browser profile.
 | In the program folder | |
 |---|---|
 | `yt-fingerprinter.pyw` | The program. |
+| `Fingerprinter.lnk` | The shortcut to start it, made by setup (or by the program, if it is missing). |
+| `fingerprinter.ico` | The fingerprint icon, for the shortcut, the window and the taskbar. |
 | `setup.bat`, `dependencies.py` | Setup, and the component check and installer that the program also uses. |
 | `audfprint_quiet.py` | Runs audfprint with its ffmpeg console windows hidden. |
 | `audfprint\` | WerZatSong's audfprint (installed by setup). |
 | `tools\` | ffmpeg and Node.js, if setup installed them. |
 | `downloads\` | The default working folder. Each link downloads into its own subfolder here, deleted once it is fingerprinted. |
 | `pklz-files\` | The default place finished fingerprints are kept. Nothing in it is deleted. |
+| `audio\` | The default place for kept downloads, when **Keep downloaded audio** is on, in a folder per channel. |
 | `work\` | The program's scratch space: file lists for audfprint and unfinished `.pklz` files. |
 | `config.json`, `recent_urls.json` | Your settings, list and recent links. |
+| `unfinished-list.json` | Where a list that stopped part-way got to, while it can be continued. |
 | `fingerprinted-items.txt` | Items already fingerprinted, when that setting is on. The format of yt-dlp's `--download-archive`. |
 | `CHANGELOG.md` | What changed in each version. |
 
@@ -281,10 +327,16 @@ Ellis, in the version maintained with [WerZatSong](https://github.com/Nel80s/Wer
 by Nel, and downloading by [yt-dlp](https://github.com/yt-dlp/yt-dlp). This
 project is the window around them.
 
+The icon is based on [Fingerprint](https://www.flaticon.com/free-icon/fingerprint_2313362)
+by Pixel perfect from [Flaticon](https://www.flaticon.com/), used under the
+Flaticon licence, which requires this credit.
+
 Only download and store material you have the right to. This tool does not
 decide that for you.
 
 ## License
 
 [MIT](LICENSE). This covers this project only. audfprint, WerZatSong and yt-dlp
-are separate projects under their own licences.
+are separate projects under their own licences. The icon, `fingerprinter.ico`,
+is based on Flaticon artwork and stays under the Flaticon licence (see
+[Credits](#credits)), not MIT.

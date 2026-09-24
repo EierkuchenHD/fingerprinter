@@ -1,6 +1,5 @@
 {
   "output_dir": "",
-  "bat_dir": "",
   "move_pklz_dir": "",
   "extra_args": "",
   "filename_template": "%(title)s [%(id)s].%(ext)s",
@@ -11,6 +10,20 @@
   "open_pklz": true,
   "batch_size": 1000,
   "fp_concurrency": 4,
-  "fp_ncores": 1,
+  "cookies_browser": "None",
+  "skip_shorter_than": 0,
+  "skip_longer_than": 0,
+  "skip_done": false,
+  "notify": true,
+  "keep_audio": false,
+  "keep_audio_dir": "",
+  "theme": "Follow Windows",
+  "console_font_size": 9,
+  "keep_awake": true,
+  "confirm_stop": true,
+  "offer_resume": true,
+  "write_fingerprinted_json": false,
+  "console_follow": true,
+  "config_version": 3,
   "queue": []
 }
