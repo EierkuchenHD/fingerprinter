@@ -8,7 +8,10 @@ rem the commonest reason downloads fail. Then it checks the Python packages,
 rem yt-dlp, ffmpeg, Node.js and WerZatSong's audfprint, lists anything missing
 rem or not working, and installs it if you say yes. Anything else that already
 rem works is left alone, so running this again is safe.
-rem It also makes Fingerprinter.lnk, the program's shortcut with its fingerprint icon.
+rem It also makes Fingerprinter.lnk, the program's shortcut with its fingerprint
+rem icon, and asks once whether to put one on the desktop. What it installs
+rem outside the program folder is noted in installed-by-setup.txt, so that
+rem uninstall.bat can offer to remove exactly that.
 rem
 rem If winget cannot install Python, this says why in plain words and offers
 rem the other ways to get it: for all users (with an administrator's
@@ -17,7 +20,13 @@ rem failure is a Windows policy that forbids the installation (winget error
 rem 0x8A15010F, Windows Installer code 1625); see :explain_failure.
 
 setlocal EnableExtensions
-cd /d "%~dp0"
+rem pushd, not cd: it also works for a folder on a network share (\\server\...),
+rem where cd cannot go and dependencies.py would not be found.
+pushd "%~dp0" || (
+    echo Cannot open the program folder %~dp0
+    pause
+    exit /b 1
+)
 title Fingerprinter setup
 
 call :find_python
@@ -35,6 +44,8 @@ set "SCOPE=user"
 echo.
 winget install --exact --id Python.Python.3.13 --scope %SCOPE%
 set "WG=%errorlevel%"
+rem Noted for uninstall.bat, which offers to remove what setup installed.
+if "%WG%"=="0" >>"%~dp0installed-by-setup.txt" echo python Python.Python.3.13 %SCOPE%
 call :find_python
 if defined PY goto have_python
 if "%WG%"=="0" goto installed_unseen

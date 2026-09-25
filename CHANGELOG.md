@@ -3,6 +3,43 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.0.0-beta.5] - 2026-09-25
+
+### Added
+
+- **`uninstall.bat`** removes the Fingerprinter: the program and everything it
+  put in its folder (audfprint, ffmpeg and Node.js, settings, scratch files)
+  and its shortcuts, also a desktop one copied there by hand. Your
+  fingerprints, kept audio and working folder are asked about one by one and
+  kept unless you say otherwise; deleting your fingerprints needs a second
+  confirmation and removes only the `.pklz` files. The Python packages and the
+  Python that setup installed are offered too, only those, each from the
+  Python it went into, and only removed on a yes. Files that did not come with
+  the Fingerprinter are never touched, and it works on a network share and
+  without Python too.
+- `setup.bat` notes what it installs outside the program folder in
+  `installed-by-setup.txt`, for the uninstaller.
+- **Remove links from the list once fingerprinted** (Settings, General), off
+  by default. Links that failed, were skipped or stopped, or where some
+  downloads or batches failed in a way that may work next time, stay in the
+  list.
+- **A desktop shortcut:** `setup.bat` asks once whether to put one on the
+  desktop, and **Put a shortcut on the desktop** in Settings, General makes
+  one at any time. It goes on the desktop Windows shows, also when OneDrive
+  has moved it, is updated when the program folder moves, and leaves another
+  copy's shortcut there alone.
+
+### Changed
+
+- A link where some batches failed, or some downloads failed in a way that
+  may work next time (a network error, a rate limit, a premiere not out yet),
+  ends as "incomplete" in the list's summary, rather than as done.
+- Shortcuts are made through Windows' own shortcut object instead of
+  WScript.Shell, which could not hold a folder name outside the system's
+  code page (a Cyrillic user name on English Windows, for example): such a
+  shortcut started nothing.
+- `setup.bat` also works from a folder on a network share.
+
 ## [1.0.0-beta.4] - 2026-09-24
 
 ### Added
@@ -234,6 +271,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.0.0-beta.5]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.5
 [1.0.0-beta.4]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.4
 [1.0.0-beta.3]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.2

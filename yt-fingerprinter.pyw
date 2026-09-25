@@ -61,7 +61,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.0.0-beta.4"
+__version__ = "1.0.0-beta.5"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -430,8 +430,10 @@ class FingerprinterApp:
         # Tracks where the most recent channel's pklz files landed, so a queue
         # run can open that folder once at the end.
         self._last_report_dir: Path | None = None
-        # This link's items that downloaded (see _download_parallel)
+        # This link's items that downloaded, and failures worth another try
+        # (see _download_parallel)
         self._downloaded_ok: list[dict] = []
+        self._retry_later = 0
 
         self._build_ui()
         self._apply_config(load_config())
@@ -868,6 +870,7 @@ class FingerprinterApp:
         self.keep_awake_var = tk.BooleanVar(value=True)
         self.confirm_stop_var = tk.BooleanVar(value=True)
         self.offer_resume_var = tk.BooleanVar(value=True)
+        self.remove_finished_var = tk.BooleanVar(value=False)
         for var, label, explanation in (
             (self.keep_awake_var, "Keep the PC awake while a job runs",
              "Windows does not go to sleep until the job has finished. The screen can "
@@ -879,9 +882,20 @@ class FingerprinterApp:
              "offers to carry on where it stopped: when it starts, and when you press "
              "Download and fingerprint. Links that finished are not run again; the one it "
              "stopped in starts over."),
+            (self.remove_finished_var, "Remove links from the list once fingerprinted",
+             "Off by default. A link leaves the list as soon as all of it has been "
+             "fingerprinted. Links that failed, were skipped or stopped, or where some "
+             "downloads or batches failed in a way that may work next time, stay, so you "
+             "can run them again."),
         ):
             ttk.Checkbutton(tab, text=label, variable=var).pack(anchor="w", pady=1)
             self._help(tab, explanation, wrap=560).pack(anchor="w", padx=22, pady=(0, 6))
+
+        self.desktop_btn = ttk.Button(tab, text="Put a shortcut on the desktop",
+                                      command=self._make_desktop_shortcut)
+        self.desktop_btn.pack(anchor="w", pady=(6, 1))
+        self._help(tab, "A Fingerprinter shortcut with its icon, for this copy of the program. "
+                        "setup.bat offers one too.", wrap=560).pack(anchor="w", padx=4, pady=(0, 6))
 
         # ---- Folders ----
         tab = ttk.Frame(self.settings_tabs, padding=8)
@@ -1634,6 +1648,17 @@ class FingerprinterApp:
         if self.keep_audio_var.get():
             kept = self._keep_dir_audio(Path(bat_dir)).resolve()
             working = Path(norm_path(self.output_dir_var.get()) or bat_dir).resolve()
+            if kept == Path(bat_dir).resolve():
+                # A folder per channel would land among the program's own
+                # (a channel called Tools or Work), and uninstall.bat would
+                # take it for one of them.
+                messagebox.showerror(
+                    "Pick another folder",
+                    "Keep downloaded audio in is the program folder itself. Choose a folder "
+                    "inside it, like the default audio, or one elsewhere.",
+                    parent=self.root,
+                )
+                return True
             if kept == work or work in kept.parents or kept == working or working in kept.parents:
                 messagebox.showerror(
                     "Pick another folder",
@@ -1742,6 +1767,7 @@ class FingerprinterApp:
         ("keep_awake_var", "keep_awake", bool),
         ("confirm_stop_var", "confirm_stop", bool),
         ("offer_resume_var", "offer_resume", bool),
+        ("remove_finished_var", "remove_finished", bool),
         ("fp_record_var", "write_fingerprinted_json", bool),
         ("console_follow_var", "console_follow", bool),
     )
@@ -2627,7 +2653,9 @@ class FingerprinterApp:
     def _queue_remove_row(self, row: dict) -> None:
         if not self._queue_editable or row not in self.queue_rows:
             return
-        i = self.queue_rows.index(row)
+        self._drop_from_queue(self.queue_rows.index(row))
+
+    def _drop_from_queue(self, i: int) -> None:
         del self.queue_urls[i]
         del self.queue_checks[i]
         if self.queue_active is not None:
@@ -2637,6 +2665,15 @@ class FingerprinterApp:
                 self.queue_active -= 1
         self._refresh_queue()
         save_config(self._gather_config())
+
+    def _remove_finished_link(self, url: str) -> None:
+        """UI thread: take a link that was fingerprinted in full off the list
+        (Settings, General), even while the list is locked for the run: the
+        run works from its own copy of the list, so this changes nothing
+        about what it does next."""
+        if url in self.queue_urls:
+            self._drop_from_queue(self.queue_urls.index(url))
+            self._log(f"[+] Took it off the list, as it is fingerprinted: {url}")
 
     # ---- how many entries each link has --------------------------------------
     #
@@ -3093,6 +3130,9 @@ class FingerprinterApp:
                     state["current"] = None
                     state.pop("fingerprinting", None)
                     self._save_list_state(state)
+                # Settings, General: a link fingerprinted in full leaves the list.
+                if (status or "done") == "done" and self.remove_finished_var.get():
+                    self.root.after(0, self._remove_finished_link, url)
 
             # Only a list that ran to its end has nothing left to continue.
             if not self.cancel_flag.is_set():
@@ -3105,7 +3145,7 @@ class FingerprinterApp:
             self._log(f"    {done}/{total} link(s) completed.")
             for u, s in results:
                 if s != "done":
-                    tag = "warning" if s in ("failed", "skipped") else None
+                    tag = "warning" if s in ("failed", "skipped", "incomplete") else None
                     self._log(f"    [{s}] {u}", tag=tag)
             self._log("=" * 60)
             self._set_status(f"List done: {done}/{total} completed.")
@@ -3114,8 +3154,9 @@ class FingerprinterApp:
             # Open the folder where pklz files ended up, once, at the very end
             # (per-channel opening was suppressed to avoid window spam). Honors
             # the "open pklz-files folder when done" checkbox.
+            made = sum(1 for _, s in results if s in ("done", "incomplete"))
             if (
-                done > 0
+                made > 0
                 and not self.cancel_flag.is_set()
                 and self.open_pklz_var.get()
                 and getattr(self, "_last_report_dir", None) is not None
@@ -3395,6 +3436,9 @@ class FingerprinterApp:
                 name = dependencies.SHORTCUT_FILE.name
                 self._log(f"[+] Updated {name} for this folder." if existed else
                           f"[+] Made {name} in the program folder: start the Fingerprinter from it.")
+            # The same for the desktop shortcut this copy made, once the folder moved.
+            if (path := dependencies.repair_desktop_shortcut()) is not None:
+                self._log(f"[+] Updated the desktop shortcut for this folder: {path}")
         finally:
             self.root.after(500, self._offer_resume)
 
@@ -3473,6 +3517,24 @@ class FingerprinterApp:
             return
         state["fingerprinting"] = True
         self._save_list_state(state)
+
+    def _make_desktop_shortcut(self) -> None:
+        """Settings, General: Fingerprinter.lnk on the desktop, for this copy
+        (the same one setup.bat offers). One PowerShell call, off the UI thread."""
+        self.desktop_btn.config(state="disabled")
+        lines: list[str] = []
+
+        def work() -> None:
+            path = dependencies.make_desktop_shortcut(lines.append)
+            if path is not None:
+                self._log(f"[+] Made a Fingerprinter shortcut on the desktop: {path}")
+            else:
+                self._log("[!] Could not make the desktop shortcut.", tag="warning")
+                for line in lines:
+                    self._log(line)
+            self.root.after(0, lambda: self.desktop_btn.config(state="normal"))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _note_list_link_done(self, url: str) -> None:
         """Worker thread: the list's current link is fingerprinted and its
@@ -3992,6 +4054,16 @@ class FingerprinterApp:
             if ok == 0:
                 self._log("[X] No successful downloads. Aborting before fingerprinting.")
                 return "failed"
+            retry_later = self._retry_later
+            if not self._downloaded_ok:
+                # Every item that came through was outside the length limits
+                # (yt-dlp's own check), so, as with "Nothing new", there is
+                # nothing to fingerprint.
+                self._log(f"[+] {qp}Nothing to fingerprint: every item was outside the length "
+                          f"limits in Settings.")
+                self._clear_download_folder(initial_folder)
+                self._set_status(f"{qp}Nothing new.")
+                return "incomplete" if retry_later else "done"
 
             # 4. Folder stays where it was downloaded; the scan below picks it up there.
             self._log(f"[+] Folder stays at: {initial_folder}")
@@ -4057,6 +4129,19 @@ class FingerprinterApp:
             # runner can open the final location once at the end.
             self._last_report_dir = keep_dir
 
+            if not complete or retry_later:
+                # Something is missing, so the link is not done in full: the
+                # summary says so, and Remove links from the list once
+                # fingerprinted leaves it in the list. Downloads that fail
+                # every time (a private or removed video) do not count.
+                if retry_later:
+                    self._log(f"[!] {qp}{retry_later} item(s) could not be downloaded this time "
+                              f"(see above); running the link again fetches them.", tag="warning")
+                if not complete:
+                    self._log(f"[!] {qp}Link finished, but not all of it was fingerprinted; see above.",
+                              tag="warning")
+                self._set_status(f"{qp}Finished with failures.")
+                return "incomplete"
             self._log(f"[+] {qp}Link done.")
             self._set_status(f"{qp}Done.")
             return "done"
@@ -5202,8 +5287,12 @@ class FingerprinterApp:
         fail = 0
         total = len(entries)
         done = 0
-        # The items that downloaded, for the done list (see _remember_done).
+        # The items that downloaded, for the done list (see _remember_done),
+        # and how many failed in a way worth trying again (RETRY_LATER).
         self._downloaded_ok: list[dict] = []
+        self._retry_later = 0
+        for entry in entries:
+            entry.pop("_fail_reason", None)
 
         # Number of visible slots = min(workers, total)
         slot_count = max(1, min(workers, total))
@@ -5248,6 +5337,8 @@ class FingerprinterApp:
                         self._downloaded_ok.append(futures[fut])
                 else:
                     fail += 1
+                    if futures[fut].get("_fail_reason") in self.RETRY_LATER:
+                        self._retry_later += 1
                 done += 1
                 # See the note in _download_one: .get(key, default) doesn't
                 # fall back when the key is present with an explicit None
@@ -5403,6 +5494,7 @@ class FingerprinterApp:
         if not success and not self.cancel_flag.is_set():
             joined = " ".join(err_lines)
             reason = self._classify_yt_dlp_error(joined)
+            entry["_fail_reason"] = reason              # see RETRY_LATER
             if reason:
                 self._log(
                     f"  ! Skipped '{title}': {reason}",
@@ -5413,6 +5505,12 @@ class FingerprinterApp:
             else:
                 self._log(f"  ! Skipped '{title}' (no error detail captured).", tag="warning")
         return success
+
+    # Download failures that may well work the next time the link runs; the
+    # rest (private, removed, members-only, geo-blocked, ...) fail every time.
+    # None is a failure with no known reason, counted as worth another try.
+    RETRY_LATER = {None, "network error", "HTTP 403 forbidden", "HTTP 429 rate-limited",
+                   "scheduled livestream (not started)", "scheduled premiere (not aired)"}
 
     @staticmethod
     def _classify_yt_dlp_error(text: str) -> str | None:

@@ -65,7 +65,9 @@ upstream copy and offers to replace it.
    - checks every other component by actually running it, lists anything
      missing or broken, and installs it once you confirm;
    - makes a **Fingerprinter** shortcut with the fingerprint icon in the program
-     folder. Copy it to your desktop if you like.
+     folder, and asks whether to put one on your desktop too. It asks once: a
+     No is remembered, and **Put a shortcut on the desktop** in Settings,
+     General makes one later.
 3. Start the Fingerprinter with that shortcut, or with **`yt-fingerprinter.pyw`**.
    Setup offers to start it for you.
 
@@ -84,6 +86,10 @@ install anything that has gone missing.
   each download is checked against its published SHA-256 before it is unpacked.
 - **WerZatSong's audfprint:** into `audfprint\` in the program folder. An
   existing folder there is renamed to `audfprint.old`, not deleted.
+
+What setup installs outside the program folder (Python, and the Python
+packages that were missing) is noted in `installed-by-setup.txt`, so that
+[uninstalling](#uninstalling) can offer to remove exactly that.
 
 ### Installing by hand instead
 
@@ -225,6 +231,8 @@ The program always works from its own folder: `audfprint\`, `tools\` and
 | General | Keep the PC awake while a job runs | On | Windows does not go to sleep until the job has finished. The screen can still turn off. |
 | General | Ask before Stop | On | |
 | General | Offer to continue an unfinished list | On | See [Continuing an unfinished list](#continuing-an-unfinished-list). |
+| General | Remove links from the list once fingerprinted | Off | A link leaves the list as soon as all of it has been fingerprinted. Links that failed, were skipped or stopped, or where some downloads or batches failed in a way that may work next time (a network error, a rate limit), stay, so you can run them again. A private or removed video does not keep a link in the list. |
+| General | Put a shortcut on the desktop | (a button) | A Fingerprinter shortcut with its icon, on the desktop, for this copy of the program. Another copy's shortcut there is not replaced: this one is then called `Fingerprinter 2`. |
 | Folders | Working folder for audio | `downloads\` | Where audio is downloaded. Each link's audio is deleted once it is fingerprinted, so keep nothing else in it. |
 | Folders | Keep finished fingerprints in | `pklz-files\` | Where finished `.pklz` files are collected. Nothing in it is ever deleted. |
 | Folders | Keep downloaded audio in | Off, `audio\` | Keeps a copy of each link's downloads, as they were downloaded (before splitting), in a folder named after the channel. On the same drive this takes no extra space. |
@@ -247,6 +255,32 @@ The program always works from its own folder: `audfprint\`, `tools\` and
 audfprint's own `--ncores` is fixed at 1 on purpose: several single-core jobs
 are faster than one job spread over several cores (measured: 8 jobs at 1 core
 took 28 s for what 1 job at 8 cores took 59 s).
+
+## Uninstalling
+
+Close the Fingerprinter and double-click **`uninstall.bat`** in the program
+folder. It lists what it will remove and asks before anything goes:
+
+- **The program and everything it put in its folder** go: audfprint, ffmpeg
+  and Node.js (`tools\`), its settings, list and scratch files, and its
+  shortcuts, including any on the desktop that start this copy, also one you
+  copied there by hand.
+- **Your own files are asked about one by one, and kept unless you say
+  otherwise:** your fingerprints (`pklz-files\`, and unfinished ones in
+  `work\pklz`, which are then kept as `recovered-...`), kept audio
+  (`audio\`) and anything in the working folder (`downloads\`). Deleting your
+  fingerprints needs a second confirmation, as making them again takes hours,
+  and removes only the `.pklz` files: anything else in `pklz-files\` stays.
+- **The Python packages and Python that setup installed** are offered too, but
+  only those setup noted installing (see
+  [What gets installed](#what-gets-installed-and-where)), each from the Python
+  it went into, and they stay unless you say yes: other programs on the PC may
+  use them. A copy of the program folder does not offer what setup installed
+  for the original.
+- **Files that did not come with the Fingerprinter** stay, and so do folders
+  outside the program folder chosen in Settings. The program folder itself
+  goes once nothing is left in it. If something cannot be removed (a file in
+  use), it says so and `uninstall.bat` stays, to run again.
 
 ## Troubleshooting
 
@@ -308,6 +342,8 @@ service, whose account has no browser profile.
 | `Fingerprinter.lnk` | The shortcut to start it, made by setup (or by the program, if it is missing). |
 | `fingerprinter.ico` | The fingerprint icon, for the shortcut, the window and the taskbar. |
 | `setup.bat`, `dependencies.py` | Setup, and the component check and installer that the program also uses. |
+| `uninstall.bat` | Removes the Fingerprinter; see [Uninstalling](#uninstalling). |
+| `installed-by-setup.txt` | What setup installed outside the program folder, and the desktop shortcut it made, for `uninstall.bat`. |
 | `audfprint_quiet.py` | Runs audfprint with its ffmpeg console windows hidden. |
 | `audfprint\` | WerZatSong's audfprint (installed by setup). |
 | `tools\` | ffmpeg and Node.js, if setup installed them. |
