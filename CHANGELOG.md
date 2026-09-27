@@ -3,6 +3,70 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.0.0-beta.6] - 2026-09-27
+
+### Added
+
+- **Several links at once** in the link box: one per line, or separated by
+  spaces or commas. `@handles`, channel IDs and links without `https://`
+  work there too, as in Import.
+- **Undo** (in the status bar, or Ctrl+Z) puts removed links back where they
+  were. **Remove ticked** asks first when it would empty the list or take more
+  than five links; every link is ticked when added, so it used to empty a new
+  list without a word.
+- **How each link's last run ended**, as a mark on its row (done, incomplete,
+  failed, skipped, stopped; running now), kept with the list, and **Tick
+  unfinished** to run the rest again. Ticks are kept between sessions too.
+- **The run in the window title**, so it can be read from the taskbar, and the
+  Now panel names the row when ticked links and rows differ.
+- **Keep yt-dlp up to date** (Settings, General), on by default: once a day at
+  start, a newer yt-dlp is installed. Before, only setup.bat and Check setup
+  updated it.
+- **When a job finishes: Sleep or Shut down** (Settings, General), after a
+  minute's warning. Back to Do nothing at every start.
+- **Pausing by itself** when ten downloads in a row fail in a way that says the
+  site is refusing them (HTTP 429 or 403, YouTube's bot check, no connection),
+  resuming after 10 minutes and longer each time; a full disk pauses until
+  Resume. A warning before downloading more than the drive has free.
+- The window opens where it was, at the same size, maximised or not.
+
+### Changed
+
+- **Skip link** stops a link's listing and downloads at once. A link that is
+  already being fingerprinted finishes first: skipping it then threw away its
+  finished fingerprints, which went out nameless as `recovered-*` at the next
+  link while the link's audio was fingerprinted again in full next time.
+- **"Open the working folder when a list starts"** opens it once per list,
+  instead of a window for every link on a folder deleted when the link is done.
+- After each link the console lists **only that link's new `.pklz` files**, and
+  one line for the whole folder, instead of every file in it.
+- A link already in the list is recognised however it is written: tracking
+  parameters (`?si=`), `www.`, `m.`, a trailing slash, `youtu.be` links.
+- **Audio on disk** asks for the name of its `.pklz` files, suggesting the
+  channel of the one download folder in the working folder, and renames only
+  its own batch files.
+- The listing is read as one JSON object per item, so a title with a line
+  break in it no longer loses the item.
+
+### Fixed
+
+- **A file audfprint could not read** (a cut-off download, say) was left out
+  of the fingerprints without a word while its link ended as done, and with
+  Skip items already fingerprinted on it was marked as fingerprinted, so never
+  tried again. It is now named in the console, the link ends incomplete, and
+  the item is not remembered.
+- **A failed listing** said only "yt-dlp info failed:", with nothing after it.
+  It now shows yt-dlp's error. A listing yt-dlp stopped part-way (a rate limit
+  on page 30 of a large channel) ran as if complete and could end the link as
+  done; the link is now incomplete, and the short count is not kept.
+- **Audio on disk** named every file `channel-N.pklz`: it looked for the
+  channel's folder in the program folder, not the working folder.
+- **Quotes in Extra download options** reached yt-dlp as part of the value, so
+  a quoted path with spaces was not found.
+- YouTube's "confirm you're not a bot", a full disk and an outdated yt-dlp are
+  recognised, with advice; a 404 or 429 on a page is no longer called a
+  network error.
+
 ## [1.0.0-beta.5] - 2026-09-25
 
 ### Added
@@ -271,6 +335,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.0.0-beta.6]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.6
 [1.0.0-beta.5]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.5
 [1.0.0-beta.4]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.4
 [1.0.0-beta.3]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.3

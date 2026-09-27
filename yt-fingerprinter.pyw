@@ -39,7 +39,6 @@ import math
 import os
 import queue
 import re
-import shlex
 import shutil
 import struct
 import subprocess
@@ -53,6 +52,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import dependencies
 
@@ -61,7 +61,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.0.0-beta.5"
+__version__ = "1.0.0-beta.6"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -91,6 +91,61 @@ def extract_handle(url: str, fallback: str = "") -> str:
     if fallback:
         return sanitize_name(fallback)
     return "channel"
+
+
+# Query parameters that only say where a link was shared from (the YouTube
+# app adds ?si=...). Dropped from links added to the list, so the same channel
+# shared from a phone and copied from the browser is one link, not two.
+TRACKING_PARAMS = {"si", "pp", "feature", "fbclid", "gclid", "igshid", "ref_src", "ref_url"}
+
+
+def clean_link(url: str) -> str:
+    """`url` without tracking parameters (?si=, &feature=, utm_*...). Left
+    exactly as it is when it has none."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.query:
+        return url
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    kept = [(k, v) for k, v in pairs
+            if k.lower() not in TRACKING_PARAMS and not k.lower().startswith("utm_")]
+    if len(kept) == len(pairs):
+        return url
+    return urlunsplit(parts._replace(query=urlencode(kept)))
+
+
+def link_key(url: str) -> str:
+    """What two links must share to be the same link in the list. Tracking
+    parameters, http or https, www. and m., the letter case of the site and
+    of a YouTube @handle, and a trailing slash make no difference, and
+    youtu.be/ID is youtube.com/watch?v=ID."""
+    url = clean_link(url.strip())
+    if "://" not in url:
+        url = "https://" + url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url.lower()
+    host = parts.netloc.lower()
+    for prefix in ("www.", "m."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    path, query = parts.path.rstrip("/"), parts.query
+    if host == "youtu.be" and path.strip("/"):
+        host, path = "youtube.com", "/watch"
+        query = "v=" + parts.path.strip("/") + ("&" + query if query else "")
+    if host == "youtube.com":
+        # Handles are not case-sensitive; video and channel IDs are.
+        path = re.sub(r"^/@[^/]+", lambda m: m.group(0).lower(), path)
+    return f"{host}{path}?{query}" if query else f"{host}{path}"
+
+
+def youtube_handle(url: str) -> str | None:
+    """The @handle of a YouTube channel link, lower case, or None."""
+    m = re.match(r"^youtube\.com/(@[^/?#]+)", link_key(url))
+    return m.group(1) if m else None
 
 
 def check_dependency(cmd: str | list[str]) -> bool:
@@ -240,6 +295,8 @@ YTDLP_UTF8 = ("--encoding", "utf-8")
 # Settings, General: the window's colours. "Follow Windows" reads whether
 # Windows apps are set to dark, and keeps following it while the program runs.
 THEME_CHOICES = ("Follow Windows", "Light", "Dark")
+# Settings, General: what the PC does once a job has run to its end.
+WHEN_DONE_CHOICES = ("Do nothing", "Sleep", "Shut down")
 # Colours for everything the ttk theme does not draw: the list and Now rows,
 # the console and its colour tags, borders, dividers, tooltips, and the text
 # colours of help lines and links. Light matches the look before dark mode:
@@ -434,6 +491,36 @@ class FingerprinterApp:
         # (see _download_parallel)
         self._downloaded_ok: list[dict] = []
         self._retry_later = 0
+        # This link's download failures by reason, for advice once per link
+        # (_advise_on_failures); failures in a row that suggest the site is
+        # refusing everything (_note_download_result); and the files audfprint
+        # could not read (_audfprint_process).
+        self._fail_reasons: dict[str | None, int] = {}
+        self._fail_streak = 0
+        self._fp_unreadable: list[str] = []
+        # What the running link is doing: "listing", "download", "split" or
+        # "fingerprint". Skip link acts on it (_skip_current).
+        self._stage = ""
+        # A pause the program made itself after downloads kept failing, the
+        # timer that resumes it, and how long the next one waits (_auto_pause).
+        self._auto_pause_after: str | None = None
+        self._auto_pause_wait = 0
+        # Removed links, for Undo (_remember_removal), and the timer that
+        # hides the Undo link again.
+        self._undo: list[list[tuple]] = []
+        self._undo_after: str | None = None
+        # A config save waiting to happen after ticks change (_schedule_save).
+        self._save_after: str | None = None
+        # The running list in the window title, "Link 2/5" (_apply_progress).
+        self._title_prefix = ""
+        # Settings, General, When a job finishes: due once a job ran to its
+        # end, acted on when the buttons are back (_finish).
+        self._power_action_due = False
+        # The main window's size and place while not maximised (_note_geometry).
+        self._normal_geometry = ""
+        # When yt-dlp was last checked for a newer release at start
+        # (_update_ytdlp_at_start), as YYYY-MM-DD.
+        self._ytdlp_checked = ""
 
         self._build_ui()
         self._apply_config(load_config())
@@ -447,6 +534,11 @@ class FingerprinterApp:
         self.root.after(10_000, self._follow_windows_theme)
         self._poll_log_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Configure>", self._note_geometry, add="+")
+        # Ctrl+Z puts back the links removed last (_undo_removal), except in a
+        # box being typed in, where it means undo the typing.
+        for key in ("<Control-z>", "<Control-Z>"):
+            self.root.bind(key, self._on_ctrl_z)
         # Quick look for anything missing, so a first run offers to install it
         # instead of failing halfway through the first link. Started from the
         # event loop, and handed the folder rather than reading the Tk variable
@@ -474,6 +566,8 @@ class FingerprinterApp:
     # default stays moderate and the ceiling finite.
     DEFAULT_PARALLEL = 8
     MAX_PARALLEL = 32
+    # Characters the link box takes: a few dozen links pasted at once.
+    LINK_BOX_MAX = 5000
 
     # audfprint processes side by side, and when a batch is worth splitting
     # into parts (see _fingerprint_all).
@@ -553,8 +647,14 @@ class FingerprinterApp:
         status = ttk.Frame(self.root)
         status.pack(side="bottom", fill="x")
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(status, textvariable=self.status_var, anchor="w").pack(
-            side="left", fill="x", expand=True, padx=(8, 0), pady=3)
+        self.status_label = ttk.Label(status, textvariable=self.status_var, anchor="w")
+        self.status_label.pack(side="left", padx=(8, 0), pady=3)
+        # "Undo", shown for a while after links are removed (_show_undo).
+        self.undo_label = ttk.Label(status, text="Undo", cursor="hand2", foreground=self.QLINK_FG,
+                                    font=self._link_font)
+        self._themed_labels.append((self.undo_label, "link"))
+        self.undo_label.bind("<Button-1>", lambda _e: self._undo_removal())
+        Tooltip(self.undo_label, "Put the removed links back where they were (Ctrl+Z).")
         self.keep_label = ttk.Label(status, cursor="hand2", foreground=self.QLINK_FG)
         self._themed_labels.append((self.keep_label, "link"))
         self.keep_label.pack(side="right", padx=8, pady=3)
@@ -598,21 +698,23 @@ class FingerprinterApp:
         bar.pack(side="top", fill="x", padx=8, pady=(8, 4))
         ttk.Label(bar, text="Link:").pack(side="left", padx=(0, 6))
         self.url_var = tk.StringVar()
-        # Cap input at 200 chars. Pasting tens of thousands of characters
-        # froze the GUI on the main thread; legitimate URLs (even with
-        # playlist + tracking params) stay well under this limit.
-        url_validator = self.root.register(lambda s: len(s) <= 200)
+        # Input is capped. Pasting tens of thousands of characters froze the
+        # GUI on the main thread; a few dozen links pasted at once fit, and
+        # a longer list is what Import is for. A paste over the cap is refused
+        # with a word about why rather than silently (_link_box_too_long).
+        url_validator = self.root.register(lambda s: len(s) <= self.LINK_BOX_MAX)
+        too_long = self.root.register(self._link_box_too_long)
         self.url_combo = ttk.Combobox(
             bar, textvariable=self.url_var, values=load_recent_urls(),
-            validate="key", validatecommand=(url_validator, "%P"),
+            validate="key", validatecommand=(url_validator, "%P"), invalidcommand=(too_long,),
         )
         self.url_combo.pack(side="left", fill="x", expand=True, padx=(0, 6))
         # Enter in the link box adds to the list too, whenever Add could.
         self.url_combo.bind("<Return>", lambda _e: self.add_queue_btn.invoke())
         Tooltip(self.url_combo,
                 "A channel, playlist or single page from YouTube, Archive.org, "
-                "Mixcloud, SoundCloud or any other site yt-dlp supports. "
-                "The arrow lists recent links.")
+                "Mixcloud, SoundCloud or any other site yt-dlp supports, or a YouTube "
+                "@handle. Paste several at once to add them all. The arrow lists recent links.")
         self.add_queue_btn = ttk.Button(bar, text="Add", width=8, command=self._add_to_queue,
                                         state="disabled")
         self.add_queue_btn.pack(side="left")
@@ -641,7 +743,10 @@ class FingerprinterApp:
         self.skip_btn = ttk.Button(bar, text="Skip link", command=self._skip_current,
                                    state="disabled")
         self.skip_btn.pack(side="left", padx=(6, 0))
-        Tooltip(self.skip_btn, "Move on to the next link once the current stage finishes.")
+        Tooltip(self.skip_btn,
+                "Move on to the next link. Listing and downloads stop at once; a link "
+                "that is already being fingerprinted finishes first, so nothing is "
+                "fingerprinted twice.")
         self.cancel_btn = ttk.Button(bar, text="Stop", width=8, command=self._cancel,
                                      state="disabled")
         self.cancel_btn.pack(side="left", padx=(6, 0))
@@ -705,6 +810,12 @@ class FingerprinterApp:
         self.tick_all_btn = ttk.Button(head, text="Tick all", style="Toolbutton",
                                        command=self._tick_all)
         self.tick_all_btn.pack(side="right")
+        # Shown once some link did not finish its last run (_update_list_header).
+        self.tick_unfinished_btn = ttk.Button(head, text="Tick unfinished", style="Toolbutton",
+                                              command=self._tick_unfinished)
+        Tooltip(self.tick_unfinished_btn,
+                "Tick only the links whose last run did not finish (incomplete, failed, "
+                "skipped or stopped) and those not run yet, to run them again.")
 
         # Rows of widgets in a canvas (see _build_queue_row): a Listbox cannot
         # hold tick boxes. White and outlined, like a list box.
@@ -738,6 +849,10 @@ class FingerprinterApp:
         # How many entries each link has: url -> {"n", "single", "date"},
         # saved with the list. _count_state holds counts in progress or failed.
         self.queue_counts: dict[str, dict] = {}
+        # How each link's last run ended: url -> {"status", "time"}, saved with
+        # the list and shown as a mark on its row; and the link running now.
+        self.queue_results: dict[str, dict] = {}
+        self._running_url: str | None = None
         self._count_state: dict[str, dict] = {}
         self._count_queue: queue.Queue[str] = queue.Queue()
         self._count_pending: set[str] = set()
@@ -871,6 +986,7 @@ class FingerprinterApp:
         self.confirm_stop_var = tk.BooleanVar(value=True)
         self.offer_resume_var = tk.BooleanVar(value=True)
         self.remove_finished_var = tk.BooleanVar(value=False)
+        self.auto_update_ytdlp_var = tk.BooleanVar(value=True)
         for var, label, explanation in (
             (self.keep_awake_var, "Keep the PC awake while a job runs",
              "Windows does not go to sleep until the job has finished. The screen can "
@@ -887,9 +1003,30 @@ class FingerprinterApp:
              "fingerprinted. Links that failed, were skipped or stopped, or where some "
              "downloads or batches failed in a way that may work next time, stay, so you "
              "can run them again."),
+            (self.auto_update_ytdlp_var, "Keep yt-dlp up to date",
+             "Once a day, when the program starts, it looks for a newer yt-dlp and installs "
+             "it. Sites change often, and an old yt-dlp is the commonest reason downloads "
+             "fail."),
         ):
             ttk.Checkbutton(tab, text=label, variable=var).pack(anchor="w", pady=1)
             self._help(tab, explanation, wrap=560).pack(anchor="w", padx=22, pady=(0, 6))
+
+        # Deliberately not saved: a Shut down chosen for one night and forgotten
+        # would otherwise switch the PC off after every job from then on.
+        row = ttk.Frame(tab)
+        row.pack(fill="x", pady=(2, 0))
+        ttk.Label(row, text="When a job finishes:").pack(side="left", padx=(0, 4))
+        self.when_done_var = tk.StringVar(value=WHEN_DONE_CHOICES[0])
+        self.when_done_combo = ttk.Combobox(row, textvariable=self.when_done_var,
+                                            values=WHEN_DONE_CHOICES, state="readonly", width=14)
+        self.when_done_combo.pack(side="left")
+        self._help(
+            tab,
+            "Sleep or Shut down happen once a list or Audio on disk has run to its end (not "
+            "after Stop), after a minute in which you can still say no. Back to Do nothing "
+            "each time the program starts.",
+            wrap=560,
+        ).pack(anchor="w", padx=4, pady=(1, 6))
 
         self.desktop_btn = ttk.Button(tab, text="Put a shortcut on the desktop",
                                       command=self._make_desktop_shortcut)
@@ -1033,8 +1170,10 @@ class FingerprinterApp:
             "while a job is running.",
             wrap=560,
         ).pack(anchor="w", padx=22, pady=(0, 6))
+        # Once per list, not per link: each link's folder is deleted when it
+        # is done, and a window per link took focus all through a long run.
         self.open_folder_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tab, text="Open the audio folder when a link starts",
+        ttk.Checkbutton(tab, text="Open the working folder when a list starts",
                         variable=self.open_folder_var).pack(anchor="w", pady=1)
 
         # ---- Fingerprinting ----
@@ -1234,7 +1373,7 @@ class FingerprinterApp:
             label.configure(foreground=p[role])
         Tooltip.colours = {"bg": p["tip_bg"], "fg": p["tip_fg"]}
         self.disk_menu.configure(**self._menu_colours())
-        for combo in (self.url_combo, self.cookies_combo, self.theme_combo):
+        for combo in (self.url_combo, self.cookies_combo, self.theme_combo, self.when_done_combo):
             self._style_combo_popdown(combo, p)
         # The rows are rebuilt in the new colours, keeping what they show.
         self._refresh_queue()
@@ -1575,6 +1714,13 @@ class FingerprinterApp:
 
     def _apply_progress(self, text: str, pct: float | None) -> None:
         self.now_detail_var.set(text)
+        # The window title too, which the taskbar shows while the window is
+        # minimised: "Link 2/5 · Downloading 42% - Fingerprinter".
+        stage = self._progress_stage[0] if self._progress_stage else ""
+        stage = stage.split(":")[0]
+        if self._title_prefix and stage:
+            done = f" {int(pct)}%" if pct is not None else ""
+            self.root.title(f"{self._title_prefix} · {stage}{done} - Fingerprinter")
         if pct is None:
             if str(self.now_bar.cget("mode")) != "indeterminate":
                 self.now_bar.configure(mode="indeterminate")
@@ -1588,6 +1734,7 @@ class FingerprinterApp:
     def _reset_progress(self) -> None:
         """UI thread, when a job ends: back to an idle Now panel."""
         self._progress_stage = None
+        self.root.title(f"Fingerprinter {__version__}")
         self.now_title_var.set("Now")
         self.now_detail_var.set("Idle")
         self.now_bar.stop()
@@ -1770,6 +1917,7 @@ class FingerprinterApp:
         ("remove_finished_var", "remove_finished", bool),
         ("fp_record_var", "write_fingerprinted_json", bool),
         ("console_follow_var", "console_follow", bool),
+        ("auto_update_ytdlp_var", "auto_update_ytdlp", bool),
     )
 
     def _apply_config(self, cfg: dict) -> None:
@@ -1804,11 +1952,15 @@ class FingerprinterApp:
                 setattr(self, attr, conv(cfg.get(key) or 0))
             except (TypeError, ValueError):
                 setattr(self, attr, conv(0))
+        self._ytdlp_checked = str(cfg.get("ytdlp_checked") or "")
+        self._restore_window(cfg.get("window"))
         # Restore the saved channel queue (crash recovery / persistence).
         saved_queue = cfg.get("queue")
         if isinstance(saved_queue, list):
             self.queue_urls = [str(u) for u in saved_queue if u]
-            self.queue_checks = [self._new_check() for _ in self.queue_urls]
+            unticked = cfg.get("queue_unticked")
+            unticked = set(unticked) if isinstance(unticked, list) else set()
+            self.queue_checks = [self._new_check(u not in unticked) for u in self.queue_urls]
             self.queue_active = None
             counts = cfg.get("queue_counts")
             if isinstance(counts, dict):
@@ -1816,6 +1968,13 @@ class FingerprinterApp:
                     u: c for u, c in counts.items()
                     if u in self.queue_urls and isinstance(c, dict)
                     and isinstance(c.get("n"), int)
+                }
+            results = cfg.get("queue_results")
+            if isinstance(results, dict):
+                self.queue_results = {
+                    u: r for u, r in results.items()
+                    if u in self.queue_urls and isinstance(r, dict)
+                    and r.get("status") in self.RESULT_MARKS
                 }
             self._refresh_queue()
 
@@ -1877,12 +2036,102 @@ class FingerprinterApp:
         # Persist the queue so it survives restarts.
         out["config_version"] = CONFIG_VERSION
         out["queue"] = list(self.queue_urls)
+        out["queue_unticked"] = [u for u, v in zip(self.queue_urls, self.queue_checks) if not v.get()]
         out["queue_counts"] = {u: c for u, c in self.queue_counts.items() if u in self.queue_urls}
+        out["queue_results"] = {u: r for u, r in self.queue_results.items() if u in self.queue_urls}
         console, share = self._console_height(), self._list_share()
         if console > 0 and share > 0:
             out["console_height"] = console
             out["list_share"] = share
+        window = self._window_config()
+        if window:
+            out["window"] = window
+        if self._ytdlp_checked:
+            out["ytdlp_checked"] = self._ytdlp_checked
         return out
+
+    # ---- the window's size and place, kept between sessions ------------------
+
+    def _note_geometry(self, event: tk.Event) -> None:
+        """Remember the size and place while the window is neither maximised
+        nor minimised: a maximised window reports the screen's size, which is
+        not where it goes back to."""
+        if event.widget is self.root:
+            try:
+                state = self.root.state()
+                if state == "normal":
+                    self._normal_geometry = self.root.geometry()
+                if state in ("normal", "zoomed"):
+                    self._window_state = state
+            except tk.TclError:
+                pass
+
+    def _window_config(self) -> dict:
+        """What config.json keeps of the window: its size and place when not
+        maximised, and whether it was maximised. Minimised (a long run watched
+        from the taskbar), it is the state before that."""
+        try:
+            state = self.root.state()
+            if state not in ("normal", "zoomed"):
+                state = getattr(self, "_window_state", "normal")
+            geometry = self._normal_geometry or (self.root.geometry() if state == "normal" else "")
+        except tk.TclError:
+            return {}
+        # Maximised all session long, there is no other size to keep: it
+        # opens maximised again, at the size worked out from the screen.
+        if not geometry and state != "zoomed":
+            return {}
+        return {"geometry": geometry, "maximised": state == "zoomed"}
+
+    def _restore_window(self, saved: object) -> None:
+        """Put the window back as it was last time, if that place is still on
+        a screen (a second monitor may have gone since); otherwise it keeps
+        the size worked out from the screen."""
+        if not isinstance(saved, dict):
+            return
+        m = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", str(saved.get("geometry") or ""))
+        area = self._screen_area(int(m[3]) + 60, int(m[4]) + 12) if m else None
+        if m and area:
+            w, h, x, y = (int(g) for g in m.groups())
+            # A screen smaller than last time (a laptop undocked): the window
+            # is made to fit it, leaving room for the frame and title bar,
+            # and moved back onto it.
+            left, top, right, bottom = area
+            w, h = min(w, right - left - 16), min(h, bottom - top - 40)
+            x, y = max(left, min(x, right - w - 16)), max(top, min(y, bottom - h - 40))
+            if w >= 900 and h >= 600:
+                self._normal_geometry = f"{w}x{h}+{x}+{y}"
+                self.root.geometry(self._normal_geometry)
+        if saved.get("maximised") is True:
+            self.root.after(0, lambda: self.root.state("zoomed"))
+
+    @staticmethod
+    def _screen_area(x: int, y: int) -> tuple[int, int, int, int] | None:
+        """The work area (left, top, right, bottom; without the taskbar) of the
+        monitor the point is on, or None when no monitor there is now."""
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            user32.MonitorFromPoint.restype = wintypes.HMONITOR
+            monitor_default_to_null = 0
+            monitor = user32.MonitorFromPoint(wintypes.POINT(x, y), monitor_default_to_null)
+            if not monitor:
+                return None
+            info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+            if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                return None
+            r = info.rcWork
+            return r.left, r.top, r.right, r.bottom
+        except Exception:  # noqa: BLE001 - when unsure, keep the default size
+            return None
 
     def _on_close(self) -> None:
         """Persist settings, then exit. Confirm first if a worker is running."""
@@ -2070,6 +2319,7 @@ class FingerprinterApp:
         known = sum(1 for d in durations if d > 0)
 
         # Audio at ~128 kbps = 16 KB/s ≈ ~1 MB/min.
+        self._estimate_bytes = 0.0     # for the free space check (_check_free_space)
         if total_dur > 0:
             est_bytes = total_dur * 16_000
             # Scale up if some entries had unknown duration (use known average)
@@ -2077,6 +2327,7 @@ class FingerprinterApp:
                 avg = total_dur / known
                 est_bytes += (n - known) * avg * 16_000
             size_str = f"~{fmt_size(est_bytes)}"
+            self._estimate_bytes = est_bytes
         else:
             size_str = "unknown"
 
@@ -2096,6 +2347,43 @@ class FingerprinterApp:
             f"Start the download?"
         )
         return self._ask_yes_no("Confirm download", msg)
+
+    def _check_free_space(self, folder: Path) -> None:
+        """Before downloading: warn when the estimate (_confirm_estimate) is
+        more than the drive has free. A warning only, as the estimate is rough;
+        if the disk does fill up, the downloads pause (_note_download_result)."""
+        need = getattr(self, "_estimate_bytes", 0.0)
+        if not need:
+            return
+        try:
+            free = shutil.disk_usage(folder).free
+        except OSError:
+            return
+        if free < need:
+            self._log(f"[!] These downloads need about {fmt_size(need)}, but only {fmt_size(free)} "
+                      f"is free on the drive of {folder}. If the disk fills up, the run pauses "
+                      f"until there is room.", tag="warning")
+
+    # What to do about the failures that have one fix for them all: said once
+    # per link, after its downloads (_advise_on_failures).
+    FAILURE_ADVICE = {
+        "YouTube bot check": "YouTube asked to confirm you are not a bot. Choose your browser under "
+                             "Sign in with cookies from (Settings, Downloads), lower Downloads at "
+                             "once, or try again later.",
+        "yt-dlp may be out of date": "These failures usually mean yt-dlp is out of date. Once this "
+                                     "job has finished, press Check setup to update it, then run "
+                                     "the link again.",
+        "HTTP 429 rate-limited": "The site is limiting how fast you download (HTTP 429). Lower "
+                                 "Downloads at once, or try again later.",
+        "disk full": "The disk is full. Free some space, then run the link again.",
+    }
+
+    def _advise_on_failures(self) -> None:
+        """After a link's downloads: one line of advice per kind of failure
+        that has one, rather than leaving it to be read from each item."""
+        for reason, n in self._fail_reasons.items():
+            if reason in self.FAILURE_ADVICE:
+                self._log(f"[!] {n} download(s) failed: {self.FAILURE_ADVICE[reason]}", tag="warning")
 
     def _select_subset(self, entries: list[dict]) -> list[dict] | None:
         """Show a checklist of video titles and return the subset the user kept.
@@ -2296,10 +2584,43 @@ class FingerprinterApp:
         if not raw:
             return args
         try:
-            return args + shlex.split(raw, posix=False)
+            return args + self._split_options(raw)
         except ValueError as e:
             self._log(f"[!] Could not parse 'Extra download options': {e}. Ignoring them.")
             return args
+
+    @staticmethod
+    def _split_options(raw: str) -> list[str]:
+        """Split Extra download options as a command line would: spaces part
+        options, quotes group words and are taken off ("C:\\My folder\\c.txt",
+        --opt="a b"), and backslashes stay as they are, for Windows paths.
+        shlex.split(posix=False), used before, kept the quotes, so a quoted
+        path reached yt-dlp with its quotes as part of it."""
+        tokens: list[str] = []
+        current: list[str] = []
+        quote: str | None = None
+        started = False
+        for ch in raw:
+            if quote:
+                if ch == quote:
+                    quote = None
+                else:
+                    current.append(ch)
+            elif ch in "\"'" and (not current or current[-1] == "="):
+                # A quote opens a group only where a word starts, or after
+                # --opt=. Inside a word it is a letter: C:\Users\O'Brien.
+                quote, started = ch, True
+            elif ch.isspace():
+                if current or started:
+                    tokens.append("".join(current))
+                current, started = [], False
+            else:
+                current.append(ch)
+        if quote:
+            raise ValueError("a quote is not closed")
+        if current or started:
+            tokens.append("".join(current))
+        return tokens
 
     # ---- what to leave out (Settings, Downloads) ----------------------------
 
@@ -2348,12 +2669,39 @@ class FingerprinterApp:
                           f"fingerprinted in an earlier run.")
         return kept
 
+    def _items_fingerprinted(self, entries: list[dict], unreadable: list[str]) -> list[dict]:
+        """The downloaded items that made it into the fingerprints: those
+        whose files audfprint could read. A file is traced to its item by the
+        item's ID in its name, as the default file name has it. When a file
+        cannot be traced, no item is remembered: better to download a link's
+        items again than to mark one done that is not in any .pklz."""
+        if not unreadable:
+            return entries
+        names = [os.path.basename(path) for path in unreadable]
+        left: list[dict] = []
+        traced = set()
+        for entry in entries:
+            item_id = str(entry.get("id") or "")
+            hits = [n for n in names if item_id and (f"[{item_id}]" in n or
+                                                     (len(item_id) >= 8 and item_id in n))]
+            if hits:
+                traced.update(hits)
+            else:
+                left.append(entry)
+        if len(traced) < len(set(names)):
+            self._log("[!] Could not tell which items the unreadable files belong to, so none of "
+                      "this link's items are remembered as fingerprinted; the next run downloads "
+                      "them again.", tag="warning")
+            return []
+        return left
+
     def _remember_done(self, entries: list[dict]) -> None:
         """Worker thread, after a link has been fingerprinted: add its items to
         the done list. Only then, so a link that fails part-way leaves nothing
         marked as done that is not in a .pklz."""
         keys = [k for k in map(self._archive_key, entries) if k]
-        new = [k for k in dict.fromkeys(keys) if k not in self._load_done()]
+        done = self._load_done()        # read once, not once per item
+        new = [k for k in dict.fromkeys(keys) if k not in done]
         if not new:
             return
         try:
@@ -2485,11 +2833,23 @@ class FingerprinterApp:
         self._paint_queue_rows()
         self._update_list_header()
 
-    def _new_check(self) -> tk.BooleanVar:
-        """A row's tick box, ticked, keeping the list's header count current."""
-        var = tk.BooleanVar(value=True)
-        var.trace_add("write", lambda *_a: self._update_list_header())
+    def _new_check(self, ticked: bool = True) -> tk.BooleanVar:
+        """A row's tick box, ticked by default, keeping the list's header count
+        current. Ticks are saved with the list (_schedule_save)."""
+        var = tk.BooleanVar(value=ticked)
+        var.trace_add("write", lambda *_a: (self._update_list_header(), self._schedule_save()))
         return var
+
+    def _schedule_save(self) -> None:
+        """Save the settings a moment from now, once for a burst of changes
+        (Tick all changes every row at once)."""
+        if self._save_after is not None:
+            self.root.after_cancel(self._save_after)
+
+        def save() -> None:
+            self._save_after = None
+            save_config(self._gather_config())
+        self._save_after = self.root.after(800, save)
 
     def _update_list_header(self) -> None:
         n = len(self.queue_urls)
@@ -2502,12 +2862,93 @@ class FingerprinterApp:
                 title += f", {ticked} ticked"
         self.list_title_var.set(title)
         self.tick_all_btn.configure(text="Untick all" if n and ticked == n else "Tick all")
+        # Tick unfinished, while some link's last run did not finish.
+        unfinished = any(self.queue_results.get(u, {}).get("status") not in (None, "done")
+                         for u in self.queue_urls if u != self._running_url)
+        if unfinished and not self.tick_unfinished_btn.winfo_manager():
+            self.tick_unfinished_btn.pack(side="right")
+        elif not unfinished and self.tick_unfinished_btn.winfo_manager():
+            self.tick_unfinished_btn.pack_forget()
 
     def _tick_all(self) -> None:
         """Tick every link, or untick them all when they already are."""
         value = not all(v.get() for v in self.queue_checks)
         for var in self.queue_checks:
             var.set(value)
+
+    def _tick_unfinished(self) -> None:
+        """Tick the links whose last run did not finish, and those not run yet;
+        untick the ones done. Then Download and fingerprint runs just those."""
+        for url, var in zip(self.queue_urls, self.queue_checks):
+            var.set(self.queue_results.get(url, {}).get("status") != "done")
+        n = sum(1 for v in self.queue_checks if v.get())
+        self.status_var.set(f"Ticked {n} link(s) that have not finished." if n else
+                            "Every link in the list finished its last run.")
+
+    # How a link's last run ended, as a mark on its row: (mark, colour, words).
+    RESULT_MARKS = {
+        "running": ("▶", "link", "Running now"),
+        "done": ("✓", "accent", "Done"),
+        "incomplete": ("◑", "orange", "Incomplete: some items could not be downloaded or "
+                                            "fingerprinted. Running it again fetches the rest"),
+        "failed": ("!", "warn", "Failed; the console says why"),
+        "skipped": ("»", "muted", "Skipped"),
+        "cancelled": ("■", "muted", "Stopped part-way"),
+    }
+
+    def _result_mark(self, url: str) -> tuple[str, str]:
+        """The mark on a link's row and its colour ("" if it has none)."""
+        status = "running" if url == self._running_url else self.queue_results.get(url, {}).get("status")
+        if status not in self.RESULT_MARKS:
+            return "", self.QMUTED_FG
+        mark, role, _ = self.RESULT_MARKS[status]
+        p = PALETTES[getattr(self, "_theme_now", "light")]
+        return mark, (p["tags"]["bat"] if role == "orange" else p[role])
+
+    def _result_tip(self, url: str) -> str:
+        if url == self._running_url:
+            return self.RESULT_MARKS["running"][2] + "."
+        result = self.queue_results.get(url) or {}
+        if result.get("status") not in self.RESULT_MARKS:
+            return ""
+        when = f" (last run {result['time']})" if result.get("time") else ""
+        return f"{self.RESULT_MARKS[result['status']][2]}{when}."
+
+    def _set_link_result(self, url: str, status: str | None) -> None:
+        """UI thread: a link starts ("running") or ends with `status`."""
+        if status == "running":
+            self._running_url = url
+            # Until it ends, it counts as stopped part-way: if the program is
+            # closed or crashes meanwhile, that is what the list keeps, not
+            # the "done" of an earlier run.
+            self.queue_results[url] = {"status": "cancelled", "time": time.strftime("%Y-%m-%d %H:%M")}
+            self._schedule_save()
+        else:
+            if self._running_url == url:
+                self._running_url = None
+            if status in self.RESULT_MARKS:
+                self.queue_results[url] = {"status": status, "time": time.strftime("%Y-%m-%d %H:%M")}
+        for i, row in enumerate(self.queue_rows):
+            if row["url"] == url:
+                mark, colour = self._result_mark(url)
+                row["mark"].config(text=mark, fg=colour)
+                if status == "running":
+                    self._scroll_to_row(i)
+        self._update_list_header()
+        if status != "running":
+            self._schedule_save()
+
+    def _scroll_to_row(self, i: int) -> None:
+        """Scroll the list so that row i is in view, if it is not already."""
+        if not 0 <= i < len(self.queue_rows):
+            return
+        self.queue_rows_frame.update_idletasks()
+        frame = self.queue_rows[i]["frame"]
+        total = max(1, self.queue_rows_frame.winfo_height())
+        first, last = self.queue_canvas.yview()
+        top, bottom = frame.winfo_y(), frame.winfo_y() + frame.winfo_height()
+        if top < first * total or bottom > last * total:
+            self.queue_canvas.yview_moveto(max(0.0, (top - (last - first) * total / 3) / total))
 
     def _build_queue_row(self, url: str, var: tk.BooleanVar) -> dict:
         bg = self.QROW_BG
@@ -2522,6 +2963,10 @@ class FingerprinterApp:
         check.pack(side="left")
         num = tk.Label(frame, bg=bg, fg=self.QFG, width=3, anchor="e")
         num.pack(side="left")
+        # How the link's last run ended, or that it is running (RESULT_MARKS).
+        text, colour = self._result_mark(url)
+        mark = tk.Label(frame, text=text, bg=bg, fg=colour, width=2)
+        mark.pack(side="left")
         # Packed from the right before the link, so a long link is cut short
         # rather than pushing them out of view.
         remove = tk.Label(frame, text="\u2715", bg=bg, fg=self.QMUTED_FG,
@@ -2534,14 +2979,15 @@ class FingerprinterApp:
         link.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         row = {"url": url, "frame": frame, "handle": handle, "check": check,
-               "num": num, "count": count, "link": link, "remove": remove}
-        for widget, kind in ((frame, "row"), (handle, "row"), (num, "row"),
+               "num": num, "mark": mark, "count": count, "link": link, "remove": remove}
+        for widget, kind in ((frame, "row"), (handle, "row"), (num, "row"), (mark, "row"),
                              (count, "row"), (link, "link")):
             widget.bind("<ButtonPress-1>", lambda e, r=row, k=kind: self._queue_press(e, r, k))
             widget.bind("<B1-Motion>", self._queue_motion)
             widget.bind("<ButtonRelease-1>", self._queue_release)
-        for widget in (frame, handle, check, num, count, link, remove):
+        for widget in (frame, handle, check, num, mark, count, link, remove):
             widget.bind("<Button-3>", lambda e, r=row: self._queue_menu(e, r))
+        Tooltip(mark, lambda: self._result_tip(url))
         remove.bind("<Button-1>", lambda _e, r=row: self._queue_remove_row(r))
         remove.bind("<Enter>", lambda e: e.widget.config(
             fg=self.QREMOVE_HOVER_FG if self._queue_editable else self.QMUTED_FG))
@@ -2557,7 +3003,7 @@ class FingerprinterApp:
         for i, row in enumerate(self.queue_rows):
             row["num"].config(text=f"{i + 1}.")
             bg = self.QROW_SELECTED if i == self.queue_active else self.QROW_BG
-            for key in ("frame", "handle", "check", "num", "count", "link", "remove"):
+            for key in ("frame", "handle", "check", "num", "mark", "count", "link", "remove"):
                 row[key].config(bg=bg)
             row["check"].config(activebackground=bg)
 
@@ -2653,7 +3099,9 @@ class FingerprinterApp:
     def _queue_remove_row(self, row: dict) -> None:
         if not self._queue_editable or row not in self.queue_rows:
             return
-        self._drop_from_queue(self.queue_rows.index(row))
+        i = self.queue_rows.index(row)
+        self._remember_removal([i])
+        self._drop_from_queue(i)
 
     def _drop_from_queue(self, i: int) -> None:
         del self.queue_urls[i]
@@ -2674,6 +3122,81 @@ class FingerprinterApp:
         if url in self.queue_urls:
             self._drop_from_queue(self.queue_urls.index(url))
             self._log(f"[+] Took it off the list, as it is fingerprinted: {url}")
+
+    # ---- Undo for links removed by hand ----------------------------------------
+
+    UNDO_SHOWN_MS = 20_000
+    TYPING_CLASSES = ("Entry", "TEntry", "TCombobox", "Text", "Spinbox", "TSpinbox")
+
+    def _on_ctrl_z(self, event: tk.Event) -> str | None:
+        """Ctrl+Z: Undo for removed links, but not in a box being typed in,
+        where it means undo the typing (and could otherwise bring back links
+        removed long ago)."""
+        try:
+            if event.widget.winfo_class() in self.TYPING_CLASSES:
+                return None
+        except (AttributeError, tk.TclError):
+            pass
+        return self._undo_removal()
+
+    def _remember_removal(self, indexes: list[int]) -> None:
+        """Before rows are removed by hand: note each one's place, tick, count
+        and last result, so Undo (the status bar, or Ctrl+Z) can put them back."""
+        removed = []
+        for i in sorted(indexes):
+            url = self.queue_urls[i]
+            removed.append((i, url, bool(self.queue_checks[i].get()),
+                            self.queue_counts.get(url), self.queue_results.get(url)))
+        if not removed:
+            return
+        self._undo.append(removed)
+        del self._undo[:-20]
+        n = len(removed)
+        self.status_var.set(f"Removed {n} link{'' if n == 1 else 's'} from the list.")
+        self.undo_label.pack(side="left", padx=(6, 0), after=self.status_label)
+        if self._undo_after is not None:
+            self.root.after_cancel(self._undo_after)
+        self._undo_after = self.root.after(self.UNDO_SHOWN_MS, self._hide_undo, True)
+
+    def _hide_undo(self, from_timer: bool = False) -> None:
+        """Hide the Undo link. Ctrl+Z still works while there is something to undo."""
+        if self._undo_after is not None and not from_timer:
+            self.root.after_cancel(self._undo_after)
+        self._undo_after = None
+        self.undo_label.pack_forget()
+
+    def _undo_removal(self) -> str:
+        """Put back the links removed last, each where it was. A link added
+        again in the meantime is not added twice."""
+        if not self._undo:
+            return "break"
+        if not self._queue_editable:
+            self.status_var.set("Undo works once the job has finished.")
+            return "break"
+        removed = self._undo.pop()
+        present = {link_key(u) for u in self.queue_urls}
+        back = 0
+        # In ascending order of place, so each goes back to where it was.
+        for i, url, ticked, count, result in removed:
+            if link_key(url) in present:
+                continue
+            i = min(i, len(self.queue_urls))
+            self.queue_urls.insert(i, url)
+            self.queue_checks.insert(i, self._new_check(ticked))
+            if count:
+                self.queue_counts[url] = count
+            if result:
+                self.queue_results[url] = result
+            present.add(link_key(url))
+            back += 1
+        self.queue_active = None
+        self._refresh_queue()
+        save_config(self._gather_config())
+        self.status_var.set(f"Put {back} link{'' if back == 1 else 's'} back in the list."
+                            if back else "Those links are in the list again already.")
+        if not self._undo:
+            self._hide_undo()
+        return "break"
 
     # ---- how many entries each link has --------------------------------------
     #
@@ -2749,8 +3272,10 @@ class FingerprinterApp:
         state = {"status": "counting", "n": 0}
         self._count_state[url] = state
         self.root.after(0, self._update_count_label, url)
+        # JSON (j), so a line break in a playlist's title cannot count as an
+        # entry of its own; a missing title still prints as NA.
         cmd = [*self.ytdlp, *YTDLP_UTF8, "--js-runtimes", "node", "--flat-playlist", "--no-warnings",
-               "--print", "%(playlist_title)s", *self._extra_args(), url]
+               "--print", "%(playlist_title)j", *self._extra_args(), url]
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
@@ -2781,12 +3306,14 @@ class FingerprinterApp:
                     self._count_procs.remove(proc)
         if self._closing:
             return
-        if state["n"] == 0:
+        if state["n"] == 0 or proc.returncode != 0:
+            # Nothing, or a listing that stopped part-way (a 429 on page 30):
+            # the last good count stays rather than a short one.
             state["status"] = "failed"
             self.root.after(0, self._update_count_label, url)
         else:
             # A single video has no playlist, which yt-dlp prints as NA.
-            single = state["n"] == 1 and first in ("NA", "")
+            single = state["n"] == 1 and first in ("NA", "", "null", '""')
             self.root.after(0, self._record_count, url, state["n"], single)
 
     def _record_count(self, url: str, n: int, single: bool) -> None:
@@ -2806,46 +3333,124 @@ class FingerprinterApp:
         for proc in running:
             self._kill_tree(proc)
 
+    def _link_box_too_long(self) -> None:
+        """A paste the link box refused as too long (LINK_BOX_MAX): say so,
+        rather than seeming to ignore it. After the validation has returned,
+        as Tk turns validation off if its callbacks do more."""
+        self.root.bell()
+        self.root.after(0, lambda: messagebox.showinfo(
+            "Too much for the link box",
+            "That is too long to paste into the link box. For a long list of links, "
+            "put them in a text file, one per line, and use Import.",
+            parent=self.root))
+
+    # Where pasted text splits into links: spaces and line breaks, and a comma
+    # or semicolon when a link or @handle follows (a comma inside a link stays).
+    _LINK_SPLIT_RE = re.compile(
+        r"\s+|[,;](?=\s*(?:https?://|@|UC[A-Za-z0-9_-]{22}|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}[/?#]))")
+
     def _add_to_queue(self) -> None:
-        url = self.url_var.get().strip()
-        if not url:
+        """Add what is in the link box: one link, or several pasted at once
+        (one per line, or separated by spaces, commas or semicolons), in any
+        form Import takes: links, links without https://, @handles and
+        channel IDs. A link already in the list, however it is written, is
+        not added again: its row is shown instead."""
+        text = self.url_var.get().strip()
+        if not text:
             return
-        if not url.startswith(("http://", "https://", "www.")):
+        added: list[str] = []
+        invalid: list[str] = []
+        dupes: list[int] = []            # rows of links already in the list
+        keys = {link_key(u): i for i, u in enumerate(self.queue_urls)}
+        handles = {youtube_handle(u): i for i, u in enumerate(self.queue_urls)}
+        same_channel: list[tuple[str, int]] = []
+        for token in self._LINK_SPLIT_RE.split(text):
+            if not token:
+                continue
+            url = self._normalize_queue_entry(token)
+            if url is None:
+                invalid.append(token)
+                continue
+            key = link_key(url)
+            if key in keys:
+                dupes.append(keys[key])
+                continue
+            handle = youtube_handle(url)
+            if handle and handles.get(handle) is not None:
+                same_channel.append((url, handles[handle]))
+            keys[key] = len(self.queue_urls)
+            handles.setdefault(handle, len(self.queue_urls))
+            self.queue_urls.append(url)
+            self.queue_checks.append(self._new_check())  # ticked by default
+            self.queue_results.pop(url, None)
+            added.append(url)
+
+        if not added and not dupes:
             messagebox.showerror(
                 "Invalid link",
                 "That doesn't look like a link.\n\n"
-                "Paste a URL starting with http:// or https://.",
+                "Paste a link starting with https://, or a YouTube @handle. Several at "
+                "once work too, one per line.",
+                parent=self.root,
             )
             return
-        if url in self.queue_urls:
-            self._log(f"[!] Already in the list: {url}")
-            return
-        self.queue_urls.append(url)
-        self.queue_checks.append(self._new_check())  # ticked by default
-        self._refresh_queue(active_index=len(self.queue_urls) - 1)
-        self._request_counts([url])
-        # Remember this URL for the dropdown's recent list, and refresh it.
-        recent = save_recent_url(url)
-        self.url_combo.configure(values=recent)
-        self.url_var.set("")  # clear the field for the next paste
-        save_config(self._gather_config())
+        if added:
+            self._refresh_queue(active_index=len(self.queue_urls) - 1)
+            self._request_counts(added)
+            # The recent list of the link box's drop-down, newest first.
+            for url in added:
+                recent = save_recent_url(url)
+            self.url_combo.configure(values=recent)
+            save_config(self._gather_config())
+            self._scroll_to_row(len(self.queue_urls) - 1)
+        else:
+            # Only links already there: show the row, so it is clear why
+            # nothing was added.
+            self.queue_active = dupes[-1]
+            self._paint_queue_rows()
+            self._scroll_to_row(dupes[-1])
+        # What could not be read stays in the box, to correct.
+        self.url_var.set(" ".join(invalid))
+
+        said = []
+        if added:
+            said.append(f"Added {len(added)} link{'' if len(added) == 1 else 's'}")
+        if dupes:
+            rows = ", ".join(str(i + 1) for i in sorted(set(dupes)))
+            said.append(("Already in the list" if not added else "already in the list")
+                        + f" (row {rows})")
+        if invalid:
+            said.append(f"not a link: {', '.join(invalid)[:80]}")
+        self.status_var.set("; ".join(said) + ".")
+        for i in sorted(set(dupes)):
+            self._log(f"[!] Already in the list, row {i + 1}: {self.queue_urls[i]}")
+        for url, i in same_channel:
+            self._log(f"[!] {url} is the same YouTube channel as row {i + 1} "
+                      f"({self.queue_urls[i]}); both are run.", tag="warning")
+        for token in invalid:
+            self._log(f"[!] Not a link, left in the link box: {token}", tag="warning")
 
     # Recognizes a bare YouTube channel ID, e.g. UCxN0K3hMnvgtsoz9NN0Iq_Q.
     _CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
     # Recognizes a bare @handle, e.g. @Muzarkive.
     _HANDLE_RE = re.compile(r"^@[A-Za-z0-9._-]{2,30}$")
+    # A link without its https://, such as youtube.com/@name or www.x.org/y.
+    _BARE_LINK_RE = re.compile(r"^(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:[/?#]|$)")
 
     @classmethod
     def _normalize_queue_entry(cls, token: str) -> str | None:
-        """Turn one imported token into a usable queue URL, or None if it's
-        not recognized. Accepts full http(s)/www URLs as-is, bare channel IDs
-        (UCxxxxxxxxxxxxxxxxxxxxxx -> .../channel/<id>), and bare @handles
-        (-> .../<handle>)."""
-        token = token.strip()
+        """Turn one pasted or imported token into a usable link, or None if
+        it is not recognized. Takes http(s) links, links without https://
+        (www.x.org/y, youtube.com/@name), bare channel IDs
+        (UCxxxxxxxxxxxxxxxxxxxxxx -> .../channel/<id>) and bare @handles
+        (-> .../<handle>). Tracking parameters (?si=...) are dropped."""
+        token = token.strip().strip("\"'<>")
         if not token or len(token) > 200:
             return None
-        if token.startswith(("http://", "https://", "www.")):
-            return token
+        if token.lower().startswith(("http://", "https://")):
+            return clean_link(token)
+        if cls._BARE_LINK_RE.match(token):
+            return clean_link("https://" + token)
         if cls._CHANNEL_ID_RE.match(token):
             return f"https://www.youtube.com/channel/{token}"
         if cls._HANDLE_RE.match(token):
@@ -2877,7 +3482,9 @@ class FingerprinterApp:
         added = 0
         dupes = 0
         invalid: list[str] = []
-        seen_this_import: set[str] = set()
+        new_urls: list[str] = []
+        # Duplicates however they are written (link_key), in the list or the file.
+        keys = {link_key(u) for u in self.queue_urls}
 
         for lineno, raw_line in enumerate(raw.splitlines(), start=1):
             line = raw_line.strip().strip("\"'")
@@ -2890,18 +3497,20 @@ class FingerprinterApp:
                 if url is None:
                     invalid.append(f"line {lineno}: {token!r}")
                     continue
-                if url in self.queue_urls or url in seen_this_import:
+                if link_key(url) in keys:
                     dupes += 1
                     continue
-                seen_this_import.add(url)
+                keys.add(link_key(url))
                 self.queue_urls.append(url)
                 self.queue_checks.append(self._new_check())
+                self.queue_results.pop(url, None)
+                new_urls.append(url)
                 added += 1
 
         if added:
             self._refresh_queue(active_index=len(self.queue_urls) - 1)
             save_config(self._gather_config())
-            self._request_counts([u for u in self.queue_urls if u in seen_this_import])
+            self._request_counts(new_urls)
 
         summary = f"[+] Imported {added} url(s) from {Path(path).name}"
         if dupes:
@@ -2917,13 +3526,26 @@ class FingerprinterApp:
             self._log("[!] File was empty; nothing imported.", tag="warning")
 
     def _queue_remove(self) -> None:
-        """Remove all checked entries. If none are checked, remove the active row."""
+        """Remove all checked entries. If none are checked, remove the active row.
+        Every link is ticked when added, so this asks first when it would empty
+        the list or take more than a few; Undo puts them back either way."""
         checked = [i for i, v in enumerate(self.queue_checks) if v.get()]
         if not checked:
             if self.queue_active is None:
                 self._log("[!] Nothing checked to remove. Tick a box or click a row first.")
                 return
             checked = [self.queue_active]
+        n = len(checked)
+        if (n == len(self.queue_urls) and n > 1) or n > 5:
+            every = "every link in the list" if n == len(self.queue_urls) else f"{n} links"
+            if not messagebox.askyesno(
+                "Remove ticked links?",
+                f"Remove {every}? {n} of {len(self.queue_urls)} are ticked.\n\n"
+                "Undo in the status bar, or Ctrl+Z, puts them back.",
+                parent=self.root,
+            ):
+                return
+        self._remember_removal(checked)
         # Delete from the end so indices stay valid.
         for i in sorted(checked, reverse=True):
             del self.queue_urls[i]
@@ -2947,8 +3569,10 @@ class FingerprinterApp:
     def _queue_clear(self) -> None:
         if not self.queue_urls:
             return
-        if not messagebox.askyesno("Clear the list", "Remove every link from the list?"):
+        if not messagebox.askyesno("Clear the list", "Remove every link from the list?\n\n"
+                                   "Undo in the status bar, or Ctrl+Z, puts them back."):
             return
+        self._remember_removal(list(range(len(self.queue_urls))))
         self.queue_urls.clear()
         self.queue_checks.clear()
         self.queue_active = None
@@ -2962,7 +3586,7 @@ class FingerprinterApp:
         state = "normal" if enabled else "disabled"
         for btn in (
             self.queue_import_btn, self.queue_remove_btn,
-            self.tick_all_btn, self.queue_clear_btn,
+            self.tick_all_btn, self.queue_clear_btn, self.tick_unfinished_btn,
         ):
             btn.config(state=state)
         self._update_add_btn()
@@ -3017,9 +3641,14 @@ class FingerprinterApp:
             return
         if not self._audfprint_ready(bat_dir) or self._folders_clash(bat_dir):
             return
+        if self._busy_elsewhere():
+            return
 
         self.cancel_flag.clear()
         self.skip_flag.clear()
+        self._power_action_due = False
+        self._auto_pause_wait = 0
+        self._fail_streak = 0
         self.start_btn.config(state="disabled")
         self.disk_btn.config(state="disabled")
         self.test_btn.config(state="disabled")
@@ -3088,6 +3717,11 @@ class FingerprinterApp:
             if resume:
                 self._log(f"[*] Continuing the unfinished list: {total} of "
                           f"{len(state['links'])} link(s) left.")
+            # Settings, Downloads: the working folder, once for the whole list.
+            # Each link's own folder is deleted when it is done, and a window
+            # per link took the focus all through a long run.
+            if self.open_folder_var.get():
+                self._open_folder(output_base)
             for i, url in enumerate(urls, start=1):
                 if self.cancel_flag.is_set():
                     # Mark the rest as not-run.
@@ -3096,11 +3730,19 @@ class FingerprinterApp:
                     break
 
                 self.skip_flag.clear()
+                self._stage = "listing"
                 self._log("=" * 60)
                 self._log(f"[*] LINK {i}/{total}: {url}")
                 self._log("=" * 60)
                 self._set_status(f"Link {i}/{total}: starting...")
-                self._set_now_title(f"Now · link {i} of {total}")
+                # Only ticked links run, so link 3 of 5 can be row 7 of the list.
+                try:
+                    row = self.queue_urls.index(url) + 1
+                except ValueError:
+                    row = i
+                self._set_now_title(f"Now · link {i} of {total}" + (f" (row {row})" if row != i else ""))
+                self._title_prefix = f"Link {i}/{total}"
+                self.root.after(0, self._set_link_result, url, "running")
 
                 state["current"] = url
                 if url == restart and discard:
@@ -3125,7 +3767,10 @@ class FingerprinterApp:
                 # over. That includes one that failed because Stop killed its
                 # work. A link the user declined (a question answered No) counts
                 # as finished, like a skipped one.
-                if not (self.cancel_flag.is_set() and status in ("cancelled", "failed")):
+                cut_by_stop = self.cancel_flag.is_set() and status in ("cancelled", "failed")
+                self.root.after(0, self._set_link_result, url,
+                                "cancelled" if cut_by_stop else status or "done")
+                if not cut_by_stop:
                     state["finished"][url] = status or "done"
                     state["current"] = None
                     state.pop("fingerprinting", None)
@@ -3147,9 +3792,15 @@ class FingerprinterApp:
                 if s != "done":
                     tag = "warning" if s in ("failed", "skipped", "incomplete") else None
                     self._log(f"    [{s}] {u}", tag=tag)
+            if any(s in ("failed", "skipped", "incomplete") for _, s in results):
+                self._log("    Tick unfinished, above the list, ticks just the links that did "
+                          "not finish, to run them again.")
             self._log("=" * 60)
             self._set_status(f"List done: {done}/{total} completed.")
             self.root.after(0, self._notify_done)
+            # Settings, General, When a job finishes: only after a list that
+            # ran to its end.
+            self._power_action_due = not self.cancel_flag.is_set()
 
             # Open the folder where pklz files ended up, once, at the very end
             # (per-channel opening was suppressed to avoid window spam). Honors
@@ -3199,18 +3850,25 @@ class FingerprinterApp:
             "this for audio that is already split; anything over "
             f"{SPLIT_TRIGGER // 60}:00 goes into the database whole.\n\n"
         )
-        if not messagebox.askyesno(
+        # The files are named here: without a link there is no channel to name
+        # them after, and every run used to come out as channel-1.pklz, ...
+        prefix = self._ask_disk_run(
             "Split and fingerprint existing audio?" if splitting
             else "Fingerprint existing audio?",
             f"Scan for audio under:\n{source_dir}\n\n"
             f"{split_line}"
             f"Then fingerprint it, and keep the results in:\n{self._keep_dir(Path(bat_dir))}\n\n"
-            f"Nothing is downloaded.\n\nContinue?",
-            parent=self.root,
-        ):
+            f"Nothing is downloaded.",
+            self._disk_run_name(Path(source_dir)),
+        )
+        if prefix is None or self._busy_elsewhere():
             return
 
         self.cancel_flag.clear()
+        # A Skip pressed in a list's last link would otherwise still be set,
+        # and stop the splitting before it had begun.
+        self.skip_flag.clear()
+        self._power_action_due = False
         self.start_btn.config(state="disabled")
         self.disk_btn.config(state="disabled")
         self.test_btn.config(state="disabled")
@@ -3224,10 +3882,69 @@ class FingerprinterApp:
         self._job_kind = "disk"
         self.worker_thread = threading.Thread(
             target=self._run_bats_only_pipeline,
-            args=(Path(bat_dir), splitting),
+            args=(Path(bat_dir), splitting, prefix),
             daemon=True,
         )
         self.worker_thread.start()
+
+    def _busy_elsewhere(self) -> bool:
+        """True, after saying so, if a job is already running. The buttons are
+        off during jobs, but a job can begin while a question before Start is
+        open: the daily yt-dlp update at start (_update_ytdlp_at_start)."""
+        if self.worker_thread is None or not self.worker_thread.is_alive():
+            return False
+        messagebox.showinfo("Busy", "Another job is running (the status bar says which). "
+                                    "Start this one when it has finished.", parent=self.root)
+        return True
+
+    def _ask_disk_run(self, title: str, message: str, name: str) -> str | None:
+        """Audio on disk's question before it starts, with the name its .pklz
+        files get (<name>-1.pklz, ...) to check or change. Returns the name,
+        made safe for file names, or None for Cancel."""
+        p = PALETTES[self._theme_now]
+        dlg = tk.Toplevel(self.root, bg=p["bg"])
+        dlg.title(title)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        dlg.bind("<Map>", self._on_map_title_bar, add="+")
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=message, justify="left", wraplength=520).pack(anchor="w")
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(12, 0))
+        ttk.Label(row, text="Name the fingerprint files:").pack(side="left", padx=(0, 6))
+        var = tk.StringVar(value=name)
+        entry = ttk.Entry(row, textvariable=var, width=32)
+        entry.pack(side="left")
+        example = ttk.Label(body, foreground=p["help"])
+        example.pack(anchor="w", pady=(3, 0))
+
+        def show_example(*_a: object) -> None:
+            example.config(text=f"They are saved as {self._pklz_name(var.get())}-1.pklz, "
+                                f"{self._pklz_name(var.get())}-2.pklz, ...")
+        var.trace_add("write", show_example)
+        show_example()
+
+        result: list[str | None] = [None]
+
+        def start() -> None:
+            result[0] = self._pklz_name(var.get())
+            dlg.destroy()
+        buttons = ttk.Frame(dlg, padding=(14, 0, 14, 14))
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(buttons, text="Start", command=start).pack(side="right", padx=(0, 6))
+        dlg.bind("<Return>", lambda _e: start())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        entry.focus_set()
+        entry.select_range(0, "end")
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return result[0]
 
     def _start_test_connection(self) -> None:
         """Run a battery of diagnostic checks: tools, versions, network."""
@@ -3451,8 +4168,9 @@ class FingerprinterApp:
         except Exception as e:  # noqa: BLE001
             self._log(f"[!] Could not check the setup: {e!r}")
             return
-        # Now that yt-dlp's whereabouts are known, bring the list's counts up to date.
         if any(s.key == "yt-dlp" and s.ok for s in statuses):
+            self._update_ytdlp_at_start()
+            # Now that yt-dlp's whereabouts are known, bring the list's counts up to date.
             self.root.after(0, self._request_counts)
         problems = [s for s in statuses if not s.ok]
         if not problems:
@@ -3471,6 +4189,43 @@ class FingerprinterApp:
         try:
             self._offer_install(statuses, bat_dir)
         finally:
+            self.root.after(0, self._finish)
+
+    def _update_ytdlp_at_start(self) -> None:
+        """Worker thread, at start: once a day, look for a newer yt-dlp and
+        install it (Settings, General, Keep yt-dlp up to date). Setup.bat and
+        Check setup did this before, and nothing did in between, while sites
+        change often. Held like a job, so no download starts while pip
+        replaces yt-dlp's files. Offline, it tries again at the next start."""
+        today = time.strftime("%Y-%m-%d")
+        if not self.auto_update_ytdlp_var.get() or self._ytdlp_checked == today:
+            return
+        try:
+            update = dependencies.ytdlp_update_available()
+        except OSError:
+            return
+        self._ytdlp_checked = today
+        if update is None:
+            return
+        installed, newest = update
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            return      # a job started meanwhile; tomorrow, or Check setup
+        self._job_kind = "setup"
+        self.worker_thread = threading.current_thread()
+        self.root.after(0, self._lock_for_job)
+        try:
+            self._set_status("Updating yt-dlp...")
+            self._log(f"[*] yt-dlp {newest} is out (this PC has {installed or 'none'}); updating it.")
+            if dependencies.update_ytdlp(lambda line: self._log("    " + line.strip())):
+                self._refresh_ytdlp()
+            else:
+                self._log("[!] yt-dlp could not be updated now; Check setup can try again.",
+                          tag="warning")
+            self._set_status("Ready.")
+        finally:
+            # This start-up thread goes on to other checks; it is no job now.
+            if self.worker_thread is threading.current_thread():
+                self.worker_thread = None
             self.root.after(0, self._finish)
 
     # ---- continuing an unfinished list ------------------------------------------
@@ -3758,6 +4513,8 @@ class FingerprinterApp:
     # held by _wait_if_paused at the points where workers would start it.
 
     def _toggle_pause(self) -> None:
+        # Pause and Resume by hand take over from a pause the program made.
+        self._cancel_auto_resume()
         if self.pause_flag.is_set():
             self.pause_flag.clear()
             self.pause_btn.config(text="Pause")
@@ -3854,9 +4611,102 @@ class FingerprinterApp:
             time.sleep(0.2)
 
     def _skip_current(self) -> None:
+        """Skip link. Listing and downloads stop at once: their work is simply
+        done again next time. Splitting finishes the file it is on. A link
+        already being fingerprinted finishes first: stopping it would throw
+        away finished batches, and the link would be fingerprinted again in
+        full next time, putting its audio in the database twice."""
         self.skip_flag.set()
-        self._log("[!] Skip requested. Moving to the next link at the next safe point"
-                  + (", once you press Resume." if self.pause_flag.is_set() else "."))
+        then = ", once you press Resume" if self.pause_flag.is_set() else ""
+        if self._stage == "fingerprint":
+            self._log("[!] Skip: this link is already being fingerprinted, so it finishes "
+                      f"first; the list then moves on{then}.", tag="warning")
+        elif self._stage == "split":
+            self._log("[!] Skip: the file being split is finished first, then the list moves "
+                      f"on to the next link{then}.", tag="warning")
+        else:
+            self._log(f"[!] Skipping this link: its listing and downloads are stopped{then}.",
+                      tag="warning")
+            threading.Thread(target=self._kill_all_children, daemon=True).start()
+
+    # ---- pausing by itself when downloads keep failing ------------------------------
+    #
+    # Failures that say the site (or this PC) refuses everything for now, not
+    # something about one item. After BACKOFF_STREAK of them in a row, trying
+    # every item left would only fail again, and against a rate limit make it
+    # last longer; so the job pauses, and against a site resumes by itself
+    # after a while, waiting longer each time. A full disk or an outdated
+    # yt-dlp will not mend by waiting, so those wait for the user.
+
+    BACKOFF_REASONS = {None, "network error", "HTTP 403 forbidden", "HTTP 429 rate-limited",
+                       "YouTube bot check", "disk full", "yt-dlp may be out of date"}
+    BACKOFF_STREAK = 10
+    AUTO_RESUME_MINUTES = (10, 20, 40, 60)
+
+    def _note_download_result(self, entry: dict, success: bool) -> None:
+        """Pipeline thread, as each download ends: count the failures in a row
+        that point at the site or this PC, and pause once there are enough."""
+        if success:
+            self._fail_streak = 0
+            self._auto_pause_wait = 0
+            return
+        reason = entry.get("_fail_reason")
+        self._fail_reasons[reason] = self._fail_reasons.get(reason, 0) + 1
+        if reason not in self.BACKOFF_REASONS:
+            return
+        self._fail_streak += 1
+        if reason == "disk full" or self._fail_streak >= self.BACKOFF_STREAK:
+            streak, self._fail_streak = self._fail_streak, 0
+            self.root.after(0, self._auto_pause, reason, streak)
+
+    def _auto_pause(self, reason: str | None, streak: int) -> None:
+        """UI thread: pause the job as Pause does, say why, and unless waiting
+        cannot help, resume by itself later."""
+        if (self.pause_flag.is_set() or self.cancel_flag.is_set()
+                or self.worker_thread is None or not self.worker_thread.is_alive()):
+            return
+        why = {
+            None: "for reasons yt-dlp did not name",
+            "network error": "the connection failed",
+            "HTTP 403 forbidden": "the site refused them (HTTP 403)",
+            "HTTP 429 rate-limited": "the site is limiting how fast you download (HTTP 429)",
+            "YouTube bot check": "YouTube asked to confirm you are not a bot",
+            "disk full": "the disk is full",
+            "yt-dlp may be out of date": "yt-dlp looks out of date",
+        }.get(reason, reason)
+        self.pause_flag.set()
+        self.pause_btn.config(text="Resume")
+        threading.Thread(target=self._hold_while_paused, daemon=True).start()
+        what = "The last download failed" if streak == 1 else f"The last {streak} downloads failed"
+        self._log(f"[!] Paused by itself. {what}: {why}.", tag="warning")
+        if reason == "disk full":
+            self._log("    Free some space on the disk, then press Resume.", tag="warning")
+            self._set_status("Paused: the disk is full.")
+        elif reason == "yt-dlp may be out of date":
+            self._log("    Press Stop, then Check setup to update yt-dlp. Download and "
+                      "fingerprint then offers to continue the list.", tag="warning")
+            self._set_status("Paused: yt-dlp looks out of date.")
+        else:
+            minutes = self.AUTO_RESUME_MINUTES[min(self._auto_pause_wait, len(self.AUTO_RESUME_MINUTES) - 1)]
+            self._auto_pause_wait += 1
+            at = time.strftime("%H:%M", time.localtime(time.time() + minutes * 60))
+            self._auto_pause_after = self.root.after(minutes * 60_000, self._auto_resume)
+            self._log(f"    Trying every item left would only fail too. Resuming by itself at "
+                      f"{at}; press Resume to carry on now, Skip link to move on, or Stop.",
+                      tag="warning")
+            self._set_status(f"Paused after {streak} failed downloads; resuming at {at}.")
+        self._notify_done()
+
+    def _auto_resume(self) -> None:
+        self._auto_pause_after = None
+        if self.pause_flag.is_set() and not self.cancel_flag.is_set():
+            self._log("[*] Resuming after the pause, to try again.")
+            self._toggle_pause()
+
+    def _cancel_auto_resume(self) -> None:
+        if self._auto_pause_after is not None:
+            self.root.after_cancel(self._auto_pause_after)
+            self._auto_pause_after = None
 
     def _set_inputs_locked(self, locked: bool) -> None:
         """Lock/unlock fields whose values are read mid-run, so the user can't
@@ -3888,6 +4738,12 @@ class FingerprinterApp:
     def _finish(self) -> None:
         self._keep_awake(False)
         self.pause_flag.clear()
+        self.skip_flag.clear()
+        self._cancel_auto_resume()
+        self._stage = ""
+        if self._running_url is not None:
+            self._set_link_result(self._running_url, None)
+        self._title_prefix = ""
         self._reset_progress()
         self.pause_btn.config(text="Pause", state="disabled")
         self.start_btn.config(state="normal")
@@ -3897,6 +4753,56 @@ class FingerprinterApp:
         self.skip_btn.config(state="disabled")
         self._set_inputs_locked(False)
         self._set_queue_controls_enabled(True)
+        if self._power_action_due:
+            self._power_action_due = False
+            self.root.after(500, self._when_done)
+
+    # ---- Settings, General: When a job finishes --------------------------------
+
+    def _when_done(self) -> None:
+        """UI thread, after a job ran to its end: sleep or shut down, as chosen
+        in Settings, after a minute in which the answer can still be No."""
+        action = self.when_done_var.get()
+        if action not in WHEN_DONE_CHOICES[1:] or (
+                self.worker_thread is not None and self.worker_thread.is_alive()):
+            return
+        verb = "go to sleep" if action == WHEN_DONE_CHOICES[1] else "shut down"
+
+        def ask() -> None:     # a worker thread: the timed question blocks until answered
+            if self._ask_yes_no_timed(
+                f"{action}?",
+                f"The job has finished, and Settings, General says to {verb} the PC when "
+                f"it does.\n\n{action} now?",
+                timeout_seconds=60, default_yes=True,
+            ):
+                self.root.after(0, self._power_off, action)
+            else:
+                self._log(f"[*] Not going to {verb}; the PC stays on.")
+
+        threading.Thread(target=ask, daemon=True).start()
+
+    def _power_off(self, action: str) -> None:
+        """Put the PC to sleep, or shut it down with a 30-second warning from
+        Windows (shutdown /a in a command prompt stops it)."""
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self._log(f"[*] {action} called off: another job has started.")
+            return
+        save_config(self._gather_config())
+        try:
+            import ctypes
+            if action == WHEN_DONE_CHOICES[1]:
+                self._log("[*] Going to sleep.")
+                # Sleep, not hibernate; wake-up timers stay on.
+                ctypes.windll.powrprof.SetSuspendState(False, False, False)
+            else:
+                subprocess.run(["shutdown", "/s", "/t", "30", "/c",
+                                "The Fingerprinter has finished its job."],
+                               check=True, capture_output=True,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self._log("[*] Windows shuts down in 30 seconds. To stop it, type shutdown /a "
+                          "in a command prompt.")
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] Could not {action.lower()}: {e!r}", tag="warning")
 
     # ------------------------- pipeline ---------------------------------------
 
@@ -3944,14 +4850,19 @@ class FingerprinterApp:
                 return "failed"
 
             # 1. Extract video list
+            self._stage = "listing"
             self._set_status(f"{qp}Extracting playlist info...")
             self._log(f"[*] Fetching info for: {url}")
             info = self._extract_info(url)
             if info is None:
-                # Stop kills the listing, which then has nothing to return.
-                return "cancelled" if self.cancel_flag.is_set() else "failed"
+                # Stop and Skip kill the listing, which then has nothing to return.
+                return stopped() or "failed"
             if (s := stopped()):
                 return s
+            # yt-dlp stopped listing part-way (_extract_info): what it found is
+            # run, but the link is not done in full, and its count is not the
+            # link's count.
+            cut_short = bool(info.get("cut_short"))
 
             channel_name_raw = (
                 info.get("channel")
@@ -3969,7 +4880,8 @@ class FingerprinterApp:
             if not entries:
                 entries = [info]  # single video fallback
             # The listing just done is a fresh count for the list.
-            self.root.after(0, self._record_count, url, len(entries), single)
+            if not cut_short:
+                self.root.after(0, self._record_count, url, len(entries), single)
 
             self._log(f"[+] Source: {channel_name_raw}  ({len(entries)} item(s))")
             if (s := stopped()):
@@ -3980,7 +4892,7 @@ class FingerprinterApp:
             if not entries:
                 self._log(f"[+] {qp}Nothing new to download for this link.")
                 self._set_status(f"{qp}Nothing new.")
-                return "done"
+                return "incomplete" if cut_short else "done"
 
             # Resolve this channel's download subfolder now (needed for the
             # pre-download cleanup check below).
@@ -4032,6 +4944,7 @@ class FingerprinterApp:
                     self._log("[X] User declined the estimate. Aborting.")
                     self._set_status("Aborted.")
                     return "cancelled"
+            self._check_free_space(output_base)
 
             # 2. Make download folder (path was resolved above for the cleanup check)
             initial_folder.mkdir(parents=True, exist_ok=True)
@@ -4039,18 +4952,15 @@ class FingerprinterApp:
 
             self._log("[+] Audio mode: native m4a/opus (no transcode, fast)")
 
-            # Open the channel's subfolder on start if requested. This applies
-            # in queue mode too — it opens whichever channel is downloading now.
-            if self.open_folder_var.get():
-                self._open_folder(initial_folder)
-
             # 3. Parallel download (uses the same `workers` value shown in the estimate)
+            self._stage = "download"
             self._set_status(f"{qp}Downloading 0/{len(entries)} ({workers} at once)...")
             ok, fail = self._download_parallel(entries, initial_folder, workers)
             self._log(f"[+] Downloads finished: {ok} OK, {fail} failed.")
 
             if (s := stopped()):
                 return s
+            self._advise_on_failures()
             if ok == 0:
                 self._log("[X] No successful downloads. Aborting before fingerprinting.")
                 return "failed"
@@ -4063,7 +4973,7 @@ class FingerprinterApp:
                           f"limits in Settings.")
                 self._clear_download_folder(initial_folder)
                 self._set_status(f"{qp}Nothing new.")
-                return "incomplete" if retry_later else "done"
+                return "incomplete" if retry_later or cut_short else "done"
 
             # 4. Folder stays where it was downloaded; the scan below picks it up there.
             self._log(f"[+] Folder stays at: {initial_folder}")
@@ -4072,11 +4982,17 @@ class FingerprinterApp:
             if self.keep_audio_var.get():
                 self._keep_audio(initial_folder, bat_dir, channel_name)
 
-            # 4a. Audio length sanity check (right after downloads finish)
+            # 4a. Audio length sanity check (right after downloads finish).
+            # Skip link takes effect here at the latest: once fingerprinting
+            # has begun, the link finishes (_skip_current).
+            self._stage = "split"
             if not self._check_long_audio(initial_folder):
                 return "cancelled"
+            if (s := stopped()):
+                return s
 
             # 4b. The work folders must start empty (nothing in them is asked about)
+            self._stage = "fingerprint"
             self._prepare_work(bat_dir, resume=False, discard=discard_work)
             self._note_list_fingerprinting(bat_dir)
 
@@ -4090,14 +5006,17 @@ class FingerprinterApp:
             pklz_before = self._snapshot_pklz(pklz_dir)
             source_dir = initial_folder
             complete = self._run_fingerprint_stage(bat_dir, source_dir, status_prefix=qp)
+            # Only Stop ends the link here. Skip link waits for it: returning
+            # now left its finished .pklz files in work\pklz, to go out
+            # nameless as recovered-* at the next link, with its audio kept
+            # and not remembered, so the next run fingerprinted it all again.
+            if self.cancel_flag.is_set():
+                return "cancelled"
             if not complete:
-                if (s := stopped()):
-                    return s
                 # Batches failed but their lists are still on disk, so the pklz
                 # files that DID succeed are worth keeping and renaming below.
                 self._log("[!] Fingerprinting did not complete cleanly - see the failures above.")
-            if (s := stopped()):
-                return s
+            unreadable = list(self._fp_unreadable)
 
             # 6b. Rename the newly-created pklz files using the channel handle.
             self._rename_new_pklz(pklz_dir, pklz_before, pklz_prefix)
@@ -4109,9 +5028,9 @@ class FingerprinterApp:
             # 6c. Move the pklz files out of work\pklz, which the next link
             #     empties, to where finished fingerprints are kept.
             keep_dir = self._keep_dir(bat_dir)
-            self._move_pklz_files(pklz_dir, keep_dir)
+            moved = self._move_pklz_files(pklz_dir, keep_dir)
             if complete and self.skip_done_var.get():
-                self._remember_done(self._downloaded_ok)
+                self._remember_done(self._items_fingerprinted(self._downloaded_ok, unreadable))
 
             # 6d. Delete this channel's download folder now that its audio has
             #     been fingerprinted and the pklz files saved. The next run
@@ -4120,16 +5039,15 @@ class FingerprinterApp:
             # With the audio gone, the file lists and resume record are spent.
             self._clear_work_if_moved(bat_dir)
 
-            # 7. Report + open the folder where the pklz files ended up.
-            #    In a multi-channel queue, opening after every channel would
-            #    spam identical folder windows, so queue mode reports without
-            #    opening here and opens once at the end of the whole queue.
-            self._report_pklz(keep_dir, label="Finished fingerprints", open_folder=not queue_mode)
+            # 7. Report what this link made. The folder opens once, at the end
+            #    of the list (_run_queue), not after every link.
+            self._report_pklz(keep_dir, label="This link's fingerprints", open_folder=not queue_mode,
+                              new_files=moved)
             # Remember where this channel's pklz files landed so the queue
             # runner can open the final location once at the end.
             self._last_report_dir = keep_dir
 
-            if not complete or retry_later:
+            if not complete or retry_later or unreadable or cut_short:
                 # Something is missing, so the link is not done in full: the
                 # summary says so, and Remove links from the list once
                 # fingerprinted leaves it in the list. Downloads that fail
@@ -4137,6 +5055,14 @@ class FingerprinterApp:
                 if retry_later:
                     self._log(f"[!] {qp}{retry_later} item(s) could not be downloaded this time "
                               f"(see above); running the link again fetches them.", tag="warning")
+                if cut_short:
+                    self._log(f"[!] {qp}yt-dlp stopped listing this link part-way, so not every "
+                              f"item was seen; running the link again lists it in full.",
+                              tag="warning")
+                if unreadable:
+                    self._log(f"[!] {qp}{len(unreadable)} file(s) could not be read and are not "
+                              f"in the fingerprints (see above); running the link again "
+                              f"downloads them again.", tag="warning")
                 if not complete:
                     self._log(f"[!] {qp}Link finished, but not all of it was fingerprinted; see above.",
                               tag="warning")
@@ -4155,11 +5081,14 @@ class FingerprinterApp:
             if not queue_mode:
                 self.root.after(0, self._finish)
 
-    def _run_bats_only_pipeline(self, bat_dir: Path, split: bool = True) -> None:
-        """Skip downloads. Scan the output directory, fingerprint it, done."""
+    def _run_bats_only_pipeline(self, bat_dir: Path, split: bool = True, prefix: str = "") -> None:
+        """Skip downloads. Scan the output directory, fingerprint it, done.
+        The .pklz files are named <prefix>-1.pklz, ..., the name chosen in
+        _ask_disk_run."""
         try:
             self._log("[*] Fingerprinting existing audio (no download)...")
             self._set_now_title("Now · audio on disk")
+            self._title_prefix = "Audio on disk"
 
             # Only work\texts is cleared here. work\pklz is deliberately left
             # alone: a successful run moves every .pklz out to the database, so
@@ -4195,22 +5124,25 @@ class FingerprinterApp:
             # any carried over from a previous attempt, so all of them are renamed
             # rather than only the ones created this time round. Otherwise a resumed
             # run ships a mix of "channel_3.pklz" and bare "3.pklz" to the database.
-            prefix = self._derive_prefix_from_subfolder(bat_dir)
-            self._rename_new_pklz(pklz_dir, set(), prefix)
+            self._rename_new_pklz(pklz_dir, set(), prefix or self._disk_run_name(source_dir))
 
             # Move them to where finished fingerprints are kept, then list and
             # optionally open that folder.
             keep_dir = self._keep_dir(bat_dir)
-            self._move_pklz_files(pklz_dir, keep_dir)
+            moved = self._move_pklz_files(pklz_dir, keep_dir)
             # After a clean run nothing is left to resume. After a failed one the
             # record stays, so pressing the button again redoes only what failed.
             if complete:
                 self._clear_work_if_moved(bat_dir)
-            self._report_pklz(keep_dir, label="Finished fingerprints")
+            self._report_pklz(keep_dir, label="New fingerprints", new_files=moved)
+            if self._fp_unreadable:
+                self._log(f"[!] {len(self._fp_unreadable)} file(s) could not be read and are not "
+                          f"in the fingerprints (see above).", tag="warning")
 
             self._log("[+] All done.")
             self.root.after(0, self._notify_done)
             self._set_status("Done.")
+            self._power_action_due = True
         except Exception as e:  # noqa: BLE001
             self._log(f"[X] Error: {e!r}")
             self._set_status("Error.")
@@ -4553,6 +5485,21 @@ class FingerprinterApp:
                         self._publish_fp_progress()
                     continue
 
+                # A file audfprint could not read (a cut-off download, a format
+                # ffmpeg cannot decode, a file antivirus holds): with -C it is
+                # stored with no fingerprints and the batch still succeeds, so
+                # this line is the only sign. Always shown, whatever the
+                # verbose setting, and noted for the link (_run_pipeline).
+                if line.startswith(self.UNREADABLE_PREFIX):
+                    path = line[len(self.UNREADABLE_PREFIX):]
+                    path = path[:-len(" skipping")] if path.endswith(" skipping") else path
+                    with self._fp_progress_lock:
+                        self._fp_unreadable.append(path)
+                    with log_lock:
+                        self._log(f"  ! [batch {batch_id}] audfprint could not read "
+                                  f"{os.path.basename(path)}; it is left out.", tag="warning")
+                    continue
+
                 if self.verbose_var.get():
                     with log_lock:
                         self._log(f"  | [batch {batch_id}] {line}", tag="bat")
@@ -4775,9 +5722,16 @@ class FingerprinterApp:
         self._log(f"[+] All {len(pending)} batch(es) fingerprinted in {took}.")
         return True
 
+    # What audfprint prints for a file it cannot read (audfprint_analyze.py,
+    # wavfile2peaks), followed by the path and " skipping".
+    UNREADABLE_PREFIX = "wavfile2peaks: Error reading "
+
     def _run_fingerprint_stage(self, bat_dir: Path, source_dir: Path, status_prefix: str = "") -> bool:
         """Scan + fingerprint: the whole of what preparador.bat and creador.bat
-        used to do. Returns True only if every batch produced a .pklz."""
+        used to do. Returns True only if every batch produced a .pklz. The
+        files audfprint could not read are in _fp_unreadable afterwards."""
+        with self._fp_progress_lock:
+            self._fp_unreadable = []
         texts_dir = bat_dir / WORK_TEXTS
         batch_size = self._safe_int(self.batch_size_var, 1000)
 
@@ -4870,6 +5824,8 @@ class FingerprinterApp:
             self._wait_if_paused()
             if self.cancel_flag.is_set():
                 return False
+            if self.skip_flag.is_set():
+                return True
             self._set_progress("Checking lengths", i, len(audio_files))
             dur = self._get_audio_duration(f)
             if dur is None:
@@ -4901,6 +5857,11 @@ class FingerprinterApp:
             self._wait_if_paused()
             if self.cancel_flag.is_set():
                 return False
+            if self.skip_flag.is_set():
+                # Skip link: the file split last is whole; the rest wait for
+                # the link's next run.
+                self._log("[*] Splitting stopped for Skip link.", tag="splitter")
+                return True
             self._set_progress("Splitting", i, len(long_files))
             made += self._split_file_in_place(path, dur)
         self._log(f"[+] Splitting complete: {made} piece(s) written.", tag="splitter")
@@ -5126,26 +6087,19 @@ class FingerprinterApp:
         return True
 
     def _extract_info(self, url: str) -> dict | None:
-        # Stream one entry per line on stdout instead of buffering the whole
-        # playlist into a single JSON dump. This lets us log a running count
-        # so the user knows the script isn't frozen on huge channels.
-        # Tab-separated fields rather than JSON-encoded — simpler and avoids
-        # version-dependent format-template features.
-        sep = "\x1f"  # ASCII unit separator, won't appear in titles
-        template = sep.join((
-            "%(id)s",
-            "%(title)s",
-            "%(duration)s",
-            "%(url)s",
-            "%(webpage_url)s",
-            "%(playlist_title)s",
-            "%(playlist_uploader)s",
-            "%(playlist_channel)s",
-            "%(channel)s",
-            # Which extractor found it, for the done list (_archive_key). Flat
-            # entries carry ie_key; a single page has extractor_key instead.
-            "%(ie_key,extractor_key)s",
-        ))
+        """List a link's entries. None when that failed, or Stop or Skip ended
+        it. When yt-dlp stopped part-way with some entries found, they are
+        returned with "cut_short" set: the link runs, but is not done in full.
+
+        One entry per line, streamed, so the console can count them as they
+        come on a huge channel. Each line is one JSON object: the fields used
+        to be joined with a separator, and a title with a line break in it (a
+        post used as the title on some sites) split its line and the item was
+        dropped without a word. Which extractor found each entry is kept for
+        the done list (_archive_key): flat entries carry ie_key, a single page
+        extractor_key instead."""
+        template = ("%(.{id,title,duration,url,webpage_url,playlist_title,playlist_uploader,"
+                    "playlist_channel,channel,ie_key,extractor_key})j")
         cmd = [
             *self.ytdlp,
             *YTDLP_UTF8,
@@ -5196,37 +6150,39 @@ class FingerprinterApp:
             except Exception:  # noqa: BLE001
                 pass
 
-        threading.Thread(target=_drain_stderr, daemon=True).start()
+        drain = threading.Thread(target=_drain_stderr, daemon=True)
+        drain.start()
 
         assert proc.stdout is not None
         last_log = time.monotonic()
-        keys = (
-            "id", "title", "duration", "url", "webpage_url",
-            "playlist_title", "playlist_uploader", "playlist_channel", "channel",
-            "extractor",
-        )
+        unreadable = 0
         try:
             for line in proc.stdout:
-                if self.cancel_flag.is_set():
+                if self.cancel_flag.is_set() or self.skip_flag.is_set():
                     self._kill_tree(proc)
                     break
-                line = line.rstrip("\n")
+                line = line.strip()
                 if not line:
                     continue
-                parts = line.split(sep)
-                if len(parts) != len(keys):
-                    continue  # malformed line, skip
-                obj: dict = dict(zip(keys, parts))
-                # yt-dlp prints the literal "NA" for missing fields.
-                for k, v in list(obj.items()):
-                    if v == "NA":
-                        obj[k] = None
+                try:
+                    raw = json.loads(line)
+                except ValueError:
+                    raw = None
+                if not isinstance(raw, dict):
+                    unreadable += 1     # counted and reported below
+                    continue
+                obj: dict = {k: raw.get(k) for k in (
+                    "id", "title", "url", "webpage_url", "playlist_title",
+                    "playlist_uploader", "playlist_channel", "channel")}
+                for k, v in obj.items():
+                    if v is not None and not isinstance(v, str):
+                        obj[k] = str(v)
+                obj["extractor"] = raw.get("ie_key") or raw.get("extractor_key")
                 # Coerce duration to a number where possible.
-                if obj.get("duration") is not None:
-                    try:
-                        obj["duration"] = float(obj["duration"])
-                    except (TypeError, ValueError):
-                        obj["duration"] = None
+                try:
+                    obj["duration"] = float(raw["duration"]) if raw.get("duration") is not None else None
+                except (TypeError, ValueError):
+                    obj["duration"] = None
 
                 # First entry seeds the channel-level metadata.
                 if not meta:
@@ -5255,16 +6211,47 @@ class FingerprinterApp:
         finally:
             proc.wait()
             self._untrack_proc(proc)
+        # What yt-dlp said on stderr, read to its end.
+        drain.join(timeout=5)
 
-        if self.cancel_flag.is_set():
+        if self.cancel_flag.is_set() or self.skip_flag.is_set():
             return None
+        # The lines that say what went wrong; yt-dlp's warnings come first.
+        errors = [ln for ln in stderr_tail if ln.startswith("ERROR")] or stderr_tail[-3:]
+        reason = self._classify_yt_dlp_error(" ".join(errors))
         if proc.returncode != 0 and not entries:
-            err = (proc.stderr.read() if proc.stderr else "").strip()
-            self._log(f"[X] yt-dlp info failed: {err[:500]}")
+            self._log(f"[X] yt-dlp could not list this link"
+                      + (f" ({reason})" if reason else "") + ":", tag="warning")
+            for ln in errors[-3:] or ["(it said nothing about why)"]:
+                self._log(f"    {ln[:400]}", tag="warning")
+            if reason in self.FAILURE_ADVICE:
+                self._log(f"    {self.FAILURE_ADVICE[reason]}", tag="warning")
+            return None
+
+        if unreadable and not entries:
+            # Nothing but lines that are not JSON: a yt-dlp too old for the
+            # template (_find_ytdlp may have picked an old yt-dlp.exe).
+            self._log("[X] yt-dlp's listing could not be read at all; this yt-dlp may be out of "
+                      "date. Press Check setup to update it.", tag="warning")
             return None
 
         # Log the final count if the throttled log missed it.
         self._log(f"[*] Done fetching: {len(entries)} entries total.")
+        cut_short = False
+        if unreadable:
+            self._log(f"[!] {unreadable} line(s) of yt-dlp's listing could not be read, so those "
+                      f"items are left out.", tag="warning")
+            cut_short = True
+        if proc.returncode != 0:
+            # Some pages listed, then a 429 or a dropped connection: running
+            # just those as if they were the whole link would end it "done".
+            self._log(f"[!] yt-dlp stopped listing part-way, after {len(entries):,} entries"
+                      + (f" ({reason})" if reason else "") + ":", tag="warning")
+            for ln in errors[-2:]:
+                self._log(f"    {ln[:400]}", tag="warning")
+            self._log("    These entries are run now; the link counts as incomplete, so "
+                      "running it again lists it in full.", tag="warning")
+            cut_short = True
 
         # Single-video URLs return one entry without playlist metadata.
         if not meta:
@@ -5273,8 +6260,10 @@ class FingerprinterApp:
                 "channel": single.get("uploader") or single.get("channel"),
                 "title": single.get("title"),
                 "entries": entries,
+                "cut_short": cut_short,
             }
         meta["entries"] = entries
+        meta["cut_short"] = cut_short
         return meta
 
     def _download_parallel(
@@ -5291,6 +6280,9 @@ class FingerprinterApp:
         # and how many failed in a way worth trying again (RETRY_LATER).
         self._downloaded_ok: list[dict] = []
         self._retry_later = 0
+        # The advice is per link; the failures in a row are counted across
+        # the list (reset in _start), or a list of short links never paused.
+        self._fail_reasons = {}
         for entry in entries:
             entry.pop("_fail_reason", None)
 
@@ -5305,7 +6297,7 @@ class FingerprinterApp:
             slot_pool.put(i)
 
         def worker(entry: dict) -> bool:
-            if self.cancel_flag.is_set():
+            if self.cancel_flag.is_set() or self.skip_flag.is_set():
                 return False
             slot = slot_pool.get()
             try:
@@ -5317,11 +6309,12 @@ class FingerprinterApp:
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {ex.submit(worker, e): e for e in entries}
             for fut in as_completed(futures):
-                if self.cancel_flag.is_set():
+                if self.cancel_flag.is_set() or self.skip_flag.is_set():
                     # Drop everything still queued. Without this the `with`
                     # block's shutdown(wait=True) also blocked the whole
                     # pipeline until the remaining downloads finished on their
-                    # own, so the UI stayed "running" long after Stop.
+                    # own, so the UI stayed "running" long after Stop. Skip
+                    # link the same: the link's downloads end here.
                     ex.shutdown(wait=False, cancel_futures=True)
                     break
                 try:
@@ -5339,6 +6332,7 @@ class FingerprinterApp:
                     fail += 1
                     if futures[fut].get("_fail_reason") in self.RETRY_LATER:
                         self._retry_later += 1
+                self._note_download_result(futures[fut], success)
                 done += 1
                 # See the note in _download_one: .get(key, default) doesn't
                 # fall back when the key is present with an explicit None
@@ -5360,7 +6354,7 @@ class FingerprinterApp:
         # already queued in the pool, so without this a Stop during download 4
         # simply started download 5.
         self._wait_if_paused()
-        if self.cancel_flag.is_set():
+        if self.cancel_flag.is_set() or self.skip_flag.is_set():
             return False
         video_url = entry.get("webpage_url") or entry.get("url") or entry.get("id") or ""
         video_url = str(video_url)
@@ -5400,8 +6394,8 @@ class FingerprinterApp:
             "-f", "bestaudio[ext=m4a]/bestaudio",
             "--remux-video", "webm>opus",
         ]
-        if not verbose:
-            cmd.append("--no-warnings")
+        # Warnings are not switched off: an outdated yt-dlp says so only in a
+        # warning (SOLVER_WARNINGS). The rest are not kept (see below).
         # The length limits, for items the listing gave no length for (the
         # rest were left out before downloading). "?" lets an item whose
         # length yt-dlp cannot find either through.
@@ -5463,7 +6457,7 @@ class FingerprinterApp:
 
         try:
             for raw in proc.stdout:
-                if self.cancel_flag.is_set():
+                if self.cancel_flag.is_set() or self.skip_flag.is_set():
                     self._kill_tree(proc)
                     break
                 line = raw.rstrip()
@@ -5478,9 +6472,13 @@ class FingerprinterApp:
                 _, display = self._parse_yt_dlp_line(line)
                 if display is not None:
                     self._update_slot(slot, f"{short_title} | {display}")
-                # accumulate error/warning lines so we can classify the failure later
+                # Error lines, to classify the failure by later; of the
+                # warnings only those that say yt-dlp cannot read the site's
+                # player any more. Every warning would let a harmless one
+                # decide what an error means.
                 low = line.lower()
-                if line.startswith("ERROR") or low.startswith("warning") or "error:" in low[:30]:
+                if (line.startswith("ERROR") or "error:" in low[:30]
+                        or (low.startswith("warning") and any(p in low for p in self.SOLVER_WARNINGS))):
                     err_lines.append(line)
         finally:
             ticker_stop.set()
@@ -5488,10 +6486,11 @@ class FingerprinterApp:
             ticker_thread.join(timeout=2.0)
 
         proc.wait()
-        success = proc.returncode == 0 and not self.cancel_flag.is_set()
+        stopped = self.cancel_flag.is_set() or self.skip_flag.is_set()
+        success = proc.returncode == 0 and not stopped
         if success and entry.get("_left_out"):
             self._log(f"  - Left out '{title}': outside the length limits in Settings.")
-        if not success and not self.cancel_flag.is_set():
+        if not success and not stopped:
             joined = " ".join(err_lines)
             reason = self._classify_yt_dlp_error(joined)
             entry["_fail_reason"] = reason              # see RETRY_LATER
@@ -5509,8 +6508,15 @@ class FingerprinterApp:
     # Download failures that may well work the next time the link runs; the
     # rest (private, removed, members-only, geo-blocked, ...) fail every time.
     # None is a failure with no known reason, counted as worth another try.
+    # What yt-dlp warns when it cannot work out YouTube's player any more, old
+    # wording and current: a sure sign it is out of date.
+    SOLVER_WARNINGS = ("nsig extraction failed", "n challenge solving failed",
+                       "signature extraction failed", "signature solving failed")
+
     RETRY_LATER = {None, "network error", "HTTP 403 forbidden", "HTTP 429 rate-limited",
-                   "scheduled livestream (not started)", "scheduled premiere (not aired)"}
+                   "not found (HTTP 404)",
+                   "scheduled livestream (not started)", "scheduled premiere (not aired)",
+                   "YouTube bot check", "disk full", "yt-dlp may be out of date"}
 
     @staticmethod
     def _classify_yt_dlp_error(text: str) -> str | None:
@@ -5519,6 +6525,11 @@ class FingerprinterApp:
         t = text.lower()
         # Order matters: more specific patterns first.
         patterns: list[tuple[str, str]] = [
+            # "Sign in to confirm you're not a bot": YouTube refusing this PC
+            # for a while, not anything about the item.
+            ("not a bot", "YouTube bot check"),
+            ("no space left on device", "disk full"),
+            ("not enough space on the disk", "disk full"),
             ("sign in to confirm your age", "age-restricted (login required)"),
             ("inappropriate for some users", "age-restricted"),
             ("age-restricted", "age-restricted"),
@@ -5544,10 +6555,21 @@ class FingerprinterApp:
             ("this video is unavailable", "unavailable"),
             ("video has been removed", "removed"),
             ("private video", "private video"),
+            # yt-dlp could not work out YouTube's player (a warning, which
+            # _download_one keeps for these): what follows is "Requested
+            # format is not available", but the cause is an outdated yt-dlp.
+            *((p, "yt-dlp may be out of date") for p in FingerprinterApp.SOLVER_WARNINGS),
             ("requested format is not available", "no audio format available"),
-            ("unable to download webpage", "network error"),
+            # Before "unable to download webpage", which a 429 or 403 on the
+            # page itself also says.
             ("http error 403", "HTTP 403 forbidden"),
             ("http error 429", "HTTP 429 rate-limited"),
+            ("http error 404", "not found (HTTP 404)"),
+            ("unable to download webpage", "network error"),
+            # A site changed and yt-dlp has not caught up yet. yt-dlp adds
+            # "please report this issue" to exactly these errors.
+            ("unable to extract", "yt-dlp may be out of date"),
+            ("please report this issue", "yt-dlp may be out of date"),
         ]
         for pat, label in patterns:
             if pat in t:
@@ -5566,18 +6588,27 @@ class FingerprinterApp:
         return {p.name for p in pklz_dir.iterdir() if p.is_file() and p.suffix.lower() == ".pklz"}
 
     @staticmethod
-    def _derive_prefix_from_subfolder(bat_dir: Path) -> str:
-        """For the bats-only run (no URL), look for a '<name>_subfolder' folder
-        in bat_dir and use <name> as the pklz prefix. Falls back to 'channel'."""
+    def _disk_run_name(source_dir: Path) -> str:
+        """The name Audio on disk suggests for its .pklz files: the channel of
+        the one '<name>_subfolder' a stopped download left in the working
+        folder, or else the working folder's own name."""
         try:
-            for p in bat_dir.iterdir():
-                if p.is_dir() and p.name.endswith("_subfolder"):
-                    base = p.name[: -len("_subfolder")]
-                    if base:
-                        return base
-        except Exception:
-            pass
-        return "channel"
+            subfolders = [p.name[: -len("_subfolder")] for p in source_dir.iterdir()
+                          if p.is_dir() and p.name.endswith("_subfolder")]
+        except OSError:
+            subfolders = []
+        subfolders = [name for name in subfolders if name]
+        if len(subfolders) == 1:
+            return subfolders[0]
+        return sanitize_name(source_dir.name or "channel")
+
+    @staticmethod
+    def _pklz_name(text: str) -> str:
+        """A typed name made safe for file names, keeping a leading @."""
+        text = text.strip()
+        if text.startswith("@") and len(text) > 1:
+            return "@" + sanitize_name(text[1:])
+        return sanitize_name(text)
 
     def _rename_new_pklz(
         self,
@@ -5585,16 +6616,17 @@ class FingerprinterApp:
         before: set[str],
         prefix: str,
     ) -> None:
-        """Rename only the .pklz files created since `before` to
-        '<prefix>-1.pklz', '<prefix>-2.pklz', ... in sorted name order.
-        Pre-existing files (those in `before`) are left untouched."""
+        """Rename the batch files audfprint wrote since `before` (1.pklz,
+        2.pklz, ...) to '<prefix>-1.pklz', '<prefix>-2.pklz', ... Anything
+        else in work\\pklz, such as another link's file that could not be
+        moved out, is left as it is."""
         if not pklz_dir.is_dir():
             return
         current = {
             p.name for p in pklz_dir.iterdir()
-            if p.is_file() and p.suffix.lower() == ".pklz"
+            if p.is_file() and re.fullmatch(r"\d+\.pklz", p.name, re.IGNORECASE)
         }
-        new_names = sorted(current - before)
+        new_names = sorted(current - before, key=lambda n: int(n.split(".")[0]))
         if not new_names:
             self._log("[!] No new pklz files to rename.", tag="warning")
             return
@@ -5604,10 +6636,12 @@ class FingerprinterApp:
         # Two-phase rename to avoid collisions: first move everything to unique
         # temp names, then to the final names. This prevents a new file named
         # e.g. '@Muzarkive-1.pklz' (coincidentally) from clobbering a target.
+        # The temporary names still end in .pklz: one whose final rename fails
+        # is then moved out with the rest, not deleted with work\pklz.
         temp_paths: list[Path] = []
         for i, name in enumerate(new_names):
             src = pklz_dir / name
-            tmp = pklz_dir / f".__renaming_{i}__.pklz.tmp"
+            tmp = pklz_dir / f"renaming-{i}-{prefix}.pklz"
             try:
                 src.rename(tmp)
                 temp_paths.append(tmp)
@@ -5618,10 +6652,10 @@ class FingerprinterApp:
         renamed = 0
         for i, tmp in enumerate(temp_paths, start=1):
             final = pklz_dir / f"{prefix}-{i}.pklz"
-            # If a final name somehow already exists (pre-existing file with the
-            # same scheme), bump until free.
+            # A name already taken (a file that could not be moved out last
+            # time) is skipped: renaming onto it fails on Windows.
             bump = i
-            while final.exists() and final.name not in before:
+            while final.exists():
                 bump += 1
                 final = pklz_dir / f"{prefix}-{bump}.pklz"
             try:
@@ -5633,32 +6667,33 @@ class FingerprinterApp:
 
         self._log(f"[+] Renamed {renamed} pklz file(s) with prefix '{prefix}'.")
 
-    def _move_pklz_files(self, pklz_dir: Path, dest_dir: Path) -> None:
+    def _move_pklz_files(self, pklz_dir: Path, dest_dir: Path) -> list[Path]:
         """Move every .pklz file from pklz_dir into dest_dir. Creates dest_dir
-        if needed. On a name collision in the destination, appends _2, _3, ..."""
+        if needed. On a name collision in the destination, appends _2, _3, ...
+        Returns where each file that moved went."""
+        moved: list[Path] = []
         if not pklz_dir.is_dir():
             self._log(f"[!] Work folder doesn't exist: {pklz_dir}", tag="warning")
-            return
+            return moved
         files = [
             p for p in pklz_dir.iterdir()
             if p.is_file() and p.suffix.lower() == ".pklz"
         ]
         if not files:
             self._log("[!] No pklz files to move.", tag="warning")
-            return
+            return moved
 
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:  # noqa: BLE001
             self._log(f"[X] Could not create destination '{dest_dir}': {e}")
-            return
+            return moved
 
         self._log(f"[*] Moving {len(files)} pklz file(s) to: {dest_dir}")
-        moved = 0
         for src in sorted(files, key=lambda p: p.name):
             if self.cancel_flag.is_set():
                 self._log("[!] Move cancelled partway through.", tag="warning")
-                return
+                return moved
             target = dest_dir / src.name
             # Avoid clobbering an existing file in the destination.
             if target.exists():
@@ -5670,10 +6705,11 @@ class FingerprinterApp:
             try:
                 shutil.move(str(src), str(target))
                 self._log(f"    {src.name} -> {target.name}")
-                moved += 1
+                moved.append(target)
             except Exception as e:  # noqa: BLE001
                 self._log(f"[!] Could not move {src.name}: {e}", tag="warning")
-        self._log(f"[+] Moved {moved} pklz file(s) to {dest_dir}.")
+        self._log(f"[+] Moved {len(moved)} pklz file(s) to {dest_dir}.")
+        return moved
 
     def _prepare_work(self, bat_dir: Path, resume: bool, discard: bool = False) -> None:
         """Empty the program's scratch folders before fingerprinting, without
@@ -5796,19 +6832,27 @@ class FingerprinterApp:
         except Exception as e:  # noqa: BLE001
             self._log(f"[!] Could not delete download folder {folder.name}: {e}", tag="warning")
 
-    def _report_pklz(self, pklz_dir: Path, label: str = "Fingerprints", open_folder: bool = True) -> int:
-        """One-shot inventory of a pklz folder. Lists contents, then optionally
-        opens the folder. Returns the file count. `label` is just for the log."""
+    def _report_pklz(self, pklz_dir: Path, label: str = "Fingerprints", open_folder: bool = True,
+                     new_files: list[Path] | None = None) -> int:
+        """Say what this job added to the fingerprints folder: each new .pklz
+        with its size, then one line for the whole folder. Listing the whole
+        folder, as this used to, printed every file ever made after every
+        link. Optionally opens the folder. Returns how many .pklz it holds."""
         if not pklz_dir.is_dir():
             self._log(f"[!] {label} folder doesn't exist: {pklz_dir}", tag="warning")
             return 0
-        files = sorted(p.name for p in pklz_dir.iterdir() if p.is_file())
-        self._log(f"[+] {label}: {len(files)} file(s) in {pklz_dir}")
-        for name in files:
-            self._log(f"    - {name}")
-        if files and open_folder and self.open_pklz_var.get():
+        new_files = [p for p in (new_files or []) if p.is_file()]
+        if new_files:
+            size = sum(p.stat().st_size for p in new_files)
+            self._log(f"[+] {label}: {len(new_files)} file(s), {fmt_size(size)}")
+            for p in new_files:
+                self._log(f"    - {p.name}  ({fmt_size(p.stat().st_size)})")
+        all_pklz = [p for p in pklz_dir.iterdir() if p.is_file() and p.suffix.lower() == ".pklz"]
+        total = sum(p.stat().st_size for p in all_pklz)
+        self._log(f"[+] {pklz_dir} now holds {len(all_pklz):,} .pklz file(s), {fmt_size(total)} in all.")
+        if all_pklz and open_folder and self.open_pklz_var.get():
             self._open_folder(pklz_dir)
-        return len(files)
+        return len(all_pklz)
 
 
 # ---------------------------- entry point -------------------------------------

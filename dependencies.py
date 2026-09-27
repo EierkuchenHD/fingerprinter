@@ -310,6 +310,20 @@ def ytdlp_command() -> list[str] | None:
     return _find_ytdlp()[0]
 
 
+def ytdlp_update_available() -> tuple[str, str] | None:
+    """(version in use, newest release) when PyPI has a newer yt-dlp than the
+    one the program runs, or none is installed; None when it is the newest.
+    Raises OSError when PyPI cannot be reached, so the caller can try again
+    another time rather than take that for "up to date"."""
+    newest = _newest_ytdlp_on_pypi()
+    if not newest:
+        raise OSError("PyPI could not be reached")
+    installed = _find_ytdlp()[1]
+    if installed and _version_key(installed) >= _version_key(newest):
+        return None
+    return installed, newest
+
+
 def check_ytdlp() -> Status:
     why = "downloads the audio"
     cmd, version = _find_ytdlp()

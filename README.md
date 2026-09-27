@@ -105,8 +105,14 @@ extra top-level folder, so check that the file is not one level too deep.
 ## Using it
 
 1. Paste a link into the **Link** box and press **Add** (or Enter). Add as many
-   as you like, or use **Import...** for a text file with one link per line.
+   as you like: several pasted at once (one per line, or separated by spaces
+   or commas) are added together, and a YouTube `@handle` or channel ID works
+   as well as a link. Use **Import...** for a longer list in a text file.
 2. Press **Download and fingerprint**.
+
+A link already in the list is not added twice, however it is written: tracking
+parameters such as `?si=` from the YouTube app, `www.`, `m.` and a trailing `/`
+make no difference. The program shows the row it is in instead.
 
 The folders are already set: audio downloads to `downloads\` and
 finished fingerprints are kept in `pklz-files\`, both in the program folder.
@@ -116,11 +122,20 @@ open that folder, and change it in **Settings** if you want them elsewhere.
 The window has three panels, and the dividers between them can be dragged:
 
 - **Your list**, on the left. Drag a row by its `≡` handle to move it, click a
-  link to open it in your browser, untick a row to skip it this time, and click
-  **✕** to remove it. Right-click a row to open or copy the link, count again,
-  move it to the top or bottom, or remove it. Each row shows how many videos
-  the channel or playlist has; the program counts them in the background when a
+  link to open it in your browser, untick a row to skip it, and click **✕** to
+  remove it. Right-click a row to open or copy the link, count again, move it
+  to the top or bottom, or remove it. Each row shows how many videos the
+  channel or playlist has; the program counts them in the background when a
   link is added, and again once a day, and a large channel takes a minute or so.
+  Ticks are kept when the program closes.
+- A mark beside each link says how its last run ended: **▶** running, **✓**
+  done, **◑** incomplete (some items could not be downloaded or fingerprinted;
+  running it again fetches the rest), **!** failed, **»** skipped, **■**
+  stopped. Hover over it for when. **Tick unfinished**, shown above the list
+  while some link did not finish, ticks just those, to run them again.
+- **Undo**, in the status bar after links are removed (or Ctrl+Z), puts them
+  back where they were. **Remove ticked** asks first when it would empty the
+  list or take more than five links.
 - **Now**, on the right: which link is running, what it is doing (listing,
   downloading, splitting or fingerprinting) with a progress bar and a rough
   time left, and a row for each download or fingerprint batch under way.
@@ -137,18 +152,30 @@ are more than you expected.
 Finished `.pklz` files are named after the channel handle in the link (for
 example `@name-1.pklz`), or after the uploader. Nothing in the fingerprints
 folder is ever deleted: if a name is already taken, the new file gets `_2`,
-`_3` and so on.
+`_3` and so on. After each link, the console lists the files that link made,
+and how many the folder holds in all.
 
 **Pause** freezes whatever is running (downloads, splitting and
 fingerprinting) and starts nothing new until you press **Resume**; it then
 carries on from the same point. A download paused for a long time may lose its
 connection, in which case yt-dlp retries and continues from its partial file.
-**Skip link** moves on to the next link once the current stage finishes.
-**Stop** asks first, then ends everything immediately.
+**Skip link** moves on to the next link: listing and downloads stop at once,
+and a file being split is finished first. A link that is already being
+fingerprinted finishes, so its fingerprints are not thrown away and made again
+next time. **Stop** asks first, then ends everything immediately.
+
+When ten downloads in a row fail in a way that says the site is refusing them
+for now (HTTP 429 or 403, YouTube's "confirm you're not a bot", no connection),
+the program pauses rather than try every item left, which would only fail too.
+It resumes by itself after 10 minutes, then waits longer each time (20, 40, 60
+minutes); press **Resume** to carry on sooner, **Skip link** or **Stop**. A full
+disk pauses at once, until you press **Resume**.
 
 While a job runs, Windows does not go to sleep (the screen can still turn
 off). Both this and the question before Stop can be turned off in Settings,
-General.
+General, which can also put the PC to sleep or shut it down once a job has
+finished. The window title shows the progress too, so it can be read from the
+taskbar. The window opens where it was last time, at the same size.
 
 ### Continuing an unfinished list
 
@@ -170,7 +197,8 @@ Turn on **Skip items already fingerprinted in an earlier run** (Settings,
 Downloads). Every item is then remembered once its link has been fingerprinted,
 and the next run of that channel only downloads what is new. An item is only
 remembered after its whole link succeeds, so a failed run never marks anything
-as done. **Forget them** clears the list.
+as done, and an item whose file audfprint could not read (a cut-off download,
+say) is not remembered either. **Forget them** clears the list.
 
 ### Audio you already have
 
@@ -181,6 +209,11 @@ without downloading anything, and both ask before they start:
   fingerprints.
 - **Fingerprint only** uses the files as they are and skips reading their
   lengths, which saves a long wait on a collection that is already split.
+
+The question before it starts also names the `.pklz` files: after the channel
+when the working folder holds one channel's folder (as a stopped download
+leaves it), otherwise after the working folder. Change the name there if you
+like.
 
 These are also the way to carry on after Stop or a crash. Neither empties
 `work\pklz`, where unfinished `.pklz` files wait. Batches that are already
@@ -206,7 +239,8 @@ two **Audio on disk** choices decide it for themselves.
 
 ## Settings
 
-Settings and the list are saved to `config.json` when you close the program.
+Settings and the list are saved to `config.json` as they change and when you
+close the program.
 The defaults suit most jobs, but check them before a large one: they decide
 memory use, download speed and how big the output files are.
 
@@ -232,17 +266,19 @@ The program always works from its own folder: `audfprint\`, `tools\` and
 | General | Ask before Stop | On | |
 | General | Offer to continue an unfinished list | On | See [Continuing an unfinished list](#continuing-an-unfinished-list). |
 | General | Remove links from the list once fingerprinted | Off | A link leaves the list as soon as all of it has been fingerprinted. Links that failed, were skipped or stopped, or where some downloads or batches failed in a way that may work next time (a network error, a rate limit), stay, so you can run them again. A private or removed video does not keep a link in the list. |
+| General | Keep yt-dlp up to date | On | Once a day, when the program starts, it looks for a newer yt-dlp and installs it. Sites change often, and an old yt-dlp is the commonest reason downloads fail. |
+| General | When a job finishes | Do nothing | **Sleep** or **Shut down** once a list or Audio on disk has run to its end (not after Stop), after a minute in which you can still say no. Back to Do nothing each time the program starts, so a choice made for one night does not stay. |
 | General | Put a shortcut on the desktop | (a button) | A Fingerprinter shortcut with its icon, on the desktop, for this copy of the program. Another copy's shortcut there is not replaced: this one is then called `Fingerprinter 2`. |
 | Folders | Working folder for audio | `downloads\` | Where audio is downloaded. Each link's audio is deleted once it is fingerprinted, so keep nothing else in it. |
 | Folders | Keep finished fingerprints in | `pklz-files\` | Where finished `.pklz` files are collected. Nothing in it is ever deleted. |
 | Folders | Keep downloaded audio in | Off, `audio\` | Keeps a copy of each link's downloads, as they were downloaded (before splitting), in a folder named after the channel. On the same drive this takes no extra space. |
 | Downloads | Name downloaded files | `%(title)s [%(id)s].%(ext)s` | A yt-dlp [output template](https://github.com/yt-dlp/yt-dlp#output-template). |
-| Downloads | Extra download options | empty | Passed to yt-dlp as they are. |
+| Downloads | Extra download options | empty | Passed to yt-dlp, split at spaces as on a command line. Put quotes around a value with spaces in it, such as a path: `--cookies "C:\Users\Jane Doe\cookies.txt"`. |
 | Downloads | Sign in with cookies from | None | A browser whose login yt-dlp uses. See [Content that needs a login](#content-that-needs-a-login). |
 | Downloads | Skip items shorter than / longer than | 0 (no limit) | Leaves out items by length, in seconds and minutes. 60 seconds leaves out YouTube Shorts. |
 | Downloads | Skip items already fingerprinted in an earlier run | Off | See [Running a channel again](#running-a-channel-again). |
 | Downloads | Show every line of download output | Off | Adds everything yt-dlp and audfprint print to the console. Useful when a download fails; otherwise it floods the console. Locked while a job runs. |
-| Downloads | Open the audio folder when a link starts | On | |
+| Downloads | Open the working folder when a list starts | On | Once per list: each link's own folder is deleted once it is done. |
 | Fingerprinting | Fingerprint jobs at once | 4 | How many audfprint processes work at the same time. A link with fewer recordings than Recordings per file is one batch; from 40 files, the jobs share it and their work is merged into one `.pklz`. Each job can use up to about 5.5 GB of memory, so raise it only if you have the RAM and CPU cores. |
 | Fingerprinting | Recordings per file | 1000 | How many recordings go into one `.pklz`. Keep it high: a matcher loads every `.pklz` on each search, so many small files slow every search. |
 | Fingerprinting | Split long recordings after downloading | On | See [Splitting](#splitting). |
@@ -289,7 +325,9 @@ Press **Check setup** first. It:
 - checks every component by running it: Python, the Python packages, yt-dlp,
   ffmpeg, ffprobe, Node.js, and whether `audfprint\` is WerZatSong's version and
   starts;
-- **updates yt-dlp** to its newest release with pip, like `setup.bat`;
+- **updates yt-dlp** to its newest release with pip, like `setup.bat` (the
+  program also does this by itself once a day at start; see Keep yt-dlp up to
+  date in Settings, General);
 - fetches one YouTube video's details as a test;
 - checks free space and write access in the working folder;
 - offers to install or repair whatever is missing or not working, and says what
@@ -301,7 +339,10 @@ Press **Check setup** first. It:
 | `setup.bat` says Python was not found | Install Python from python.org with **Add python.exe to PATH** ticked, then run `setup.bat` again. |
 | `setup.bat`: "Organization policies are preventing installation" | A Windows policy on that PC forbids the installation (Windows Installer code 1625), as on many work, school or managed PCs. `setup.bat` explains it, shows any Windows Installer policy it finds, and offers to install for all users (with an administrator's permission) or to get Python from the Microsoft Store, which these policies do not cover. |
 | An install fails | The console shows why (no connection, proxy, antivirus) and how to do that part by hand. |
-| Many downloads fail, HTTP 429 or 403 | The site is rate-limiting you. Lower **Downloads at once** and try again later. |
+| Many downloads fail, HTTP 429 or 403 | The site is rate-limiting you. After ten in a row the run pauses and resumes by itself later. Lower **Downloads at once**, or try again later. |
+| "YouTube asked to confirm you are not a bot" | YouTube is refusing this PC for a while. Choose your browser under **Sign in with cookies from** (Settings, Downloads), lower **Downloads at once**, or wait. |
+| "yt-dlp may be out of date" | A site changed and this yt-dlp has not caught up. Once the job has finished, press **Check setup** to update it, then run the link again. |
+| "audfprint could not read ..." | That file is damaged or cut off. It is left out of the fingerprints and not remembered as done, and its link counts as incomplete, so running the link again downloads it again. |
 | Some items are skipped | Private, members-only, age-restricted or blocked in your country. The console gives the reason for each. |
 | The downloaded audio is gone | Expected: it is deleted once a link is fingerprinted. Turn on **Keep downloaded audio** in Settings, Folders, to keep it. |
 | A run seems frozen | Big channels take a while to list; **Now** shows how many entries have been found so far. For more detail, turn on **Show every line of download output** (Settings, Downloads). |
