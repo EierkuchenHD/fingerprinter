@@ -128,6 +128,20 @@ The window has three panels, and the dividers between them can be dragged:
   channel or playlist has; the program counts them in the background when a
   link is added, and again once a day, and a large channel takes a minute or so.
   Ticks are kept when the program closes.
+- **Channel pictures:** a YouTube link shows its channel's picture beside it
+  (for a playlist or a video, the picture of the channel it is from; hover over
+  it for the channel's name). They are fetched in the background, a few seconds
+  each, once a month, and kept in `avatars\`. **Count again** fetches them
+  again; **Show channel pictures in the list** (Settings, General) turns them
+  off.
+- **Several rows at once:** Ctrl+click a row to add it to the selection,
+  Shift+click to select every row from the one clicked before, and Ctrl+A with
+  the list clicked to select them all. Dragging one of them moves them all,
+  and right-click works on all of them: copy, count again, tick, untick, move
+  to the top or bottom, or remove. Delete removes them; Esc clears the selection.
+- **Sort ▾** puts the list in order once: most or fewest videos first (links
+  not counted yet go last), or by the link, A to Z or Z to A (`https://` and
+  `www.` don't count). Undo puts the old order back.
 - A mark beside each link says how its last run ended: **▶** running, **✓**
   done, **◑** incomplete (some items could not be downloaded or fingerprinted;
   running it again fetches the rest), **!** failed, **»** skipped, **■**
@@ -138,10 +152,20 @@ The window has three panels, and the dividers between them can be dragged:
   list or take more than five links.
 - **Now**, on the right: which link is running, what it is doing (listing,
   downloading, splitting or fingerprinting) with a progress bar and a rough
-  time left, and a row for each download or fingerprint batch under way.
+  time left, and a row for each download or fingerprint batch under way: its
+  title, shortened to fit (hover over it for the whole title), and how it is
+  going in a column of its own.
 - **Console**, along the bottom: everything that happens, in detail. It
   keeps the newest line in view; untick **Follow** to read back while new lines
-  keep coming.
+  keep coming. **Search** above it (or Ctrl+F) highlights every match as you
+  type, in any case, and new lines as they come; Enter goes to the next match,
+  Shift+Enter to the one before, and Esc clears the search. Going to a match
+  turns Follow off until the search is cleared. Right-click the console to copy,
+  select all, search, save it to a text file or clear it, or to open or copy
+  the link under the pointer.
+
+Ctrl+Backspace and Ctrl+Delete remove a word at a time in the link box and the
+other boxes, as elsewhere in Windows.
 
 Hover over a control to see what it does.
 
@@ -198,7 +222,10 @@ Downloads). Every item is then remembered once its link has been fingerprinted,
 and the next run of that channel only downloads what is new. An item is only
 remembered after its whole link succeeds, so a failed run never marks anything
 as done, and an item whose file audfprint could not read (a cut-off download,
-say) is not remembered either. **Forget them** clears the list.
+say) is not remembered either. **Show them** opens the list
+(`fingerprinted-items.txt`, one item per line: the site and the item's ID); take
+a line out and that item is fetched again next time. Like **Forget them**, which
+clears it, it waits while a job runs, as the run adds to the file.
 
 ### Audio you already have
 
@@ -267,6 +294,7 @@ The program always works from its own folder: `audfprint\`, `tools\` and
 | General | Offer to continue an unfinished list | On | See [Continuing an unfinished list](#continuing-an-unfinished-list). |
 | General | Remove links from the list once fingerprinted | Off | A link leaves the list as soon as all of it has been fingerprinted. Links that failed, were skipped or stopped, or where some downloads or batches failed in a way that may work next time (a network error, a rate limit), stay, so you can run them again. A private or removed video does not keep a link in the list. |
 | General | Keep yt-dlp up to date | On | Once a day, when the program starts, it looks for a newer yt-dlp and installs it. Sites change often, and an old yt-dlp is the commonest reason downloads fail. |
+| General | Show channel pictures in the list | On | For YouTube links, the channel's picture beside the link, fetched from YouTube once a month and kept in `avatars\`. The pictures go the way yt-dlp goes: through its proxy, whether that is set in Extra download options or in yt-dlp's own config file. yt-dlp can use a SOCKS proxy but the picture downloads cannot, so with one nothing is fetched, and the console says so. Off, nothing is fetched. |
 | General | When a job finishes | Do nothing | **Sleep** or **Shut down** once a list or Audio on disk has run to its end (not after Stop), after a minute in which you can still say no. Back to Do nothing each time the program starts, so a choice made for one night does not stay. |
 | General | Put a shortcut on the desktop | (a button) | A Fingerprinter shortcut with its icon, on the desktop, for this copy of the program. Another copy's shortcut there is not replaced: this one is then called `Fingerprinter 2`. |
 | Folders | Working folder for audio | `downloads\` | Where audio is downloaded. Each link's audio is deleted once it is fingerprinted, so keep nothing else in it. |
@@ -298,8 +326,8 @@ Close the Fingerprinter and double-click **`uninstall.bat`** in the program
 folder. It lists what it will remove and asks before anything goes:
 
 - **The program and everything it put in its folder** go: audfprint, ffmpeg
-  and Node.js (`tools\`), its settings, list and scratch files, and its
-  shortcuts, including any on the desktop that start this copy, also one you
+  and Node.js (`tools\`), its settings, list and scratch files, the channel
+  pictures (`avatars\`), and its shortcuts, including any on the desktop that start this copy, also one you
   copied there by hand.
 - **Your own files are asked about one by one, and kept unless you say
   otherwise:** your fingerprints (`pklz-files\`, and unfinished ones in
@@ -392,6 +420,7 @@ service, whose account has no browser profile.
 | `pklz-files\` | The default place finished fingerprints are kept. Nothing in it is deleted. |
 | `audio\` | The default place for kept downloads, when **Keep downloaded audio** is on, in a folder per channel. |
 | `work\` | The program's scratch space: file lists for audfprint and unfinished `.pklz` files. |
+| `avatars\` | The channel pictures shown in the list, and `index.json`, which link is whose channel. Safe to delete; they are fetched again. |
 | `config.json`, `recent_urls.json` | Your settings, list and recent links. |
 | `unfinished-list.json` | Where a list that stopped part-way got to, while it can be continued. |
 | `fingerprinted-items.txt` | Items already fingerprinted, when that setting is on. The format of yt-dlp's `--download-archive`. |

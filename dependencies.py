@@ -1084,7 +1084,7 @@ PROGRAM_FILES = (
     "setup.bat", SHORTCUT_FILE.name, "config.json", "recent_urls.json",
     "fingerprinted-items.txt", "unfinished-list.json", "unfinished-list.tmp", RECORD_FILE.name,
 )
-PROGRAM_FOLDERS = ("audfprint", "audfprint.download", "texts", "__pycache__")
+PROGRAM_FOLDERS = ("audfprint", "audfprint.download", "texts", "__pycache__", "avatars")
 PROGRAM_SUBFOLDERS = {"tools": ("ffmpeg", "node"), "work": ("texts",)}
 # The user's own files: asked about one by one, and kept unless they say so.
 FINGERPRINTS_DIR, KEPT_AUDIO_DIR, WORKING_DIR = "pklz-files", "audio", "downloads"

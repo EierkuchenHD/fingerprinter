@@ -26,6 +26,7 @@
   "write_fingerprinted_json": false,
   "console_follow": true,
   "auto_update_ytdlp": true,
+  "show_avatars": true,
   "config_version": 3,
   "queue": []
 }

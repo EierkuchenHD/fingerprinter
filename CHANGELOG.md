@@ -3,6 +3,50 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.0.0-beta.7] - 2026-09-28
+
+### Added
+
+- **Channel pictures in the list**: a YouTube link shows its channel's picture
+  (for a playlist or a video, that of the channel it is from), with the
+  channel's name on hover. Fetched in the background once a month as a small
+  round PNG, so without Pillow, and kept in `avatars\`, which uninstall removes
+  too. Count again fetches them again. **Show channel pictures in the list**
+  (Settings, General) turns them off, and then nothing is fetched. They go
+  through the proxy yt-dlp uses (Extra download options or yt-dlp's own config
+  file); with a SOCKS proxy, which they cannot use, nothing is fetched.
+- **Search in the console** (or Ctrl+F): every match highlighted as you type,
+  in any case, new lines included; Enter and Shift+Enter go from match to
+  match, with a count, and Esc clears it. Going to a match turns Follow off
+  until the search is cleared.
+- **A right-click menu in the console**: Copy, Copy all, Select all, Search,
+  Save as, Clear and Follow, and Open link or Copy link on a link.
+- **Ctrl+Backspace and Ctrl+Delete** remove a word at a time in the link box
+  and every other box, as elsewhere in Windows. Tk has neither.
+- **Several rows selected at once** in the list: Ctrl+click, Shift+click, and
+  Ctrl+A with the list clicked. Dragging one moves them all; right-click copies,
+  counts again, ticks, unticks, moves or removes them all; Delete removes them
+  and Esc clears the selection. Remove ticked with nothing ticked removes the
+  selected rows.
+- **Sort** above the list: most or fewest videos first, or by the link, A to Z
+  or Z to A. Undo puts the old order back.
+- **Show them**, beside Forget them (Settings, Downloads), opens the list of
+  items remembered as fingerprinted.
+
+### Changed
+
+- **The Now panel** shows how each download or batch is going in a column of
+  its own, instead of after a `|` at the end of its title.
+
+### Fixed
+
+- **Titles in the Now panel** were cut at 40 characters however wide the
+  panel was. They now use the room there is, end in … where they are cut, and
+  show in full on hover.
+- **`fingerprinted-items.txt` edited by hand**: when its last line had no line
+  break, the next item remembered ran on into it, and both were fetched again;
+  a byte-order mark from Notepad hid the first item. Neither happens now.
+
 ## [1.0.0-beta.6] - 2026-09-27
 
 ### Added
@@ -335,6 +379,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.0.0-beta.7]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.7
 [1.0.0-beta.6]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.6
 [1.0.0-beta.5]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.5
 [1.0.0-beta.4]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.4

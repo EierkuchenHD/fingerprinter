@@ -62,7 +62,7 @@ if exist "work\pklz\*.pklz" (
 for %%F in (yt-fingerprinter.pyw dependencies.py audfprint_quiet.py requirements.txt config.example.json README.md CHANGELOG.md LICENSE fingerprinter.ico setup.bat Fingerprinter.lnk config.json recent_urls.json fingerprinted-items.txt unfinished-list.json unfinished-list.tmp installed-by-setup.txt) do (
     if exist "%%F" del /f /q "%%F"
 )
-for %%D in (audfprint audfprint.download texts __pycache__ tools\ffmpeg tools\node work\texts) do (
+for %%D in (audfprint audfprint.download texts __pycache__ avatars tools\ffmpeg tools\node work\texts) do (
     if exist "%%D\" rmdir /s /q "%%D"
 )
 for /d %%D in (audfprint.old audfprint.old? audfprint.old?? tools\tmp*) do (

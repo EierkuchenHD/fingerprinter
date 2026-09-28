@@ -32,8 +32,12 @@ Requirements (dependencies.py checks them and installs what is missing):
 """
 from __future__ import annotations
 
+import ast
 import base64
+import bisect
+import datetime
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -47,12 +51,13 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.request
 import webbrowser
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import dependencies
 
@@ -61,7 +66,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.0.0-beta.6"
+__version__ = "1.0.0-beta.7"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -148,6 +153,38 @@ def youtube_handle(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+def youtube_kind(url: str) -> str | None:
+    """What a YouTube link is: "channel", "playlist" or "video"; None for any
+    other site. A watch link with a list is the list, as yt-dlp takes it,
+    except a Mix (list=RD...), which yt-dlp takes as the one video."""
+    key = link_key(url)
+    if not key.startswith("youtube.com/"):
+        return None
+    path, _, query = key[len("youtube.com"):].partition("?")
+    params = dict(parse_qsl(query))
+    playlist = params.get("list", "")
+    if path in ("/playlist", "/watch") and playlist and not playlist.startswith("RD"):
+        return "playlist"
+    if re.match(r"^/(@[^/]+|channel/UC[\w-]+|c/[^/]+|user/[^/]+)(/|$)", path):
+        return "channel"
+    if (path == "/watch" and params.get("v")) or re.match(r"^/(shorts|live|embed)/[\w-]+$", path):
+        return "video"
+    return None
+
+
+def youtube_channel_page(url: str) -> str | None:
+    """The channel page of a YouTube channel link (without its tab), or None."""
+    m = re.match(r"^youtube\.com/(@[^/?#]+|channel/UC[\w-]+|c/[^/?#]+|user/[^/?#]+)", link_key(url))
+    return f"https://www.youtube.com/{m.group(1)}" if m else None
+
+
+def avatar_image_url(url: str, px: int) -> str:
+    """A channel picture's address, asking Google's image server for a round
+    PNG of px pixels (=s20-cc-rp): Tk shows PNG without Pillow, and the soft
+    edge of the circle blends into whatever colour the row has."""
+    return re.sub(r"=[\w-]*$", "", url) + f"=s{int(px)}-cc-rp"
+
+
 def check_dependency(cmd: str | list[str]) -> bool:
     """True if the program starts at all. A list is a full command, such as
     ["python", "-m", "yt_dlp"]."""
@@ -209,6 +246,34 @@ DONE_FILE = SCRIPT_DIR / "fingerprinted-items.txt"
 # finding it at start-up means the last run stopped part-way (Stop, a crash,
 # the PC shutting down) and can be continued (see _offer_resume).
 LIST_STATE_FILE = SCRIPT_DIR / "unfinished-list.json"
+# Channel pictures for the list's YouTube links (Settings, General): a small
+# round PNG per channel, "<channel id>-<pixels>.png", and index.json, which
+# link is whose channel. Looked up again after AVATAR_REFRESH_DAYS.
+AVATAR_DIR = SCRIPT_DIR / "avatars"
+AVATAR_INDEX = AVATAR_DIR / "index.json"
+AVATAR_REFRESH_DAYS = 30
+
+
+def load_avatar_index() -> dict:
+    """{"links": {link_key: {"channel", "date", "tried"}}, "channels":
+    {channel id: {"image", "name", "handle", "date"}}}; empty when missing."""
+    try:
+        data = json.loads(AVATAR_INDEX.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    return {part: data[part] if isinstance(data.get(part), dict) else {}
+            for part in ("links", "channels")}
+
+
+def save_avatar_index(index: dict) -> None:
+    try:
+        AVATAR_DIR.mkdir(exist_ok=True)
+        tmp = AVATAR_INDEX.with_suffix(".tmp")
+        tmp.write_text(json.dumps(index, indent=1), encoding="utf-8")
+        os.replace(tmp, AVATAR_INDEX)
+    except OSError:
+        pass
 
 
 def load_config() -> dict:
@@ -312,6 +377,8 @@ PALETTES = {
         "menu": "SystemMenu", "menu_fg": "SystemMenuText", "list": "SystemWindow",
         "list_fg": "SystemWindowText", "highlight": "SystemHighlight", "highlight_fg": "SystemHighlightText",
         "tip_bg": "#ffffe1", "tip_fg": "#000000",
+        # Console search: every match, and the one gone to.
+        "found": "#fff0a0", "found_now": "#ffb74d",
         "tags": {"ytdlp": "#1565c0", "bat": "#e67e22", "warning": "#c0392b",
                  "splitter": "#16a085", "ts": "#888888"},
     },
@@ -325,6 +392,7 @@ PALETTES = {
         "menu": "#2b2c30", "menu_fg": "#e8eaed", "list": "#2b2c30",
         "list_fg": "#e8eaed", "highlight": "#264f78", "highlight_fg": "#e8eaed",
         "tip_bg": "#303134", "tip_fg": "#e8eaed",
+        "found": "#574714", "found_now": "#9a6700",
         "tags": {"ytdlp": "#8ab4f8", "bat": "#fbbc04", "warning": "#f28b82",
                  "splitter": "#81c995", "ts": "#8c8f94"},
     },
@@ -524,6 +592,9 @@ class FingerprinterApp:
 
         self._build_ui()
         self._apply_config(load_config())
+        # Channel pictures go the way yt-dlp goes: they follow its options.
+        for var in (self.extra_args_var, self.cookies_browser_var):
+            var.trace_add("write", lambda *_a: self._note_avatar_options())
         self._fill_default_folders()
         # The ttk theme main() picked: light mode goes back to it (_apply_theme).
         self._native_theme = ttk.Style().theme_use()
@@ -539,6 +610,14 @@ class FingerprinterApp:
         # box being typed in, where it means undo the typing.
         for key in ("<Control-z>", "<Control-Z>"):
             self.root.bind(key, self._on_ctrl_z)
+        # Ctrl+F: search the console.
+        for key in ("<Control-f>", "<Control-F>"):
+            self.root.bind(key, lambda _e: self._focus_console_find())
+        # Ctrl+Backspace and Ctrl+Delete remove a word at a time in every
+        # box, as elsewhere in Windows. Tk has neither.
+        for cls in ("Entry", "TEntry", "TCombobox", "Spinbox", "TSpinbox"):
+            self.root.bind_class(cls, "<Control-BackSpace>", lambda e: self._delete_word(e, forward=False))
+            self.root.bind_class(cls, "<Control-Delete>", lambda e: self._delete_word(e, forward=True))
         # Quick look for anything missing, so a first run offers to install it
         # instead of failing halfway through the first link. Started from the
         # event loop, and handed the folder rather than reading the Tk variable
@@ -654,7 +733,8 @@ class FingerprinterApp:
                                     font=self._link_font)
         self._themed_labels.append((self.undo_label, "link"))
         self.undo_label.bind("<Button-1>", lambda _e: self._undo_removal())
-        Tooltip(self.undo_label, "Put the removed links back where they were (Ctrl+Z).")
+        Tooltip(self.undo_label, "Put the removed links back where they were, or the list "
+                                 "back in the order it had before Sort (Ctrl+Z).")
         self.keep_label = ttk.Label(status, cursor="hand2", foreground=self.QLINK_FG)
         self._themed_labels.append((self.keep_label, "link"))
         self.keep_label.pack(side="right", padx=8, pady=3)
@@ -810,6 +890,12 @@ class FingerprinterApp:
         self.tick_all_btn = ttk.Button(head, text="Tick all", style="Toolbutton",
                                        command=self._tick_all)
         self.tick_all_btn.pack(side="right")
+        self.sort_btn = ttk.Button(head, text="Sort ▾", style="Toolbutton",
+                                   command=self._show_sort_menu)
+        self.sort_btn.pack(side="right")
+        Tooltip(self.sort_btn,
+                "Put the list in order: by how many videos each link has, or by "
+                "the link, A to Z or Z to A. Undo puts the old order back.")
         # Shown once some link did not finish its last run (_update_list_header).
         self.tick_unfinished_btn = ttk.Button(head, text="Tick unfinished", style="Toolbutton",
                                               command=self._tick_unfinished)
@@ -836,13 +922,21 @@ class FingerprinterApp:
         self.queue_canvas.bind("<Configure>", lambda e: self.queue_canvas.itemconfigure(
             inner, width=e.width))
         self._wheel_targets.append(self.queue_canvas)
+        # Clicking a row gives the list the keyboard, for these.
+        self.queue_canvas.bind("<Delete>", lambda _e: self._queue_remove_selected())
+        self.queue_canvas.bind("<Control-a>", lambda _e: self._queue_select_all())
+        self.queue_canvas.bind("<Control-A>", lambda _e: self._queue_select_all())
+        self.queue_canvas.bind("<Escape>", lambda _e: self._queue_select_none())
 
         # Backing state. queue_urls holds the URLs; queue_checks holds a
-        # BooleanVar per URL (checked = include in the run); queue_active is the
-        # index last clicked. queue_rows holds each row's widgets, in order.
+        # BooleanVar per URL (checked = include in the run). queue_selected
+        # holds the selected rows' links (Ctrl+click and Shift+click select
+        # more than one), and _queue_anchor the one clicked last (queue_active
+        # is its row). queue_rows holds each row's widgets, in order.
         self.queue_urls: list[str] = []
         self.queue_checks: list[tk.BooleanVar] = []
-        self.queue_active: int | None = None
+        self.queue_selected: set[str] = set()
+        self._queue_anchor: str | None = None
         self.queue_rows: list[dict] = []
         self._queue_editable = True
         self._drag: dict | None = None
@@ -860,6 +954,26 @@ class FingerprinterApp:
         self._count_procs: list[subprocess.Popen] = []
         self._count_lock = threading.Lock()
         self._closing = False
+        # Channel pictures (_request_avatars): what is known about whose
+        # channel each link is, loaded here so the rows built next show the
+        # pictures already fetched, without going online.
+        self.show_avatars_var = tk.BooleanVar(value=True)
+        self._avatars_on = True
+        self._avatar_extra: list[str] = []
+        # (key, when, opener) of the last _avatar_connection, and the last
+        # reason given for fetching nothing, so it is said once.
+        self._avatar_proxy: tuple | None = None
+        self._avatar_proxy_said = ""
+        self._avatar_index = load_avatar_index()
+        self._avatar_lock = threading.Lock()
+        self._avatar_images: dict[str, tk.PhotoImage] = {}
+        # As tall as a line of the list's text, so rows keep their height.
+        self._avatar_px = self._link_font.metrics("linespace") + 5
+        self._avatar_blank = tk.PhotoImage(master=self.root, width=self._avatar_px,
+                                           height=self._avatar_px)
+        self._avatar_queue: queue.Queue[tuple] = queue.Queue()
+        self._avatar_pending: set[str] = set()
+        self._avatar_thread: threading.Thread | None = None
 
     def _build_now_panel(self) -> None:
         box = ttk.Frame(self.hpanes)
@@ -890,10 +1004,13 @@ class FingerprinterApp:
         inner = self.now_canvas.create_window((0, 0), window=self.active_frame, anchor="nw")
         self.active_frame.bind("<Configure>", lambda _e: self.now_canvas.configure(
             scrollregion=self.now_canvas.bbox("all")))
-        self.now_canvas.bind("<Configure>", lambda e: self.now_canvas.itemconfigure(
-            inner, width=e.width))
+        def resized(e: tk.Event) -> None:
+            self.now_canvas.itemconfigure(inner, width=e.width)
+            if self.slot_rows:
+                self.active_frame.columnconfigure(2, minsize=self._slot_status_width())
+        self.now_canvas.bind("<Configure>", resized)
         self._wheel_targets.append(self.now_canvas)
-        self.slot_vars: list[tk.StringVar] = []
+        self.slot_rows: list[dict] = []
         self._init_slots(0)
 
     def _build_console_panel(self) -> None:
@@ -915,6 +1032,43 @@ class FingerprinterApp:
         follow.pack(side="right", padx=(0, 8))
         Tooltip(follow, "Scroll to each new line as it is added. Turn off to read "
                         "earlier lines while a job runs.")
+        # Search: every match is highlighted as you type, in any case, and the
+        # one gone to more strongly. Enter and Shift+Enter (or the arrows) go
+        # to the next and the one before; Esc clears it. Ctrl+F comes here.
+        self.console_find_count_var = tk.StringVar()
+        find_count = ttk.Label(head, textvariable=self.console_find_count_var,
+                               foreground=self.HELP_GREY, width=14, anchor="w")
+        find_count.pack(side="right", padx=(4, 8))
+        self._themed_labels.append((find_count, "help"))
+        find_next = ttk.Button(head, text="▼", width=2, style="Toolbutton",
+                               command=lambda: self._console_find_step(1))
+        find_next.pack(side="right")
+        Tooltip(find_next, "The next match (Enter).")
+        find_prev = ttk.Button(head, text="▲", width=2, style="Toolbutton",
+                               command=lambda: self._console_find_step(-1))
+        find_prev.pack(side="right")
+        Tooltip(find_prev, "The match before (Shift+Enter).")
+        self.console_find_var = tk.StringVar()
+        self.console_find_entry = ttk.Entry(head, textvariable=self.console_find_var, width=26)
+        self.console_find_entry.pack(side="right", padx=(4, 2))
+        Tooltip(self.console_find_entry,
+                "Search the console (Ctrl+F). Every match is highlighted, in any case. "
+                "Enter goes to the next, Shift+Enter to the one before, Esc clears it. "
+                "Going to a match turns Follow off until the search is cleared.")
+        ttk.Label(head, text="Search:").pack(side="right")
+        self.console_find_var.trace_add("write", lambda *_a: self._console_find_later())
+        self.console_find_entry.bind("<Return>", lambda _e: self._console_find_step(1))
+        self.console_find_entry.bind("<Shift-Return>", lambda _e: self._console_find_step(-1))
+        self.console_find_entry.bind("<Escape>", lambda _e: self.console_find_var.set(""))
+        # The matches: (start index, length), top to bottom; which one was
+        # gone to (-1: none); the search they are for; and whether going to
+        # one turned Follow off, to turn it back on when the search is cleared.
+        self._found: list[tuple[str, int]] = []
+        self._found_keys: list[tuple[int, int]] = []    # (line, column) of each, for bisect
+        self._found_now = -1
+        self._found_term = ""
+        self._find_after: str | None = None
+        self._find_paused_follow = False
         # wrap="word": long file names wrap onto the next line whole instead of
         # breaking mid-word at the edge of the console. A plain Text with a ttk
         # scrollbar rather than ScrolledText, whose classic Windows scrollbar
@@ -929,12 +1083,18 @@ class FingerprinterApp:
         self.log_text.pack(side="left", fill="both", expand=True)
         # Ctrl and the wheel change the text size, like in a browser.
         self.log_text.bind("<Control-MouseWheel>", self._console_zoom)
+        self.log_text.bind("<Button-3>", self._console_menu)
         self.log_text.configure(state="disabled")
         self.log_text.tag_configure("ytdlp", foreground="#1565c0")
         self.log_text.tag_configure("bat", foreground="#e67e22")
         self.log_text.tag_configure("warning", foreground="#c0392b")
         self.log_text.tag_configure("splitter", foreground="#16a085")
         self.log_text.tag_configure("ts", foreground="#888888")
+        p = PALETTES["light"]
+        self.log_text.tag_configure("found", background=p["found"])
+        self.log_text.tag_configure("found_now", background=p["found_now"])
+        # Selected text shows over the search's highlighting.
+        self.log_text.tag_raise("sel")
 
     def _build_settings(self) -> None:
         """Everything set once, in its own window: folders, then download and
@@ -1010,6 +1170,11 @@ class FingerprinterApp:
         ):
             ttk.Checkbutton(tab, text=label, variable=var).pack(anchor="w", pady=1)
             self._help(tab, explanation, wrap=560).pack(anchor="w", padx=22, pady=(0, 6))
+        ttk.Checkbutton(tab, text="Show channel pictures in the list", variable=self.show_avatars_var,
+                        command=self._show_avatars_changed).pack(anchor="w", pady=1)
+        self._help(tab, "For YouTube links: the channel's picture beside the link. Fetched from "
+                        f"YouTube once a month and kept in the {AVATAR_DIR.name} folder. Off, "
+                        "nothing is fetched.", wrap=560).pack(anchor="w", padx=22, pady=(0, 6))
 
         # Deliberately not saved: a Shut down chosen for one night and forgotten
         # would otherwise switch the PC off after every job from then on.
@@ -1145,6 +1310,12 @@ class FingerprinterApp:
         self.skip_done_check.pack(side="left")
         self.forget_done_btn = ttk.Button(row, text="Forget them", command=self._forget_done)
         self.forget_done_btn.pack(side="right")
+        self.show_done_btn = ttk.Button(row, text="Show them", command=self._show_done)
+        self.show_done_btn.pack(side="right", padx=(0, 4))
+        Tooltip(self.show_done_btn,
+                f"Open {DONE_FILE.name}, the list of items remembered as fingerprinted: "
+                "one per line, the site and the item's ID. Take a line out to have "
+                "that item fetched again. Not while a job runs: it adds to the file.")
         self.done_count_var = tk.StringVar()
         done_count = ttk.Label(row, textvariable=self.done_count_var, foreground=self.HELP_GREY)
         done_count.pack(side="right", padx=6)
@@ -1368,6 +1539,8 @@ class FingerprinterApp:
                                 selectbackground=p["highlight"], selectforeground=p["highlight_fg"])
         for tag, colour in p["tags"].items():
             self.log_text.tag_configure(tag, foreground=colour)
+        self.log_text.tag_configure("found", background=p["found"])
+        self.log_text.tag_configure("found_now", background=p["found_now"])
         self._themed_labels = [(label, role) for label, role in self._themed_labels if label.winfo_exists()]
         for label, role in self._themed_labels:
             label.configure(foreground=p[role])
@@ -1377,8 +1550,8 @@ class FingerprinterApp:
             self._style_combo_popdown(combo, p)
         # The rows are rebuilt in the new colours, keeping what they show.
         self._refresh_queue()
-        texts = [v.get() for v in self.slot_vars]
-        self._init_slots(len(texts), texts or None)
+        rows = self._slot_contents()
+        self._init_slots(len(rows), rows or None)
         for window in (self.root, self.settings_win):
             self._dark_title_bar(window, mode == "dark")
 
@@ -1835,6 +2008,114 @@ class FingerprinterApp:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+        self._found, self._found_keys, self._found_now = [], [], -1
+        self._show_find_count()
+
+    # ---- Searching the console ----------------------------------------------------
+
+    def _focus_console_find(self) -> str:
+        """Ctrl+F: to the search box, its text selected to type over."""
+        self.console_find_entry.focus_set()
+        self.console_find_entry.select_range(0, "end")
+        self.console_find_entry.icursor("end")
+        return "break"
+
+    def _console_find_later(self) -> None:
+        """The search box changed: search once typing pauses."""
+        if self._find_after is not None:
+            self.root.after_cancel(self._find_after)
+        self._find_after = self.root.after(150, self._console_find)
+
+    def _console_find(self) -> None:
+        """Highlight every match of the search box in the console, and go to
+        the first from the top of the view (so the view stays put if one is in
+        sight). An empty box clears the search, and turns Follow back on if
+        going to a match turned it off."""
+        if self._find_after is not None:
+            self.root.after_cancel(self._find_after)
+            self._find_after = None
+        text = self.log_text
+        text.tag_remove("found", "1.0", "end")
+        text.tag_remove("found_now", "1.0", "end")
+        self._found, self._found_keys, self._found_now = [], [], -1
+        self._found_term = self._console_find_term()
+        if not self._found_term:
+            self._show_find_count()
+            if self._find_paused_follow:
+                self._find_paused_follow = False
+                self.console_follow_var.set(True)
+                text.see("end")
+            return
+        self._console_mark_matches("1.0")
+        if not self._found:
+            self._show_find_count()
+            return
+        # The first match from the top of the view: found by halving, as a
+        # Tk comparison per match took seconds on a long console.
+        top = tuple(int(n) for n in text.index("@0,0").split("."))
+        first = bisect.bisect_left(self._found_keys, top)
+        self._console_show_match(first if first < len(self._found) else 0)
+
+    def _console_find_term(self) -> str:
+        """The search box's text, up to any line break a paste brought in:
+        the console is searched a line at a time."""
+        return self.console_find_var.get().replace("\r", "\n").split("\n")[0]
+
+    def _console_mark_matches(self, start: str) -> None:
+        """Highlight and note the matches of the search from `start` on. One
+        Tk search for all of them: a Python loop was slow on a long console.
+        A match is as long as the search, in characters ("+Nc"); Tk's own
+        count is in index columns, where an emoji takes two."""
+        text = self.log_text
+        found = text.tk.splitlist(text.tk.call(
+            text._w, "search", "-all", "-nocase", "--", self._found_term, start, "end-1c"))
+        if not found:
+            return
+        n = len(self._found_term)
+        spans = [(str(s), n) for s in found]
+        self._found.extend(spans)
+        self._found_keys.extend(tuple(int(p) for p in s.split(".")) for s, _n in spans)
+        for i in range(0, len(spans), 500):
+            text.tag_add("found", *(ix for s, _n in spans[i:i + 500] for ix in (s, f"{s}+{n}c")))
+
+    def _console_show_match(self, i: int) -> None:
+        """Go to match i, and turn Follow off meanwhile: the next line added
+        would scroll it away."""
+        text = self.log_text
+        text.tag_remove("found_now", "1.0", "end")
+        self._found_now = i
+        start, n = self._found[i]
+        text.tag_add("found_now", start, f"{start}+{n}c")
+        if self.console_follow_var.get():
+            self.console_follow_var.set(False)
+            self._find_paused_follow = True
+        text.see(start)
+        self._show_find_count()
+
+    def _console_find_step(self, step: int) -> str:
+        """Enter / Shift+Enter, or the arrows: the next match, or the one
+        before, round from the end to the start."""
+        if self._find_after is not None or self._found_term != self._console_find_term():
+            self._console_find()        # typed just now: search first
+            if self._found_now >= 0 and step > 0:
+                return "break"          # already on the first match
+        if self._found:
+            now = self._found_now
+            self._console_show_match((now + step) % len(self._found) if now >= 0
+                                     else (0 if step > 0 else len(self._found) - 1))
+        return "break"
+
+    def _show_find_count(self) -> None:
+        n = len(self._found)
+        if not self._found_term:
+            words = ""
+        elif not n:
+            words = "No matches"
+        elif self._found_now >= 0:
+            words = f"{self._found_now + 1:,} of {n:,}"
+        else:
+            words = f"{n:,} match" + ("" if n == 1 else "es")
+        self.console_find_count_var.set(words)
 
     def _copy_log(self) -> None:
         contents = self.log_text.get("1.0", "end-1c")
@@ -1851,6 +2132,73 @@ class FingerprinterApp:
         except tk.TclError as e:
             self._log(f"[!] Could not copy to clipboard: {e}")
 
+    _CONSOLE_LINK_RE = re.compile(r"https?://[^\s\"'<>]+")
+
+    def _console_link_at(self, x: int, y: int) -> str | None:
+        """The link in the console under the pointer, if any."""
+        index = self.log_text.index(f"@{x},{y}")
+        line_no = int(index.split(".")[0])
+        # In characters, as Python counts them: Tk's column counts an emoji
+        # in a title as two.
+        col = len(self.log_text.get(f"{line_no}.0", index))
+        line = self.log_text.get(f"{line_no}.0", f"{line_no}.end")
+        for m in self._CONSOLE_LINK_RE.finditer(line):
+            if m.start() <= col <= m.end():
+                return m.group().rstrip(".,;:)]'")
+        return None
+
+    def _console_menu(self, event: tk.Event) -> str:
+        """Right-click in the console: copy, select, search, save or clear it,
+        and open or copy the link under the pointer."""
+        text = self.log_text
+        link = self._console_link_at(event.x, event.y)
+        has_text = bool(text.get("1.0", "end-1c").strip())
+        menu = tk.Menu(self.root, tearoff=0, **self._menu_colours())
+        if link:
+            menu.add_command(label="Open link", command=lambda: self._open_link(link))
+            menu.add_command(label="Copy link", command=lambda: self._copy_text(link))
+            menu.add_separator()
+        menu.add_command(label="Copy", accelerator="Ctrl+C",
+                         state="normal" if text.tag_ranges("sel") else "disabled",
+                         command=lambda: self._copy_text(text.get("sel.first", "sel.last")))
+        menu.add_command(label="Copy all", state="normal" if has_text else "disabled",
+                         command=self._copy_log)
+        menu.add_command(label="Select all", accelerator="Ctrl+A", state="normal" if has_text else "disabled",
+                         command=lambda: (text.tag_add("sel", "1.0", "end-1c"), text.focus_set()))
+        menu.add_command(label="Search...", accelerator="Ctrl+F", command=self._focus_console_find)
+        menu.add_separator()
+        menu.add_command(label="Save as...", state="normal" if has_text else "disabled",
+                         command=self._save_log)
+        menu.add_command(label="Clear", state="normal" if has_text else "disabled",
+                         command=self._clear_log)
+        menu.add_separator()
+        menu.add_checkbutton(label="Follow", variable=self.console_follow_var,
+                             command=self._console_follow_changed)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _save_log(self) -> None:
+        """Save what the console holds to a text file of the user's choosing."""
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Save the console",
+            initialfile=time.strftime("Fingerprinter console %Y-%m-%d %H-%M.txt"),
+            defaultextension=".txt", filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        # Encoded before the file is opened, so nothing can fail after it has
+        # been emptied; a stray half of an emoji pair becomes "?".
+        data = self.log_text.get("1.0", "end-1c").replace("\n", "\r\n").encode("utf-8", errors="replace")
+        try:
+            Path(path).write_bytes(data)
+        except OSError as e:
+            messagebox.showerror("Could not save", f"The console could not be saved:\n{e}", parent=self.root)
+            return
+        self._log(f"[+] Console saved to {path}")
+
     # ------------------------- threading bridge -------------------------------
 
     def _log(self, msg: str, tag: str | None = None) -> None:
@@ -1861,10 +2209,13 @@ class FingerprinterApp:
         self.log_queue.put((ts, msg, tag))
 
     def _poll_log_queue(self) -> None:
+        added_from = None
         try:
             while True:
                 ts, msg, tag = self.log_queue.get_nowait()
                 self.log_text.configure(state="normal")
+                if added_from is None:
+                    added_from = self.log_text.index("end-1c")
                 self.log_text.insert("end", ts, "ts")
                 if tag:
                     self.log_text.insert("end", msg + "\n", tag)
@@ -1875,10 +2226,16 @@ class FingerprinterApp:
                 self.log_text.configure(state="disabled")
         except queue.Empty:
             pass
+        # New lines are searched too, while a search is on.
+        if added_from is not None and self._found_term:
+            self._console_mark_matches(added_from)
+            self._show_find_count()
         self.root.after(100, self._poll_log_queue)
 
     def _console_follow_changed(self) -> None:
-        """Turned back on: catch up with the newest line straight away."""
+        """Turned back on: catch up with the newest line straight away. Either
+        way it is the user's choice now, which clearing a search leaves be."""
+        self._find_paused_follow = False
         if self.console_follow_var.get():
             self.log_text.see("end")
 
@@ -1918,6 +2275,7 @@ class FingerprinterApp:
         ("fp_record_var", "write_fingerprinted_json", bool),
         ("console_follow_var", "console_follow", bool),
         ("auto_update_ytdlp_var", "auto_update_ytdlp", bool),
+        ("show_avatars_var", "show_avatars", bool),
     )
 
     def _apply_config(self, cfg: dict) -> None:
@@ -2048,6 +2406,10 @@ class FingerprinterApp:
             out["window"] = window
         if self._ytdlp_checked:
             out["ytdlp_checked"] = self._ytdlp_checked
+        # Follow as the user left it: a search that turned it off meanwhile
+        # (_console_show_match) does not keep it off after a restart.
+        if self._find_paused_follow:
+            out["console_follow"] = True
         return out
 
     # ---- the window's size and place, kept between sessions ------------------
@@ -2269,40 +2631,115 @@ class FingerprinterApp:
 
     # ------------------------- slot panel -------------------------------------
 
-    def _init_slots(self, n: int, texts: list[str] | None = None) -> None:
-        """Rebuild the Now panel with n rows (UI thread). With no rows it says
-        what will appear there."""
+    # Statuses about as wide as they get. The status column is kept this wide,
+    # so the titles do not shift about as a download's status changes.
+    SLOT_STATUS_SAMPLES = ("99.9%  999.99KiB/s  ETA 00:00", "extracting audio... (100s)",
+                           "12,345 of 12,345 files (100%)")
+
+    def _init_slots(self, n: int, rows: list[tuple[str, str, str]] | None = None) -> None:
+        """Rebuild the Now panel with n rows (UI thread), each (number, title,
+        status): what the row is about (a download's title, a fingerprint
+        batch) and, in a column of its own, how it is going. With no rows it
+        says what will appear there."""
         for child in self.active_frame.winfo_children():
             child.destroy()
-        self.slot_vars = []
+        self.slot_rows = []
+        # The titles take the room the numbers and statuses leave.
+        self.active_frame.columnconfigure(1, weight=1)
         if n <= 0:
             tk.Label(
                 self.active_frame, bg=self.QROW_BG, fg=self.QMUTED_FG, justify="left", anchor="w",
                 text="Nothing running. Downloads and fingerprinting show here once "
                      "you start.",
                 wraplength=360,
-            ).pack(fill="x", padx=6, pady=6)
+            ).grid(row=0, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
             return
+        self.active_frame.columnconfigure(2, minsize=self._slot_status_width())
         for i in range(n):
-            var = tk.StringVar(value=(texts[i] if texts else f"{i + 1:>2}  idle"))
-            tk.Label(self.active_frame, textvariable=var, bg=self.QROW_BG, fg=self.QFG,
-                     anchor="w").pack(fill="x", padx=4)
-            self.slot_vars.append(var)
+            num, title, status = rows[i] if rows else (str(i + 1), "", "idle")
+            row = {"num": num, "title": title, "status": status}
+            row["num_label"] = tk.Label(self.active_frame, text=num, bg=self.QROW_BG,
+                                        fg=self.QMUTED_FG, anchor="e", width=2)
+            # width=1: a title asks for no room of its own. It gets what is
+            # left, and is shortened to fit that (_fit_slot_title).
+            row["title_label"] = tk.Label(self.active_frame, bg=self.QROW_BG, fg=self.QFG,
+                                          anchor="w", width=1, padx=0)
+            row["status_label"] = tk.Label(self.active_frame, text=status, bg=self.QROW_BG,
+                                           fg=self.QFG, anchor="w", padx=0)
+            row["num_label"].grid(row=i, column=0, sticky="e", padx=(4, 6))
+            row["title_label"].grid(row=i, column=1, sticky="ew", padx=(0, 16))
+            row["status_label"].grid(row=i, column=2, sticky="w", padx=(0, 6))
+            row["title_label"].bind("<Configure>", lambda _e, r=row: self._fit_slot_title(r))
+            # The whole title, when it had to be shortened.
+            Tooltip(row["title_label"],
+                    lambda r=row: r["title"] if r["title_label"].cget("text") != r["title"] else "")
+            self.slot_rows.append(row)
+            self._fit_slot_title(row)
 
-    def _update_slot(self, idx: int, text: str) -> None:
-        """Thread-safe slot label update."""
+    def _slot_status_width(self) -> int:
+        """The status column's width: as wide as statuses get, but no more
+        than 45% of the panel, so a narrow panel still shows part of each
+        title (Batch 12 and Batch 13 stay apart)."""
+        font = tkfont.nametofont("TkDefaultFont")
+        full = max(font.measure(s) for s in self.SLOT_STATUS_SAMPLES) + 24
+        width = self.now_canvas.winfo_width()
+        return min(full, int(width * 0.45)) if width > 1 else full
+
+    def _slot_contents(self) -> list[tuple[str, str, str]]:
+        """What the Now panel's rows show: (number, title, status) each."""
+        return [(r["num"], r["title"], r["status"]) for r in self.slot_rows]
+
+    def _fit_slot_title(self, row: dict) -> None:
+        """Show as much of a row's title as fits, with … where it is cut."""
+        label = row["title_label"]
+        if not label.winfo_exists():
+            return
+        room = label.winfo_width() - 2 * (int(label.cget("bd")) + int(label.cget("highlightthickness")))
+        if room <= 1:           # not laid out yet; <Configure> fits it then
+            label.configure(text=row["title"])
+            return
+        label.configure(text=self._elide(row["title"], room, tkfont.nametofont("TkDefaultFont")))
+
+    @staticmethod
+    def _elide(text: str, room: int, font: tkfont.Font) -> str:
+        """`text`, or as much of its start as fits in `room` pixels followed by …"""
+        if font.measure(text) <= room:
+            return text
+        low, high = 0, len(text)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if font.measure(text[:mid].rstrip() + "…") <= room:
+                low = mid
+            else:
+                high = mid - 1
+        return text[:low].rstrip() + "…"
+
+    def _set_slot(self, row: dict, title: str, status: str, num: str | None = None) -> None:
+        """UI thread: change what a Now row shows, leaving what stays alone."""
+        if num is not None and num != row["num"]:
+            row["num"] = num
+            row["num_label"].configure(text=num)
+        if title != row["title"]:
+            row["title"] = title
+            self._fit_slot_title(row)
+        if status != row["status"]:
+            row["status"] = status
+            row["status_label"].configure(text=status)
+
+    def _update_slot(self, idx: int, title: str, status: str) -> None:
+        """Thread-safe: a download row's title, and how its download is going."""
         def apply() -> None:
-            if 0 <= idx < len(self.slot_vars):
-                self.slot_vars[idx].set(f"{idx + 1:>2}  {text}")
+            if 0 <= idx < len(self.slot_rows):
+                self._set_slot(self.slot_rows[idx], title, status)
         self.root.after(0, apply)
 
-    def _show_rows(self, texts: list[str]) -> None:
-        """UI thread: show these lines in the Now panel, one row each."""
-        if len(texts) != len(self.slot_vars):
-            self._init_slots(len(texts), texts)
+    def _show_rows(self, rows: list[tuple[str, str]]) -> None:
+        """UI thread: these (title, status) rows in the Now panel, unnumbered."""
+        if len(rows) != len(self.slot_rows):
+            self._init_slots(len(rows), [("", title, status) for title, status in rows])
             return
-        for var, text in zip(self.slot_vars, texts):
-            var.set(text)
+        for row, (title, status) in zip(self.slot_rows, rows):
+            self._set_slot(row, title, status, num="")
 
     def _confirm_estimate(
         self, entries: list[dict], workers: int, log_only: bool = False,
@@ -2572,10 +3009,11 @@ class FingerprinterApp:
         except Exception as e:  # noqa: BLE001
             self._log(f"[!] Could not open folder: {e}")
 
-    def _extra_args(self) -> list[str]:
+    def _extra_args(self, quiet: bool = False) -> list[str]:
         """yt-dlp options from Settings, for every yt-dlp run that fetches from
         a site: the browser to sign in with, then Extra download options
-        (parsed respecting quotes)."""
+        (parsed respecting quotes). `quiet`: options that do not parse are
+        left out without a word (read as they are typed)."""
         args: list[str] = []
         browser = self.cookies_browser_var.get().strip()
         if browser and browser != COOKIE_BROWSERS[0]:
@@ -2586,7 +3024,8 @@ class FingerprinterApp:
         try:
             return args + self._split_options(raw)
         except ValueError as e:
-            self._log(f"[!] Could not parse 'Extra download options': {e}. Ignoring them.")
+            if not quiet:
+                self._log(f"[!] Could not parse 'Extra download options': {e}. Ignoring them.")
             return args
 
     @staticmethod
@@ -2635,8 +3074,10 @@ class FingerprinterApp:
 
     @staticmethod
     def _load_done() -> set[str]:
+        # utf-8-sig: Notepad may add a byte-order mark when the file is edited
+        # by hand (Show them), which would otherwise hide the first item.
         try:
-            return {ln.strip() for ln in DONE_FILE.read_text(encoding="utf-8").splitlines() if ln.strip()}
+            return {ln.strip() for ln in DONE_FILE.read_text(encoding="utf-8-sig").splitlines() if ln.strip()}
         except OSError:
             return set()
 
@@ -2705,8 +3146,15 @@ class FingerprinterApp:
         if not new:
             return
         try:
-            with open(DONE_FILE, "a", encoding="utf-8") as f:
-                f.writelines(k + "\n" for k in new)
+            # A file edited by hand may end without a line break, and the
+            # first new item would then run on into the last old one.
+            with open(DONE_FILE, "ab+") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell():
+                    f.seek(-1, os.SEEK_END)
+                    if f.read(1) not in (b"\n", b"\r"):
+                        f.write(b"\r\n")
+                f.write("".join(k + "\r\n" for k in new).encode("utf-8"))
         except OSError as e:
             self._log(f"[!] Could not update {DONE_FILE.name}: {e}")
             return
@@ -2716,6 +3164,19 @@ class FingerprinterApp:
     def _update_done_count(self) -> None:
         n = len(self._load_done())
         self.done_count_var.set(f"{n:,} remembered" if n else "none remembered yet")
+        locked = getattr(self, "_done_file_locked", False)     # a job is running
+        self.show_done_btn.config(state="normal" if n and not locked else "disabled")
+
+    def _show_done(self) -> None:
+        """Open the file of items remembered as fingerprinted, in the program
+        that opens text files (Notepad, unless changed)."""
+        if not DONE_FILE.is_file():
+            self._update_done_count()
+            return
+        try:
+            os.startfile(str(DONE_FILE))  # type: ignore[attr-defined]
+        except OSError as e:
+            messagebox.showerror("Could not open it", f"{DONE_FILE}\n\n{e}", parent=self.settings_win)
 
     def _forget_done(self) -> None:
         n = len(self._load_done())
@@ -2814,6 +3275,7 @@ class FingerprinterApp:
         self.queue_rows = []
         if active_index is not None:
             self.queue_active = active_index
+        self.queue_selected &= set(self.queue_urls)
 
         if not self.queue_urls:
             # The explanation the list used to carry in a permanent grey line
@@ -2826,7 +3288,8 @@ class FingerprinterApp:
                      "above and press Add. YouTube, Archive.org, Mixcloud, SoundCloud and "
                      "any other site yt-dlp supports work.\n\n"
                      "Links run from top to bottom. Drag a row by ≡ to move it, "
-                     "click a link to open it, and right-click a row for more.",
+                     "click a link to open it, Ctrl+click or Shift+click rows to "
+                     "select several, and right-click a row for more.",
             ).pack(fill="x", padx=8, pady=8)
         for url, var in zip(self.queue_urls, self.queue_checks):
             self.queue_rows.append(self._build_queue_row(url, var))
@@ -2967,6 +3430,12 @@ class FingerprinterApp:
         text, colour = self._result_mark(url)
         mark = tk.Label(frame, text=text, bg=bg, fg=colour, width=2)
         mark.pack(side="left")
+        # The channel's picture, for YouTube links; a blank of the same size
+        # for the rest and until it has come, so the links stay in line.
+        avatar = tk.Label(frame, image=self._avatar_image_for(url), bg=bg, bd=0,
+                          padx=0, pady=0, highlightthickness=0)
+        if self.show_avatars_var.get():
+            avatar.pack(side="left", padx=(2, 0))
         # Packed from the right before the link, so a long link is cut short
         # rather than pushing them out of view.
         remove = tk.Label(frame, text="\u2715", bg=bg, fg=self.QMUTED_FG,
@@ -2978,16 +3447,17 @@ class FingerprinterApp:
                         cursor="hand2", anchor="w")
         link.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
-        row = {"url": url, "frame": frame, "handle": handle, "check": check,
-               "num": num, "mark": mark, "count": count, "link": link, "remove": remove}
+        row = {"url": url, "frame": frame, "handle": handle, "check": check, "num": num,
+               "mark": mark, "avatar": avatar, "count": count, "link": link, "remove": remove}
         for widget, kind in ((frame, "row"), (handle, "row"), (num, "row"), (mark, "row"),
-                             (count, "row"), (link, "link")):
+                             (avatar, "row"), (count, "row"), (link, "link")):
             widget.bind("<ButtonPress-1>", lambda e, r=row, k=kind: self._queue_press(e, r, k))
             widget.bind("<B1-Motion>", self._queue_motion)
             widget.bind("<ButtonRelease-1>", self._queue_release)
-        for widget in (frame, handle, check, num, mark, count, link, remove):
+        for widget in (frame, handle, check, num, mark, avatar, count, link, remove):
             widget.bind("<Button-3>", lambda e, r=row: self._queue_menu(e, r))
         Tooltip(mark, lambda: self._result_tip(url))
+        Tooltip(avatar, lambda: self._avatar_tip(url))
         remove.bind("<Button-1>", lambda _e, r=row: self._queue_remove_row(r))
         remove.bind("<Enter>", lambda e: e.widget.config(
             fg=self.QREMOVE_HOVER_FG if self._queue_editable else self.QMUTED_FG))
@@ -2999,26 +3469,85 @@ class FingerprinterApp:
         return row
 
     def _paint_queue_rows(self) -> None:
-        """Number the rows and colour the selected one."""
+        """Number the rows and colour the selected ones."""
         for i, row in enumerate(self.queue_rows):
             row["num"].config(text=f"{i + 1}.")
-            bg = self.QROW_SELECTED if i == self.queue_active else self.QROW_BG
-            for key in ("frame", "handle", "check", "num", "mark", "count", "link", "remove"):
+            bg = self.QROW_SELECTED if row["url"] in self.queue_selected else self.QROW_BG
+            for key in ("frame", "handle", "check", "num", "mark", "avatar", "count", "link", "remove"):
                 row[key].config(bg=bg)
             row["check"].config(activebackground=bg)
 
+    @property
+    def queue_active(self) -> int | None:
+        """The row clicked last, while it is selected: where Shift+click
+        selects from. Setting it selects that row alone (None: no row)."""
+        url = self._queue_anchor
+        if url is not None and url in self.queue_selected and url in self.queue_urls:
+            return self.queue_urls.index(url)
+        return None
+
+    @queue_active.setter
+    def queue_active(self, index: int | None) -> None:
+        self._queue_anchor = None if index is None else self.queue_urls[index]
+        self.queue_selected = set() if index is None else {self._queue_anchor}
+
+    def _selected_indexes(self) -> list[int]:
+        """The selected rows, top to bottom."""
+        return [i for i, url in enumerate(self.queue_urls) if url in self.queue_selected]
+
+    def _queue_select_all(self) -> str:
+        self.queue_selected = set(self.queue_urls)
+        self._paint_queue_rows()
+        return "break"
+
+    def _queue_select_none(self) -> str:
+        self.queue_active = None
+        self._paint_queue_rows()
+        return "break"
+
+    def _queue_click(self, row: dict, shift: bool, ctrl: bool) -> None:
+        """A click on a row that did not drag it: Ctrl toggles the row in the
+        selection, Shift selects every row from the one clicked last, and a
+        plain click selects just this row (or nothing, clicked again)."""
+        url = row["url"]
+        anchor = self._queue_anchor if self._queue_anchor in self.queue_urls else None
+        if shift and anchor is not None:
+            a, b = sorted((self.queue_urls.index(anchor), self.queue_urls.index(url)))
+            span = set(self.queue_urls[a:b + 1])
+            self.queue_selected = (self.queue_selected | span) if ctrl else span
+        elif ctrl or shift:
+            self.queue_selected ^= {url}
+            self._queue_anchor = url
+        elif self.queue_selected == {url}:
+            self.queue_active = None
+        else:
+            self.queue_active = self.queue_urls.index(url)
+        self._paint_queue_rows()
+
     def _queue_press(self, event: tk.Event, row: dict, kind: str) -> None:
-        self._drag = {"row": row, "kind": kind, "y": event.y_root, "moved": False}
+        state = getattr(event, "state", 0)
+        self._drag = {"row": row, "kind": kind, "y": event.y_root, "moved": False,
+                      "shift": bool(state & 0x1), "ctrl": bool(state & 0x4)}
+        # The keyboard to the list, for Delete, Ctrl+A and Esc.
+        self.queue_canvas.focus_set()
 
     def _queue_motion(self, event: tk.Event) -> None:
         drag = self._drag
-        if drag is None or not self._queue_editable or drag["row"] not in self.queue_rows:
+        if (drag is None or not self._queue_editable or drag["row"] not in self.queue_rows
+                or drag["shift"] or drag["ctrl"]):
             return
         if not drag["moved"]:
             if abs(event.y_root - drag["y"]) < 5:
                 return
             drag["moved"] = True
-            self.queue_active = self.queue_rows.index(drag["row"])
+            # A row of several selected takes the others along, gathered
+            # around it; any other row moves alone, and is selected.
+            url = drag["row"]["url"]
+            if url in self.queue_selected and len(self.queue_selected) > 1:
+                drag["block"] = [u for u in self.queue_urls if u in self.queue_selected]
+            else:
+                self.queue_active = self.queue_urls.index(url)
+                drag["block"] = [url]
             self._paint_queue_rows()
         # Scroll when dragged past either edge of the list.
         top = self.queue_canvas.winfo_rooty()
@@ -3026,35 +3555,33 @@ class FingerprinterApp:
             self.queue_canvas.yview_scroll(-1, "units")
         elif event.y_root > top + self.queue_canvas.winfo_height() - 6:
             self.queue_canvas.yview_scroll(1, "units")
-        # Move once the pointer passes the middle of a neighbouring row, so the
-        # row does not jump back and forth while the pointer is still over it.
+        # The rows go after every other row whose middle the pointer has
+        # passed, so they do not jump back and forth while the pointer is
+        # still over a neighbour.
         y = event.y_root - self.queue_rows_frame.winfo_rooty()
-        cur = target = self.queue_rows.index(drag["row"])
+        block = drag["block"]
+        before = sum(1 for row in self.queue_rows if row["url"] not in block
+                     and row["frame"].winfo_y() + row["frame"].winfo_height() / 2 < y)
+        self._queue_place(block, before)
 
-        def middle(i: int) -> float:
-            f = self.queue_rows[i]["frame"]
-            return f.winfo_y() + f.winfo_height() / 2
-
-        while target + 1 < len(self.queue_rows) and y > middle(target + 1):
-            target += 1
-        if target == cur:
-            while target > 0 and y < middle(target - 1):
-                target -= 1
-        if target != cur:
-            self._queue_reorder(cur, target)
-
-    def _queue_reorder(self, cur: int, target: int) -> None:
-        """Move one link from position cur to target, keeping the selection."""
-        selected = self.queue_urls[self.queue_active] if self.queue_active is not None else None
-        for seq in (self.queue_urls, self.queue_checks, self.queue_rows):
-            seq.insert(target, seq.pop(cur))
-        self.queue_active = self.queue_urls.index(selected) if selected is not None else None
+    def _queue_place(self, block: list[str], index: int) -> bool:
+        """Move these links, in this order, to `index` among the others.
+        True if that changed the order."""
+        rows = dict(zip(self.queue_urls, zip(self.queue_checks, self.queue_rows)))
+        others = [u for u in self.queue_urls if u not in block]
+        order = others[:index] + block + others[index:]
+        if order == self.queue_urls:
+            return False
+        self.queue_urls[:] = order
+        self.queue_checks[:] = [rows[u][0] for u in order]
+        self.queue_rows[:] = [rows[u][1] for u in order]
         for row in self.queue_rows:
             row["frame"].pack_forget()
         for row in self.queue_rows:
             row["frame"].pack(fill="x")
         self._paint_queue_rows()
         self.queue_rows_frame.update_idletasks()
+        return True
 
     def _queue_release(self, _event: tk.Event) -> None:
         drag, self._drag = self._drag, None
@@ -3062,31 +3589,60 @@ class FingerprinterApp:
             return
         if drag["moved"]:
             save_config(self._gather_config())
+        elif drag["shift"] or drag["ctrl"]:
+            self._queue_click(drag["row"], drag["shift"], drag["ctrl"])
         elif drag["kind"] == "link":
             self._open_link(drag["row"]["url"])
         else:
-            idx = self.queue_rows.index(drag["row"])
-            self.queue_active = None if idx == self.queue_active else idx
-            self._paint_queue_rows()
+            self._queue_click(drag["row"], False, False)
 
     def _queue_menu(self, event: tk.Event, row: dict) -> None:
         url = row["url"]
+        # A row outside the selection is selected alone first, as in Explorer.
+        if url not in self.queue_selected:
+            self.queue_active = self.queue_urls.index(url)
+            self._paint_queue_rows()
         editable = "normal" if self._queue_editable else "disabled"
         menu = tk.Menu(self.root, tearoff=0, **self._menu_colours())
-        menu.add_command(label="Open link", command=lambda: self._open_link(url))
-        menu.add_command(label="Copy link", command=lambda: self._copy_text(url))
-        menu.add_command(label="Count again", command=lambda: self._request_counts([url], force=True))
-        menu.add_separator()
+        many = [u for u in self.queue_urls if u in self.queue_selected]
+        if len(many) > 1:
+            n = len(many)
+            menu.add_command(label=f"Copy {n} links", command=lambda: self._copy_text("\n".join(many)))
+            menu.add_command(label="Count them again", command=lambda: self._request_counts(many, force=True))
+            menu.add_separator()
+            menu.add_command(label="Tick them", state=editable,
+                             command=lambda: self._queue_tick_selected(True))
+            menu.add_command(label="Untick them", state=editable,
+                             command=lambda: self._queue_tick_selected(False))
+            menu.add_separator()
+        else:
+            menu.add_command(label="Open link", command=lambda: self._open_link(url))
+            menu.add_command(label="Copy link", command=lambda: self._copy_text(url))
+            menu.add_command(label="Count again", command=lambda: self._request_counts([url], force=True))
+            menu.add_separator()
         menu.add_command(label="Move to top", state=editable,
                          command=lambda: self._queue_move_row(row, 0))
         menu.add_command(label="Move to bottom", state=editable,
                          command=lambda: self._queue_move_row(row, len(self.queue_rows) - 1))
-        menu.add_command(label="Remove from the list", state=editable,
-                         command=lambda: self._queue_remove_row(row))
+        menu.add_command(label=f"Remove {len(many)} links from the list" if len(many) > 1
+                         else "Remove from the list", state=editable,
+                         command=self._queue_remove_selected)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _queue_tick_selected(self, ticked: bool) -> None:
+        for url, var in zip(self.queue_urls, self.queue_checks):
+            if url in self.queue_selected:
+                var.set(ticked)
+
+    def _queue_remove_selected(self) -> str:
+        """Right-click's Remove, and Delete in the list: the selected rows."""
+        indexes = self._selected_indexes()
+        if indexes and self._queue_editable:
+            self._queue_remove_rows(indexes, "selected")
+        return "break"
 
     @staticmethod
     def _open_link(url: str) -> None:
@@ -3104,13 +3660,8 @@ class FingerprinterApp:
         self._drop_from_queue(i)
 
     def _drop_from_queue(self, i: int) -> None:
-        del self.queue_urls[i]
+        self.queue_selected.discard(self.queue_urls.pop(i))
         del self.queue_checks[i]
-        if self.queue_active is not None:
-            if self.queue_active == i:
-                self.queue_active = None
-            elif self.queue_active > i:
-                self.queue_active -= 1
         self._refresh_queue()
         save_config(self._gather_config())
 
@@ -3127,6 +3678,68 @@ class FingerprinterApp:
 
     UNDO_SHOWN_MS = 20_000
     TYPING_CLASSES = ("Entry", "TEntry", "TCombobox", "Text", "Spinbox", "TSpinbox")
+
+    @staticmethod
+    def _word_end(text: str, pos: int, forward: bool) -> int:
+        """Where Ctrl+Backspace (back) or Ctrl+Delete (forward) from `pos` stops.
+        Back: over spaces, then punctuation, then a word, so in a link it
+        takes "videos", then "name/", then "com/@" and so on. Forward: the same
+        the other way round."""
+        def word(c: str) -> bool:
+            return c.isalnum() or c == "_"
+
+        def punct(c: str) -> bool:
+            return not word(c) and not c.isspace()
+
+        step = 1 if forward else -1
+        order = (word, punct, str.isspace) if forward else (str.isspace, punct, word)
+        i = pos
+        for kind in order:
+            while 0 <= (i if forward else i - 1) < len(text) and kind(text[i if forward else i - 1]):
+                i += step
+        return i
+
+    def _delete_word(self, event: tk.Event, forward: bool) -> str:
+        """Ctrl+Backspace / Ctrl+Delete in a box: the selection if there is
+        one, else the word before / after the cursor."""
+        w = event.widget
+        try:
+            locked = w.instate(["disabled"]) or w.instate(["readonly"])
+        except (AttributeError, tk.TclError):
+            locked = str(w.cget("state")) != "normal"
+        if locked:
+            return "break"
+        try:
+            if w.selection_present():
+                w.delete("sel.first", "sel.last")
+                return "break"
+        except (AttributeError, tk.TclError):
+            pass
+        text = w.get()
+        pos = self._char_offset(text, int(w.index("insert")))
+        end = self._word_end(text, pos, forward)
+        if end != pos:
+            first, last = sorted((pos, end))
+            w.delete(self._tk_offset(text, first), self._tk_offset(text, last))
+        return "break"
+
+    # Tk 8.6 counts a character above U+FFFF (an emoji, say) as two places in
+    # a box's text, where Python counts it as one.
+
+    @staticmethod
+    def _tk_offset(text: str, i: int) -> int:
+        """Tk's place for the i-th character of `text`."""
+        return i + sum(1 for c in text[:i] if ord(c) > 0xFFFF)
+
+    @staticmethod
+    def _char_offset(text: str, place: int) -> int:
+        """The character at Tk's place `place` in `text`."""
+        units = 0
+        for i, c in enumerate(text):
+            if units >= place:
+                return i
+            units += 2 if ord(c) > 0xFFFF else 1
+        return len(text)
 
     def _on_ctrl_z(self, event: tk.Event) -> str | None:
         """Ctrl+Z: Undo for removed links, but not in a box being typed in,
@@ -3149,10 +3762,15 @@ class FingerprinterApp:
                             self.queue_counts.get(url), self.queue_results.get(url)))
         if not removed:
             return
-        self._undo.append(removed)
-        del self._undo[:-20]
         n = len(removed)
-        self.status_var.set(f"Removed {n} link{'' if n == 1 else 's'} from the list.")
+        self._offer_undo(removed, f"Removed {n} link{'' if n == 1 else 's'} from the list.")
+
+    def _offer_undo(self, entry: list | dict, message: str) -> None:
+        """Keep what Undo needs to reverse a change (removed rows, or {"order":
+        the order before a sort}), and show Undo in the status bar for a while."""
+        self._undo.append(entry)
+        del self._undo[:-20]
+        self.status_var.set(message)
         self.undo_label.pack(side="left", padx=(6, 0), after=self.status_label)
         if self._undo_after is not None:
             self.root.after_cancel(self._undo_after)
@@ -3166,14 +3784,24 @@ class FingerprinterApp:
         self.undo_label.pack_forget()
 
     def _undo_removal(self) -> str:
-        """Put back the links removed last, each where it was. A link added
-        again in the meantime is not added twice."""
+        """Put back the links removed last, each where it was, or the order
+        the list had before it was sorted. A link added again in the meantime
+        is not added twice."""
         if not self._undo:
             return "break"
         if not self._queue_editable:
             self.status_var.set("Undo works once the job has finished.")
             return "break"
         removed = self._undo.pop()
+        if isinstance(removed, dict):
+            # Links added since the sort stay at the end, where they went.
+            order = [u for u in removed["order"] if u in self.queue_urls]
+            self._queue_place(order, 0)
+            save_config(self._gather_config())
+            self.status_var.set("Put the list back in the order it had.")
+            if not self._undo:
+                self._hide_undo()
+            return "break"
         present = {link_key(u) for u in self.queue_urls}
         back = 0
         # In ascending order of place, so each goes back to where it was.
@@ -3255,6 +3883,8 @@ class FingerprinterApp:
             t = threading.Thread(target=self._count_worker, daemon=True)
             self._count_threads.append(t)
             t.start()
+        # Their channel pictures too, while they are being looked at.
+        self._request_avatars(urls, force)
 
     def _count_worker(self) -> None:
         while not self._closing:
@@ -3326,12 +3956,401 @@ class FingerprinterApp:
         save_config(self._gather_config())
 
     def _stop_counting(self) -> None:
-        """On quit: end the counting yt-dlp processes too."""
+        """On quit: end the counting yt-dlp processes too (and those looking
+        up channel pictures)."""
         self._closing = True
         with self._count_lock:
             running = list(self._count_procs)
         for proc in running:
             self._kill_tree(proc)
+
+    # ---- Channel pictures -----------------------------------------------------
+    # For YouTube links (Settings, General): the channel's picture beside the
+    # link. yt-dlp finds the address of a channel's picture (one page, about 4
+    # seconds); for a playlist or a video, YouTube's oEmbed first says whose it
+    # is (a tenth of a second). The picture comes from Google's image server
+    # as a small round PNG and is kept in avatars\ (AVATAR_DIR). One link at a
+    # time, in the background, started along with the counts.
+
+    AVATAR_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+    AVATAR_HOSTS = ("googleusercontent.com", "ggpht.com")
+    PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+    def _avatar_file(self, channel: str) -> Path:
+        return AVATAR_DIR / f"{channel}-{self._avatar_px}.png"
+
+    def _avatar_channel(self, url: str) -> str:
+        """The channel a link is known to be from ("" if not known)."""
+        with self._avatar_lock:
+            return str((self._avatar_index["links"].get(link_key(url)) or {}).get("channel") or "")
+
+    @staticmethod
+    def _days_since(day: object) -> int:
+        try:
+            return (datetime.date.today() - datetime.date.fromisoformat(str(day))).days
+        except ValueError:
+            return 10 ** 6
+
+    def _avatar_image_for(self, url: str) -> tk.PhotoImage:
+        """UI thread: the picture for a link's row, or the blank."""
+        channel = self._avatar_channel(url) if self.show_avatars_var.get() else ""
+        if not channel:
+            return self._avatar_blank
+        image = self._avatar_images.get(channel)
+        if image is None:
+            path = self._avatar_file(channel)
+            if not path.is_file():
+                return self._avatar_blank
+            try:
+                image = tk.PhotoImage(master=self.root, file=str(path))
+            except tk.TclError:
+                # Damaged: gone, so the next look fetches it again.
+                path.unlink(missing_ok=True)
+                return self._avatar_blank
+            self._avatar_images[channel] = image
+        return image
+
+    def _avatar_tip(self, url: str) -> str:
+        """The channel's name and handle, over its picture."""
+        channel = self._avatar_channel(url)
+        if not channel or channel not in self._avatar_images:
+            return ""
+        with self._avatar_lock:
+            info = dict(self._avatar_index["channels"].get(channel) or {})
+        name, handle = str(info.get("name") or ""), str(info.get("handle") or "")
+        if name and handle and handle.lower() != name.lower():
+            return f"{name} ({handle})"
+        return name or handle
+
+    def _avatar_stale(self, url: str) -> bool:
+        """Whether a link's channel picture is to be fetched: not known yet,
+        missing on disk, or older than AVATAR_REFRESH_DAYS. A link tried today
+        already (it failed, say) waits until tomorrow."""
+        with self._avatar_lock:
+            link = dict(self._avatar_index["links"].get(link_key(url)) or {})
+            channel = str(link.get("channel") or "")
+            info = dict(self._avatar_index["channels"].get(channel) or {}) if channel else {}
+        if link.get("tried") == time.strftime("%Y-%m-%d"):
+            return False
+        if not info.get("image"):
+            return True
+        return (self._days_since(info.get("date")) >= AVATAR_REFRESH_DAYS
+                or not self._avatar_file(channel).is_file())
+
+    def _request_avatars(self, urls: list[str] | None = None, force: bool = False) -> None:
+        """UI thread: fetch the channel pictures these links (all by default)
+        need, or with `force` (Count again) look them up again anyway."""
+        # The setting and the yt-dlp options, where the worker can read them:
+        # Tk's own variables are only for the UI thread. The options are kept
+        # current as they change (_note_avatar_options), so lookups already
+        # queued go the way yt-dlp goes now.
+        self._avatars_on = self.show_avatars_var.get()
+        self._avatar_extra = self._extra_args()
+        if not self._avatars_on or self._closing:
+            return
+        for url in list(self.queue_urls) if urls is None else urls:
+            key = link_key(url)
+            if youtube_kind(url) is None or key in self._avatar_pending:
+                continue
+            if not force and not self._avatar_stale(url):
+                continue
+            self._avatar_pending.add(key)
+            self._avatar_queue.put((url, force))
+        if not self._avatar_queue.empty() and (self._avatar_thread is None
+                                               or not self._avatar_thread.is_alive()):
+            self._avatar_thread = threading.Thread(target=self._avatar_worker, daemon=True)
+            self._avatar_thread.start()
+
+    def _note_avatar_options(self) -> None:
+        """UI thread: Extra download options or the sign-in browser changed."""
+        self._avatar_extra = self._extra_args(quiet=True)
+
+    def _avatar_worker(self) -> None:
+        while not self._closing:
+            url, force = self._avatar_queue.get()
+            try:
+                if url in self.queue_urls and self._avatars_on and not self._closing:
+                    self._avatar_one(url, list(self.ytdlp), list(self._avatar_extra), force)
+            except Exception as e:  # noqa: BLE001
+                self._log(f"[!] Could not get the channel picture for {url}: {e!r}")
+            finally:
+                self._avatar_pending.discard(link_key(url))
+
+    def _avatar_failed(self, key: str) -> None:
+        """Worker thread: a look-up came to nothing. Tried again tomorrow,
+        unless it only stopped because the program is closing or the pictures
+        were switched off: that is not the link's fault."""
+        if not self._closing and self._avatars_on:
+            self._note_avatar(key, None, None)
+
+    def _avatar_one(self, url: str, ytdlp: list[str], extra: list[str], force: bool) -> None:
+        """Worker thread: find the link's channel, and fetch its picture."""
+        key = link_key(url)
+        opener = self._avatar_connection(ytdlp, extra)
+        if opener is None:
+            return
+        with self._avatar_lock:
+            channel = str((self._avatar_index["links"].get(key) or {}).get("channel") or "")
+            channels = {c: dict(i) for c, i in self._avatar_index["channels"].items()}
+
+        def fresh(c: str) -> bool:
+            return bool(channels.get(c, {}).get("image")) and \
+                self._days_since(channels[c].get("date")) < AVATAR_REFRESH_DAYS
+
+        info = None
+        if force or not channel:
+            page = (youtube_channel_page(url) or self._oembed_author(url, opener)
+                    or self._avatar_owner(url, ytdlp, extra))
+            known = self._known_channel(page, channels) if page else ""
+            if page and known and fresh(known) and not force:
+                channel = known         # another link of a channel already fetched
+            else:
+                info = self._avatar_lookup(page, ytdlp, extra) if page else None
+                if info is None:
+                    self._avatar_failed(key)
+                    return
+                channel = info["channel"]
+        elif not fresh(channel):
+            info = self._avatar_lookup(f"https://www.youtube.com/channel/{channel}", ytdlp, extra)
+            if info is None:
+                self._avatar_failed(key)
+                return
+        path = self._avatar_file(channel)
+        if info is not None or not path.is_file():
+            image = info["image"] if info else channels.get(channel, {}).get("image", "")
+            data = self._fetch_png(avatar_image_url(image, self._avatar_px), opener) if image else None
+            if data is None:
+                self._avatar_failed(key)
+                return
+            try:
+                AVATAR_DIR.mkdir(exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_bytes(data)
+                os.replace(tmp, path)
+            except OSError:
+                self._avatar_failed(key)
+                return
+        self._note_avatar(key, channel, info)
+        self.root.after(0, self._show_avatar, channel)
+
+    @staticmethod
+    def _known_channel(page: str, channels: dict) -> str:
+        """The channel id of a channel page already in the index, or ""."""
+        m = re.search(r"/channel/(UC[\w-]{22})", page)
+        if m:
+            return m.group(1)
+        handle = youtube_handle(page)
+        return next((c for c, i in channels.items()
+                     if handle and str(i.get("handle") or "").lower() == handle), "")
+
+    # How long what yt-dlp said about its proxy is trusted (_avatar_connection).
+    AVATAR_PROXY_SECONDS = 600
+
+    def _avatar_connection(self, ytdlp: list[str], extra: list[str]) -> urllib.request.OpenerDirector | None:
+        """Worker thread: urllib, going the way yt-dlp goes, for oEmbed and
+        the pictures: through the proxy yt-dlp uses, whether it comes from
+        Extra download options or from yt-dlp's own config file. None when
+        that cannot be matched (a SOCKS proxy, or yt-dlp not saying): then
+        nothing is fetched, rather than going round the proxy."""
+        # The sign-in browser plays no part in the proxy, and is left out.
+        args = [a for i, a in enumerate(extra) if a != "--cookies-from-browser"
+                and not (i and extra[i - 1] == "--cookies-from-browser")]
+        key = (tuple(ytdlp), tuple(args))
+        cached = self._avatar_proxy
+        if cached and cached[0] == key and time.monotonic() - cached[1] < self.AVATAR_PROXY_SECONDS:
+            return cached[2]
+        proxies = self._ytdlp_proxies(ytdlp, args)
+        opener, why = self._opener_for(proxies)
+        self._avatar_proxy = (key, time.monotonic(), opener)
+        if opener is None and why != self._avatar_proxy_said:
+            self._avatar_proxy_said = why
+            self._log(f"[!] Channel pictures are not fetched: {why}")
+        return opener
+
+    def _ytdlp_proxies(self, ytdlp: list[str], args: list[str]) -> dict | None:
+        """Worker thread: the proxies yt-dlp uses with these options and its
+        own config files: its verbose output says ("Proxy map: {...}") before
+        it stops for want of a link, having fetched nothing."""
+        out = self._run_ytdlp([*ytdlp, *YTDLP_UTF8, "-v", *args], timeout=60, output="stderr")
+        m = re.search(r"\[debug\] Proxy map: (\{.*\})", out or "")
+        try:
+            proxies = ast.literal_eval(m.group(1)) if m else None
+        except (ValueError, SyntaxError):
+            return None
+        return proxies if isinstance(proxies, dict) else None
+
+    @staticmethod
+    def _opener_for(proxies: dict | None) -> tuple[urllib.request.OpenerDirector | None, str]:
+        """urllib for yt-dlp's proxy map ({} none, {"all": "host:port"},
+        "__noproxy__" for --proxy ""), or None and why not."""
+        if proxies is None:
+            return None, "yt-dlp did not say which proxy it uses."
+        chosen = {}
+        for scheme in ("http", "https"):
+            proxy = proxies.get(scheme, proxies.get("all"))
+            if proxy is None:
+                continue
+            proxy = str(proxy)
+            if proxy == "__noproxy__":
+                continue                    # this one direct, as yt-dlp goes
+            if "://" not in proxy:
+                proxy = "http://" + proxy   # as yt-dlp reads host:port
+            if not re.match(r"^https?://", proxy, re.I):
+                return None, (f"yt-dlp goes through the proxy {proxy}, which the picture "
+                              "downloads cannot use (only http and https proxies).")
+            chosen[scheme] = proxy
+        if not proxies:
+            # No proxy of yt-dlp's own: both use the system's (environment,
+            # Windows' proxy setting).
+            return urllib.request.build_opener(), ""
+        return urllib.request.build_opener(urllib.request.ProxyHandler(chosen)), ""
+
+    def _run_ytdlp(self, cmd: list[str], timeout: int = 120, output: str = "stdout") -> str | None:
+        """Worker thread: run a quiet yt-dlp and return what it printed on
+        `output` ("stdout" or "stderr"), or None if it could not run or took
+        too long. Registered with the counting processes, so quitting ends it."""
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE if output == "stdout" else subprocess.DEVNULL,
+                stderr=subprocess.PIPE if output == "stderr" else subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            return None
+        with self._count_lock:
+            self._count_procs.append(proc)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._kill_tree(proc)
+            return None
+        finally:
+            with self._count_lock:
+                if proc in self._count_procs:
+                    self._count_procs.remove(proc)
+        return out if output == "stdout" else err
+
+    def _avatar_owner(self, url: str, ytdlp: list[str], extra: list[str]) -> str | None:
+        """Worker thread: the channel page of a playlist or video link, from
+        yt-dlp, when oEmbed cannot say (a video whose owner turned embedding
+        off, an unlisted playlist). Slower: a page of the playlist, or the
+        video's own page."""
+        if youtube_channel_page(url):
+            return None
+        out = self._run_ytdlp([*ytdlp, *YTDLP_UTF8, "--js-runtimes", "node", "--flat-playlist",
+                               "--no-warnings", "-I", "1", "--print",
+                               "#CH\t%(playlist_channel_id,channel_id)j", *extra, url])
+        for line in (out or "").splitlines():
+            if line.startswith("#CH\t"):
+                try:
+                    channel = json.loads(line[4:])
+                except ValueError:
+                    continue
+                if isinstance(channel, str) and re.fullmatch(r"UC[\w-]{22}", channel):
+                    return f"https://www.youtube.com/channel/{channel}"
+        return None
+
+    def _oembed_author(self, url: str, opener: urllib.request.OpenerDirector) -> str | None:
+        """Worker thread: the channel page of a playlist or video link, from
+        YouTube's oEmbed (a tenth of a second, rather than a yt-dlp look-up)."""
+        key = link_key(url)
+        path, _, query = key[len("youtube.com"):].partition("?")
+        params = dict(parse_qsl(query))
+        if youtube_kind(url) == "playlist":
+            target = f"https://www.youtube.com/playlist?list={params['list']}"
+        else:
+            m = re.match(r"^/(?:shorts|live|embed)/([\w-]+)$", path)
+            target = f"https://www.youtube.com/watch?v={m.group(1) if m else params.get('v', '')}"
+        request = urllib.request.Request(
+            "https://www.youtube.com/oembed?" + urlencode({"format": "json", "url": target}),
+            headers={"User-Agent": self.AVATAR_USER_AGENT})
+        try:
+            with opener.open(request, timeout=15) as response:
+                data = json.loads(response.read(200_000).decode("utf-8"))
+        except (OSError, ValueError, http.client.HTTPException):
+            return None
+        author = data.get("author_url") if isinstance(data, dict) else None
+        if not isinstance(author, str) or not author:
+            return None
+        page = urljoin("https://www.youtube.com/", author)
+        return page if youtube_kind(page) == "channel" else None
+
+    def _avatar_lookup(self, page: str, ytdlp: list[str], extra: list[str]) -> dict | None:
+        """Worker thread: a channel's id, name, handle and picture address,
+        from yt-dlp reading the channel's page (-I 0: none of its videos)."""
+        cmd = [*ytdlp, *YTDLP_UTF8, "--js-runtimes", "node", "--flat-playlist", "--no-warnings",
+               "-I", "0", "--print",
+               "playlist:#AV\t%(channel_id)j\t%(channel,uploader,title)j\t%(uploader_id)j\t%(thumbnails)j",
+               *extra, page]
+        out = self._run_ytdlp(cmd) or ""
+
+        def value(text: str) -> object:
+            try:
+                return json.loads(text)
+            except ValueError:
+                return None             # NA, for a field yt-dlp does not have
+
+        # One line for the channel, and for a bare @handle one per tab too.
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 5 or parts[0] != "#AV":
+                continue
+            channel, name, handle, thumbnails = (value(p) for p in parts[1:])
+            image = next((t.get("url") for t in thumbnails if isinstance(t, dict)
+                          and t.get("id") == "avatar_uncropped"), None) if isinstance(thumbnails, list) else None
+            if not isinstance(image, str) or not image.startswith("https://"):
+                continue
+            host = urlsplit(image).hostname or ""
+            if (isinstance(channel, str) and re.fullmatch(r"UC[\w-]{22}", channel)
+                    and host.endswith(self.AVATAR_HOSTS)):
+                return {"channel": channel, "image": image,
+                        "name": name if isinstance(name, str) else "",
+                        "handle": handle if isinstance(handle, str) else ""}
+        return None
+
+    def _fetch_png(self, url: str, opener: urllib.request.OpenerDirector) -> bytes | None:
+        request = urllib.request.Request(url, headers={"User-Agent": self.AVATAR_USER_AGENT})
+        try:
+            with opener.open(request, timeout=15) as response:
+                data = response.read(256_001)
+        except (OSError, ValueError, http.client.HTTPException):
+            return None
+        return data if len(data) <= 256_000 and data.startswith(self.PNG_SIGNATURE) else None
+
+    def _note_avatar(self, key: str, channel: str | None, info: dict | None) -> None:
+        """Worker thread: note what the look-up found for a link (channel
+        None: nothing this time; a picture already there stays). Here rather
+        than on the UI thread, so the next link, maybe a playlist of the same
+        channel, already finds the channel known."""
+        today = time.strftime("%Y-%m-%d")
+        with self._avatar_lock:
+            link = self._avatar_index["links"].setdefault(key, {})
+            link["tried"] = today
+            if channel:
+                link.update(channel=channel, date=today)
+                entry = self._avatar_index["channels"].setdefault(channel, {})
+                if info:
+                    entry.update(image=info["image"], name=info["name"],
+                                 handle=info["handle"], date=today)
+            save_avatar_index(self._avatar_index)
+
+    def _show_avatar(self, channel: str) -> None:
+        """UI thread: a channel's picture is new on disk; show it on every
+        row of that channel."""
+        self._avatar_images.pop(channel, None)
+        for row in self.queue_rows:
+            if self._avatar_channel(row["url"]) == channel:
+                row["avatar"].config(image=self._avatar_image_for(row["url"]))
+
+    def _show_avatars_changed(self) -> None:
+        """The setting was switched: show or hide the pictures, and fetch the
+        missing ones when it is on."""
+        self._avatars_on = self.show_avatars_var.get()
+        self._refresh_queue()
+        if self._avatars_on:
+            self._request_avatars()
 
     def _link_box_too_long(self) -> None:
         """A paste the link box refused as too long (LINK_BOX_MAX): say so,
@@ -3526,28 +4545,32 @@ class FingerprinterApp:
             self._log("[!] File was empty; nothing imported.", tag="warning")
 
     def _queue_remove(self) -> None:
-        """Remove all checked entries. If none are checked, remove the active row.
-        Every link is ticked when added, so this asks first when it would empty
-        the list or take more than a few; Undo puts them back either way."""
+        """Remove all checked entries. If none are checked, the selected rows."""
         checked = [i for i, v in enumerate(self.queue_checks) if v.get()]
-        if not checked:
-            if self.queue_active is None:
-                self._log("[!] Nothing checked to remove. Tick a box or click a row first.")
-                return
-            checked = [self.queue_active]
-        n = len(checked)
+        if checked:
+            self._queue_remove_rows(checked, "ticked")
+        elif self.queue_selected:
+            self._queue_remove_rows(self._selected_indexes(), "selected")
+        else:
+            self._log("[!] Nothing checked to remove. Tick a box or click a row first.")
+
+    def _queue_remove_rows(self, indexes: list[int], how: str) -> None:
+        """Remove these rows ("ticked" or "selected" ones). Every link is
+        ticked when added, so this asks first when it would empty the list or
+        take more than a few; Undo puts them back either way."""
+        n = len(indexes)
         if (n == len(self.queue_urls) and n > 1) or n > 5:
             every = "every link in the list" if n == len(self.queue_urls) else f"{n} links"
             if not messagebox.askyesno(
-                "Remove ticked links?",
-                f"Remove {every}? {n} of {len(self.queue_urls)} are ticked.\n\n"
+                f"Remove {how} links?",
+                f"Remove {every}? {n} of {len(self.queue_urls)} are {how}.\n\n"
                 "Undo in the status bar, or Ctrl+Z, puts them back.",
                 parent=self.root,
             ):
                 return
-        self._remember_removal(checked)
+        self._remember_removal(indexes)
         # Delete from the end so indices stay valid.
-        for i in sorted(checked, reverse=True):
+        for i in sorted(indexes, reverse=True):
             del self.queue_urls[i]
             del self.queue_checks[i]
         self.queue_active = None
@@ -3556,15 +4579,68 @@ class FingerprinterApp:
 
     def _queue_move_row(self, row: dict, target: int) -> None:
         """Right-click's Move to top / bottom: dragging a row across a long
-        list is slow, so the ends are one click away."""
+        list is slow, so the ends are one click away. A row of several selected
+        takes the others along, in their order."""
         if not self._queue_editable or row not in self.queue_rows:
             return
-        cur = self.queue_rows.index(row)
-        target = max(0, min(target, len(self.queue_rows) - 1))
-        if target != cur:
-            self.queue_active = cur
-            self._queue_reorder(cur, target)
+        url = row["url"]
+        if url in self.queue_selected and len(self.queue_selected) > 1:
+            block = [u for u in self.queue_urls if u in self.queue_selected]
+        else:
+            self.queue_active = self.queue_urls.index(url)
+            block = [url]
+        others = len(self.queue_urls) - len(block)
+        if self._queue_place(block, 0 if target <= 0 else min(target, others)):
             save_config(self._gather_config())
+
+    SORTS = (("most", "Most videos first"), ("fewest", "Fewest videos first"),
+             ("az", "A to Z"), ("za", "Z to A"))
+
+    def _show_sort_menu(self) -> None:
+        menu = tk.Menu(self.root, tearoff=0, **self._menu_colours())
+        for how, label in self.SORTS:
+            menu.add_command(label=label, command=lambda h=how: self._sort_queue(h))
+        try:
+            menu.tk_popup(self.sort_btn.winfo_rootx(),
+                          self.sort_btn.winfo_rooty() + self.sort_btn.winfo_height())
+        finally:
+            menu.grab_release()
+
+    @staticmethod
+    def _sort_name(url: str) -> str:
+        """A link as it sorts A to Z: without https:// and www., so a channel
+        sorts by its site and name whichever way the link was written."""
+        name = re.sub(r"^[a-z]+://", "", url.strip(), flags=re.I)
+        return re.sub(r"^(www|m)\.", "", name, flags=re.I).casefold()
+
+    def _sort_queue(self, how: str) -> None:
+        """Put the list in order, once ("most", "fewest", "az" or "za"). Links
+        not counted yet go last by videos, in the order they had. Undo puts
+        the old order back."""
+        if not self._queue_editable or len(self.queue_urls) < 2:
+            return
+        before = list(self.queue_urls)
+
+        def videos(url: str) -> int | None:
+            n = (self.queue_counts.get(url) or {}).get("n")
+            return n if isinstance(n, int) else None
+
+        if how in ("most", "fewest"):
+            counted = sorted((u for u in before if videos(u) is not None),
+                             key=videos, reverse=how == "most")
+            uncounted = [u for u in before if videos(u) is None]
+            order = counted + uncounted
+        else:
+            order = sorted(before, key=self._sort_name, reverse=how == "za")
+            uncounted = []
+        label = dict(self.SORTS)[how]
+        if not self._queue_place(order, 0):
+            self.status_var.set(f"The list is in that order already ({label}).")
+            return
+        save_config(self._gather_config())
+        note = (f" {len(uncounted)} not counted yet are at the end."
+                if uncounted and how in ("most", "fewest") else "")
+        self._offer_undo({"order": before}, f"Sorted the list: {label}.{note}")
 
     def _queue_clear(self) -> None:
         if not self.queue_urls:
@@ -3585,7 +4661,7 @@ class FingerprinterApp:
         self._queue_editable = enabled
         state = "normal" if enabled else "disabled"
         for btn in (
-            self.queue_import_btn, self.queue_remove_btn,
+            self.queue_import_btn, self.queue_remove_btn, self.sort_btn,
             self.tick_all_btn, self.queue_clear_btn, self.tick_unfinished_btn,
         ):
             btn.config(state=state)
@@ -4727,6 +5803,10 @@ class FingerprinterApp:
         for widget in (self.min_seconds_spin, self.max_minutes_spin,
                        self.skip_done_check, self.forget_done_btn):
             widget.config(state="disabled" if locked else "normal")
+        # Show them too: Notepad saving the file would drop items remembered
+        # meanwhile. Unlocked, it is clickable only with something remembered.
+        self._done_file_locked = locked
+        self._update_done_count()
         # Read as each link's downloads finish.
         self.keep_audio_check.config(state="disabled" if locked else "normal")
         if locked:
@@ -5199,11 +6279,11 @@ class FingerprinterApp:
             self._set_status(f"{base}fingerprinting...")
         # The Now panel: overall files, and a row per batch under way.
         self._set_progress("Fingerprinting", done, total or None)
-        running = [f"batch {b}   {d:,} of {t:,} files ({d * 100 // t}%)"
+        running = [(f"Batch {b}", f"{d:,} of {t:,} files ({d * 100 // t}%)")
                    for b, (d, t) in items if 0 < d < t]
         waiting = sum(1 for _, (d, _t) in items if d == 0)
         finished = sum(1 for _, (d, t) in items if t and d >= t)
-        running.append(f"{waiting} batch(es) waiting, {finished} done")
+        running.append(("Batches", f"{waiting} waiting, {finished} done"))
         self.root.after(0, self._show_rows, running)
 
     def _scan_audio_files(self, source_dir: Path, texts_dir: Path, batch_size: int) -> int:
@@ -6303,7 +7383,7 @@ class FingerprinterApp:
             try:
                 return self._download_one(entry, slot, target_folder)
             finally:
-                self._update_slot(slot, "idle")
+                self._update_slot(slot, "", "idle")
                 slot_pool.put(slot)
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -6376,9 +7456,8 @@ class FingerprinterApp:
         # only uses its default when the key is ABSENT, not when its value is
         # None. Using `or` instead correctly falls back in both cases.
         title = entry.get("title") or str(video_url) or "(untitled)"
-        short_title = title if len(title) <= 40 else (title[:37] + "...")
-
-        self._update_slot(slot, f"{short_title} | queued")
+        # The whole title: the Now panel shortens it to the room it has.
+        self._update_slot(slot, title, "queued")
         self._log(f"[*] Starting: {title}")
 
         verbose = self.verbose_var.get()
@@ -6446,10 +7525,10 @@ class FingerprinterApp:
                 if self.pause_flag.is_set():
                     paused_for += 1.0     # the clock stops with the process
                     if es is not None:
-                        self._update_slot(slot, f"{short_title} | paused")
+                        self._update_slot(slot, title, "paused")
                 elif es is not None:
                     elapsed = int(time.time() - es - paused_for)
-                    self._update_slot(slot, f"{short_title} | extracting audio... ({elapsed}s)")
+                    self._update_slot(slot, title, f"extracting audio... ({elapsed}s)")
                 ticker_stop.wait(1.0)
 
         ticker_thread = threading.Thread(target=ticker, daemon=True)
@@ -6471,7 +7550,7 @@ class FingerprinterApp:
                     extract_start[0] = time.time()
                 _, display = self._parse_yt_dlp_line(line)
                 if display is not None:
-                    self._update_slot(slot, f"{short_title} | {display}")
+                    self._update_slot(slot, title, display)
                 # Error lines, to classify the failure by later; of the
                 # warnings only those that say yt-dlp cannot read the site's
                 # player any more. Every warning would let a harmless one
