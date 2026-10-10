@@ -1132,7 +1132,7 @@ PROGRAM_FILES = (
     "config.example.json", "README.md", "CHANGELOG.md", "LICENSE", "fingerprinter.ico",
     "setup.bat", SHORTCUT_FILE.name, "config.json", "recent_urls.json",
     "fingerprinted-items.txt", "unfinished-list.json", "unfinished-list.tmp", RECORD_FILE.name,
-    "links-left-out.txt", "links-left-out.tmp",
+    "links-left-out.txt", "links-left-out.tmp", "published-dates.txt",
 )
 PROGRAM_FOLDERS = ("audfprint", "audfprint.download", "texts", "__pycache__", "avatars",
                    "listings")

@@ -3,6 +3,27 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.1.0] - 2026-10-10
+
+### Added
+
+- **Only items published on or after a date** (Settings, Downloads), for a
+  channel's new uploads: older items are left out and listed under
+  `N skipped` with the reason. Where the site's list gives no date (YouTube's
+  never does), yt-dlp looks each one up just before downloading; the dates of
+  those left out are remembered in `published-dates.txt`, so the next run
+  does not look them up again. Items with no date at all are downloaded, and
+  a run with the box ticked but no proper date is refused.
+
+### Fixed
+
+- **An archive.org item of several files could fail for every file** with
+  "no audio format available": archive.org gives each file the item's page as
+  its link, so each download fetched the whole item, whose files yt-dlp lists
+  with no codec the format choice accepts. Each file now downloads by its own
+  link, which is also the link **Copy link and its videos** and the skipped
+  list show for it.
+
 ## [1.0.0] - 2026-10-10
 
 The first full release.
@@ -512,6 +533,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.1.0]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.1.0
 [1.0.0]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0
 [1.0.0-beta.9]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.9
 [1.0.0-beta.8]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.8

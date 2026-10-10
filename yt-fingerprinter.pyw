@@ -66,7 +66,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -254,6 +254,10 @@ CONFIG_VERSION = 3
 # Items already fingerprinted, one "<extractor> <id>" per line: the format of
 # yt-dlp's --download-archive, so the file also works with yt-dlp itself.
 DONE_FILE = SCRIPT_DIR / "fingerprinted-items.txt"
+# When items left out as too old came out, "<extractor> <id>\t<YYYYMMDD>" a
+# line, as yt-dlp found it while Only items published on or after was on: such
+# an item is looked up once, not on every run (_filter_entries).
+DATES_FILE = SCRIPT_DIR / "published-dates.txt"
 # A list run in progress: its links, which finished, and which one is running.
 # Written as each link starts and ends and deleted when the list completes, so
 # finding it at start-up means the last run stopped part-way (Stop, a crash,
@@ -317,6 +321,64 @@ def entry_link(entry: dict) -> str:
         return "https://" + link
     item_id = str(entry.get("id") or "")
     return f"https://www.youtube.com/watch?v={item_id}" if re.fullmatch(r"[\w-]{11}", item_id) else ""
+
+
+def own_pages(entries: list) -> list:
+    """The listed entries, with a page several of them share replaced by each
+    one's own link (its url). archive.org gives every file of an item the
+    item's page as its webpage_url: downloading that fetched the whole item
+    for each file, where its files have no video codec and bestaudio found
+    none ("Requested format is not available" for every file). The url is
+    the file itself, which downloads as just that file. In place."""
+    shared: dict[str, int] = {}
+    for e in entries:
+        if isinstance(e, dict) and e.get("webpage_url"):
+            shared[e["webpage_url"]] = shared.get(e["webpage_url"], 0) + 1
+    for e in entries:
+        if (isinstance(e, dict) and shared.get(e.get("webpage_url"), 0) > 1
+                and "://" in str(e.get("url") or "")):
+            e["webpage_url"] = e["url"]
+    return entries
+
+
+def published_date(info: dict) -> str | None:
+    """When an item came out, YYYYMMDD, from what yt-dlp gave: its
+    upload_date, or else its timestamp; None when neither."""
+    date = str(info.get("upload_date") or "")
+    if re.fullmatch(r"\d{8}", date):
+        return date
+    for key in ("timestamp", "release_timestamp"):
+        try:
+            return time.strftime("%Y%m%d", time.gmtime(float(info[key])))
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            pass
+    return None
+
+
+_dates_lock = threading.Lock()
+
+
+def load_published_dates() -> dict[str, str]:
+    """DATES_FILE: {"<extractor> <id>": "YYYYMMDD"}."""
+    try:
+        lines = DATES_FILE.read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError):
+        return {}
+    dates = {}
+    for line in lines:
+        key, _, date = line.partition("\t")
+        if key and re.fullmatch(r"\d{8}", date.strip()):
+            dates[key] = date.strip()
+    return dates
+
+
+def save_published_date(key: str, date: str) -> None:
+    """Add an item's date to DATES_FILE. Any thread."""
+    try:
+        with _dates_lock, open(DATES_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{key}\t{date}\n")
+    except OSError:
+        pass
 
 
 def clean_text(text: object) -> str:
@@ -1735,6 +1797,26 @@ class FingerprinterApp:
 
         row = ttk.Frame(tab)
         row.pack(fill="x")
+        self.date_after_on_var = tk.BooleanVar(value=False)
+        self.date_after_check = ttk.Checkbutton(
+            row, text="Only items published on or after", variable=self.date_after_on_var)
+        self.date_after_check.pack(side="left")
+        self.date_after_var = tk.StringVar(value="")
+        self.date_after_entry = ttk.Entry(row, textvariable=self.date_after_var, width=11)
+        self.date_after_entry.pack(side="left", padx=(4, 0))
+        ttk.Label(row, text="as 2024-01-31").pack(side="left", padx=(6, 0))
+        self._help(
+            tab,
+            "For new uploads only. Where a site's list does not say when an item came out "
+            "(YouTube's never does), yt-dlp looks it up just before downloading, a second or "
+            "two each, and leaves it out if it is older; the date of each one left out is "
+            "remembered, so the next run does not look again. Items with no date at all are "
+            "downloaded.",
+            wrap=560,
+        ).pack(anchor="w", padx=4, pady=(1, 8))
+
+        row = ttk.Frame(tab)
+        row.pack(fill="x")
         self.skip_done_var = tk.BooleanVar(value=False)
         self.skip_done_check = ttk.Checkbutton(
             row, text="Skip items already fingerprinted in an earlier run",
@@ -2734,6 +2816,8 @@ class FingerprinterApp:
         ("cookies_browser_var", "cookies_browser", str),
         ("min_seconds_var", "skip_shorter_than", int),
         ("max_minutes_var", "skip_longer_than", int),
+        ("date_after_on_var", "date_after_on", bool),
+        ("date_after_var", "date_after", str),
         ("skip_done_var", "skip_done", bool),
         ("notify_var", "notify", bool),
         ("keep_audio_var", "keep_audio", bool),
@@ -3598,10 +3682,30 @@ class FingerprinterApp:
         except OSError:
             return set()
 
+    def _date_after(self) -> str | None:
+        """Only items published on or after (Settings, Downloads): the date
+        as yt-dlp takes it, YYYYMMDD. None when it is off, "" when it is on
+        but not a date (_start refuses to run then)."""
+        if not self.date_after_on_var.get():
+            return None
+        text = self.date_after_var.get().strip()
+        for fmt in ("%Y-%m-%d", "%Y%m%d", "%d.%m.%Y"):
+            try:
+                return time.strftime("%Y%m%d", time.strptime(text, fmt))
+            except ValueError:
+                pass
+        return ""
+
+    @staticmethod
+    def _date_text(date: str) -> str:
+        """YYYYMMDD as YYYY-MM-DD."""
+        return f"{date[:4]}-{date[4:6]}-{date[6:]}"
+
     def _filter_entries(self, entries: list[dict]) -> list[dict]:
-        """Leave out items outside the length limits and, when asked, items
-        fingerprinted in an earlier run. Items whose length the listing did not
-        give are kept here; yt-dlp checks those itself (see _download_one).
+        """Leave out items outside the length limits, items published before
+        the date when that is on, and, when asked, items fingerprinted in an
+        earlier run. Items whose length or date the listing did not give (nor
+        DATES_FILE) are kept here; yt-dlp checks those itself (_download_one).
         Those outside the limits are noted for the link's row (_note_skipped);
         those fingerprinted before are not: they are done, not skipped."""
         shortest = self._safe_int(self.min_seconds_var, 0, minimum=0)
@@ -3609,11 +3713,19 @@ class FingerprinterApp:
         # Read first: an item fingerprinted before is done, not skipped, also
         # when it is outside limits set since.
         done = self._load_done() if self.skip_done_var.get() else set()
+        after = self._date_after()
+        dates = load_published_dates() if after else {}
         kept: list[dict] = []
-        short = long_ = 0
+        short = long_ = old = 0
         for entry in entries:
             length = entry.get("duration")
-            if length and shortest and length < shortest:
+            published = entry.get("published") or dates.get(self._archive_key(entry) or "")
+            if after and published and published < after:
+                old += 1
+                if self._archive_key(entry) not in done:
+                    self._note_skipped(entry, f"published before {self._date_text(after)} "
+                                              f"(Settings, Downloads)", "date")
+            elif length and shortest and length < shortest:
                 short += 1
                 if self._archive_key(entry) not in done:
                     self._note_skipped(entry, f"shorter than {shortest} seconds (Settings, Downloads)",
@@ -3625,6 +3737,8 @@ class FingerprinterApp:
                                        "length")
             else:
                 kept.append(entry)
+        if old:
+            self._log(f"[*] Leaving out {old} item(s) published before {self._date_text(after)}.")
         if short:
             self._log(f"[*] Leaving out {short} item(s) shorter than {shortest} seconds.")
         if long_:
@@ -3955,7 +4069,7 @@ class FingerprinterApp:
     def _note_skipped(self, entry: dict, why: str, kind: str) -> None:
         """Pipeline thread: an item of the running link was not fingerprinted,
         and why, for its row (_show_skipped). `kind` is "failed",
-        "unreadable" or "length": which to keep first (SKIPPED_KEPT)."""
+        "unreadable", "length" or "date": which to keep first (SKIPPED_KEPT)."""
         if self._skipped_now is None:
             return
         self._skipped_now.append({"title": clean_text(entry.get("title") or entry.get("id") or "(untitled)")[:200],
@@ -3973,7 +4087,8 @@ class FingerprinterApp:
     @staticmethod
     def _skipped_ranked(items: list[dict]) -> list[dict]:
         """Skipped items, those that failed first, then those that could not
-        be read, then those left out by length; each in the order noted."""
+        be read, then those left out by length or date; each in the order
+        noted."""
         rank = {"failed": 0, "unreadable": 1}
         return sorted(items, key=lambda i: rank.get(i.get("kind"), 2))
 
@@ -5218,7 +5333,7 @@ class FingerprinterApp:
             single = state["n"] == 1 and not (first or {}).get("playlist_title")
             # Before the count is recorded, so a copy waiting for it
             # (_queue_copy_with_videos) finds the listing there.
-            save_listing(url, entries, single)
+            save_listing(url, own_pages(entries), single)
             self.root.after(0, self._record_count, url, state["n"], single)
 
     def _record_count(self, url: str, n: int, single: bool) -> None:
@@ -6123,6 +6238,14 @@ class FingerprinterApp:
                 )
                 return
 
+        if self._date_after() == "":
+            MessageBox.showerror(
+                "Not a date",
+                f"Only items published on or after (Settings, Downloads) is on, but "
+                f"\"{self.date_after_var.get().strip()}\" is not a date. Write it as "
+                f"2024-01-31, or turn the setting off.",
+            )
+            return
         self._fill_default_folders()
         output_dir = self.output_dir_var.get()
         bat_dir = self.bat_dir_var.get()
@@ -7525,6 +7648,9 @@ class FingerprinterApp:
             for entry in entries:
                 if entry.get("_fail_why"):
                     self._note_skipped(entry, entry["_fail_why"], "failed")
+                elif entry.get("_too_old"):
+                    self._note_skipped(entry, f"published before {self._date_text(self._date_after() or '')} "
+                                              f"(Settings, Downloads)", "date")
                 elif entry.get("_left_out"):
                     self._note_skipped(entry, "outside the length limits (Settings, Downloads)", "length")
 
@@ -8696,8 +8822,8 @@ class FingerprinterApp:
         dropped without a word. Which extractor found each entry is kept for
         the done list (_archive_key): flat entries carry ie_key, a single page
         extractor_key instead."""
-        template = ("%(.{id,title,duration,url,webpage_url,playlist_title,playlist_uploader,"
-                    "playlist_channel,channel,ie_key,extractor_key})j")
+        template = ("%(.{id,title,duration,url,webpage_url,upload_date,timestamp,release_timestamp,"
+                    "playlist_title,playlist_uploader,playlist_channel,channel,ie_key,extractor_key})j")
         cmd = [
             *self.ytdlp,
             *YTDLP_UTF8,
@@ -8776,6 +8902,8 @@ class FingerprinterApp:
                     if v is not None and not isinstance(v, str):
                         obj[k] = str(v)
                 obj["extractor"] = raw.get("ie_key") or raw.get("extractor_key")
+                # When it came out, where the site's list says (_filter_entries).
+                obj["published"] = published_date(raw)
                 # Coerce duration to a number where possible.
                 try:
                     obj["duration"] = float(raw["duration"]) if raw.get("duration") is not None else None
@@ -8833,6 +8961,7 @@ class FingerprinterApp:
                       "date. Press Check setup to update it.", tag="warning")
             return None
 
+        own_pages(entries)
         # Log the final count if the throttled log missed it.
         self._log(f"[*] Done fetching: {len(entries)} entries total.")
         cut_short = False
@@ -9027,6 +9156,11 @@ class FingerprinterApp:
             limits.append(f"duration <=? {longest * 60}")
         if limits:
             cmd += ["--match-filter", " & ".join(limits)]
+        if (after := self._date_after()):
+            # An item that came out earlier is left out ("upload date is not
+            # in range"), one with no date downloaded. Its date is printed
+            # first either way, to remember it (DATES_FILE).
+            cmd += ["--dateafter", after, "--print", f"pre_process:{self.DATE_MARK}%(upload_date)s"]
         cmd.extend(self._extra_args())
         cmd.append(video_url)
 
@@ -9052,6 +9186,7 @@ class FingerprinterApp:
         self._track_proc(proc)
 
         err_lines: list[str] = []
+        published: str | None = None      # DATE_MARK
         # Every warning, to show with a failure: they often say why, where the
         # error itself only says "Requested format is not available". Keyed
         # without their numbers, so "Retrying (1/3)" ... "(3/3)" are one.
@@ -9101,6 +9236,12 @@ class FingerprinterApp:
                     self._log(f"  [s{slot + 1}] {line}", tag="ytdlp")
                 if "does not pass filter" in line:
                     entry["_left_out"] = True     # outside the length limits
+                if line.startswith(self.DATE_MARK):
+                    published = line[len(self.DATE_MARK):].strip()
+                    continue
+                if "upload date is not in range" in line:
+                    # Left out, as by length, and why.
+                    entry["_left_out"] = entry["_too_old"] = True
                 if line.startswith(self.PICKED_MARK):
                     picked_video = line[len(self.PICKED_MARK):].strip() not in ("none", "NA", "")
                     continue
@@ -9135,7 +9276,13 @@ class FingerprinterApp:
         proc.wait()
         stopped = self.cancel_flag.is_set() or self.skip_flag.is_set()
         success = proc.returncode == 0 and not stopped
-        if success and entry.get("_left_out"):
+        if success and entry.get("_too_old"):
+            self._log(f"  - Left out '{title}': published "
+                      f"{self._date_text(published) if re.fullmatch(r'[0-9]{8}', published or '') else 'earlier'}, "
+                      f"before the date in Settings.")
+            if (key := self._archive_key(entry)) and re.fullmatch(r"[0-9]{8}", published or ""):
+                save_published_date(key, published)
+        elif success and entry.get("_left_out"):
             self._log(f"  - Left out '{title}': outside the length limits in Settings.")
         if success and from_video:
             why = ("it is age-restricted and the account signed in with is not age-verified"
@@ -9220,6 +9367,8 @@ class FingerprinterApp:
     # yt-dlp prints this, then the video codec of the format it picked
     # (_download_one, --print).
     PICKED_MARK = "[fingerprinter] picked vcodec="
+    # Before it, when it came out (Only items published on or after).
+    DATE_MARK = "[fingerprinter] published="
 
     RETRY_LATER = {None, "network error", "HTTP 403 forbidden", "HTTP 429 rate-limited",
                    "not found (HTTP 404)",

@@ -59,7 +59,7 @@ if exist "work\pklz\*.pklz" (
     if not exist "pklz-files\" mkdir "pklz-files"
     for %%P in ("work\pklz\*.pklz") do call :keep_pklz "%%~fP" "%%~nP"
 )
-for %%F in (yt-fingerprinter.pyw dependencies.py audfprint_quiet.py requirements.txt config.example.json README.md CHANGELOG.md LICENSE fingerprinter.ico setup.bat Fingerprinter.lnk config.json recent_urls.json fingerprinted-items.txt unfinished-list.json unfinished-list.tmp links-left-out.txt links-left-out.tmp installed-by-setup.txt) do (
+for %%F in (yt-fingerprinter.pyw dependencies.py audfprint_quiet.py requirements.txt config.example.json README.md CHANGELOG.md LICENSE fingerprinter.ico setup.bat Fingerprinter.lnk config.json recent_urls.json fingerprinted-items.txt unfinished-list.json unfinished-list.tmp links-left-out.txt links-left-out.tmp published-dates.txt installed-by-setup.txt) do (
     if exist "%%F" del /f /q "%%F"
 )
 for %%D in (audfprint audfprint.download texts __pycache__ avatars listings tools\ffmpeg tools\node work\texts) do (

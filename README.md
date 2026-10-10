@@ -199,8 +199,9 @@ The window has three panels, and the dividers between them can be dragged:
   stopped. Hover over it for when. **Tick unfinished**, shown above the list
   while some link did not finish, ticks just those, to run them again.
 - **`3 skipped`**, beside the count, when the link's last run left videos
-  out: shorter or longer than the limits in Settings, failed to download, or
-  could not be read for fingerprinting. A run that ends before it has listed
+  out: shorter or longer than the limits in Settings, published before the
+  date in Settings, failed to download, or could not be read for
+  fingerprinting. A run that ends before it has listed
   the link keeps the ones before, and hovering says which run they are from.
   Up to 500 are kept per link, those that failed first. Click it (or right-click the row,
   **Show what was skipped**) for which ones and why, grouped by reason, each
@@ -369,6 +370,7 @@ you last left it.
 | Downloads | Extra download options | empty | Passed to yt-dlp, split at spaces as on a command line. Put quotes around a value with spaces in it, such as a path: `--cookies "C:\Users\Jane Doe\cookies.txt"`. |
 | Downloads | Sign in with cookies from | None | A browser whose login yt-dlp uses. See [Content that needs a login](#content-that-needs-a-login). |
 | Downloads | Skip items shorter than / longer than | 0 (no limit) | Leaves out items by length, in seconds and minutes. 60 seconds leaves out YouTube Shorts. |
+| Downloads | Only items published on or after | Off | Downloads only what came out on that date or later, such as a channel's new uploads. Where the site's list does not give the date (YouTube's never does), yt-dlp looks it up just before downloading, a second or two each, and leaves out what is older; the dates of those are kept in `published-dates.txt`, so the next run does not look them up again. Items with no date at all are downloaded. Running with the box ticked but no proper date in it is refused. |
 | Downloads | Skip items already fingerprinted in an earlier run | Off | See [Running a channel again](#running-a-channel-again). |
 | Downloads | Show every line of download output | Off | Adds everything yt-dlp and audfprint print to the console. Useful when a download fails; otherwise it floods the console. Locked while a job runs. |
 | Downloads | Open the working folder when a list starts | On | Once per list: each link's own folder is deleted once it is done. |
@@ -493,6 +495,7 @@ service, whose account has no browser profile.
 | `config.json`, `recent_urls.json` | Your settings, list and recent links. |
 | `unfinished-list.json` | Where a list that stopped part-way got to, while it can be continued. |
 | `fingerprinted-items.txt` | Items already fingerprinted, when that setting is on. The format of yt-dlp's `--download-archive`. |
+| `published-dates.txt` | When the items left out by **Only items published on or after** came out, so they are not looked up again. Safe to delete. |
 | `CHANGELOG.md` | What changed in each version. |
 
 ## Credits
