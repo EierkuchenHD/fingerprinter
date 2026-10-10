@@ -66,7 +66,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.0.0-beta.9"
+__version__ = "1.0.0"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -178,6 +178,19 @@ def youtube_channel_page(url: str) -> str | None:
     return f"https://www.youtube.com/{m.group(1)}" if m else None
 
 
+def list_key(url: str) -> str:
+    """What two links must share to be one entry in the list: link_key, and
+    a YouTube channel's Videos tab counts as the channel itself, so
+    youtube.com/@x and www.youtube.com/@x/videos are one entry. (The bare
+    channel runs its Shorts and Live too; _add_to_queue says so.) Its other
+    tabs (/shorts, /streams, /featured...) stay entries of their own:
+    yt-dlp lists each of them as something else."""
+    key = link_key(url)
+    m = re.match(r"^(youtube\.com/(?:@[^/?#]+|channel/UC[\w-]+|c/[^/?#]+|user/[^/?#]+))"
+                 r"/videos$", key)
+    return m.group(1) if m else key
+
+
 def avatar_image_url(url: str, px: int) -> str:
     """A channel picture's address, asking Google's image server for a round
     PNG of px pixels (=s20-cc-rp): Tk shows PNG without Pillow, and the soft
@@ -246,12 +259,155 @@ DONE_FILE = SCRIPT_DIR / "fingerprinted-items.txt"
 # finding it at start-up means the last run stopped part-way (Stop, a crash,
 # the PC shutting down) and can be continued (see _offer_resume).
 LIST_STATE_FILE = SCRIPT_DIR / "unfinished-list.json"
+# The most links the list holds. Each row is up to 9 of the 10,000 windows
+# Windows lets a program have, and the list crashed past about 1,000. Links of
+# a saved list beyond it (an earlier version took any number) are written to
+# LEFT_OUT_FILE at start, one per line, to Import once there is room.
+QUEUE_MAX = 1000
+LEFT_OUT_FILE = SCRIPT_DIR / "links-left-out.txt"
 # Channel pictures for the list's YouTube links (Settings, General): a small
 # round PNG per channel, "<channel id>-<pixels>.png", and index.json, which
 # link is whose channel. Looked up again after AVATAR_REFRESH_DAYS.
 AVATAR_DIR = SCRIPT_DIR / "avatars"
 AVATAR_INDEX = AVATAR_DIR / "index.json"
 AVATAR_REFRESH_DAYS = 30
+
+
+# What each link in the list holds, as its last listing found it (a count or a
+# run): "<hash of the link>.json", {"url", "date", "single", "entries":
+# [[title, link], ...]}. Read by Copy link and its videos; files of links no
+# longer in the list are deleted at start (prune_listings).
+LISTING_DIR = SCRIPT_DIR / "listings"
+
+
+def save_left_out_links(urls: list[str]) -> Path | None:
+    """Add these links to LEFT_OUT_FILE, after those already there (none
+    twice). The file, or None when it could not be read or written."""
+    try:
+        old = (LEFT_OUT_FILE.read_text(encoding="utf-8").splitlines()
+               if LEFT_OUT_FILE.exists() else [])
+    except (OSError, ValueError):
+        return None             # rewriting it would lose what it holds
+    have = {line.strip() for line in old}
+    if not old:
+        # Import passes over lines starting with #.
+        old = [f"# Links left out of the Fingerprinter's list, which holds at most {QUEUE_MAX:,}.",
+               "# Import this file to add them once there is room.", ""]
+    tmp = LEFT_OUT_FILE.with_suffix(".tmp")
+    try:
+        tmp.write_text("\n".join(old + [u for u in urls if u not in have]) + "\n", encoding="utf-8")
+        os.replace(tmp, LEFT_OUT_FILE)
+    except OSError:
+        return None
+    return LEFT_OUT_FILE
+
+
+def listing_file(url: str) -> Path:
+    return LISTING_DIR / (hashlib.sha1(link_key(url).encode("utf-8")).hexdigest()[:20] + ".json")
+
+
+def entry_link(entry: dict) -> str:
+    """The page of one listed item, or "" when the listing gave none. Flat
+    entries carry it as url, a single page as webpage_url (its url, if any,
+    is the media file itself). A bare 11-character ID is a YouTube video's."""
+    link = str(entry.get("webpage_url") or entry.get("url") or "")
+    if "://" in link:
+        return link
+    if link.startswith(("youtu.be/", "www.", "youtube.com/")):
+        return "https://" + link
+    item_id = str(entry.get("id") or "")
+    return f"https://www.youtube.com/watch?v={item_id}" if re.fullmatch(r"[\w-]{11}", item_id) else ""
+
+
+def clean_text(text: object) -> str:
+    """`text` on one line, with what UTF-8 cannot hold (a lone surrogate, from
+    a title a site cut in half) as "?": written to a file or handed to Tk,
+    it would raise instead."""
+    text = str(text).encode("utf-8", "replace").decode("utf-8")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def save_listing(url: str, entries: list[dict], single: bool) -> None:
+    """Keep what a listing of `url` found (see LISTING_DIR). Any thread."""
+    # No title is no title (SoundCloud's lists give none), not the item's ID.
+    rows = [[clean_text(e.get("title") or ""), clean_text(entry_link(e))]
+            for e in entries if isinstance(e, dict)]
+    # A line yt-dlp printed that was not an entry gives neither.
+    rows = [row for row in rows if row[0] or row[1]]
+    data = {"url": url, "date": time.strftime("%Y-%m-%d"), "single": bool(single), "entries": rows}
+    path = listing_file(url)
+    try:
+        LISTING_DIR.mkdir(exist_ok=True)
+        tmp = path.with_name(f"{path.stem}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, ValueError):
+        pass
+
+
+def load_listing(url: str) -> dict | None:
+    """The kept listing of `url` (save_listing), or None when there is none
+    or it cannot be read."""
+    try:
+        data = json.loads(listing_file(url).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(data, dict) and isinstance(data.get("entries"), list)):
+        return None
+    data["entries"] = [(str(e[0]), str(e[1])) for e in data["entries"]
+                       if isinstance(e, list) and len(e) == 2]
+    return data
+
+
+def skipped_file(url: str) -> Path:
+    """Every item a link's run skipped, when that is more than config.json
+    keeps (SKIPPED_KEPT): {"time", "items": [[link, why], ...]}, so Copy link
+    and its videos marks them all."""
+    path = listing_file(url)
+    return path.with_name(f"{path.stem}-skipped.json")
+
+
+def save_skipped_links(url: str, when: str, items: list[dict] | None) -> None:
+    """Keep every skipped item of a link's run (`when`); None deletes them."""
+    path = skipped_file(url)
+    try:
+        if items is None:
+            path.unlink(missing_ok=True)
+            return
+        LISTING_DIR.mkdir(exist_ok=True)
+        data = {"time": when, "items": [[i.get("link", ""), i.get("why", "")] for i in items if i.get("link")]}
+        tmp = path.with_name(f"{path.stem}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, ValueError):
+        pass
+
+
+def load_skipped_links(url: str, when: str) -> dict[str, str] | None:
+    """link_key -> why for every item the run of `when` skipped, or None when
+    they were not kept apart (there were few enough for config.json)."""
+    try:
+        data = json.loads(skipped_file(url).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("time") != when or not isinstance(data.get("items"), list):
+        return None
+    return {link_key(str(i[0])): str(i[1]) for i in data["items"] if isinstance(i, list) and len(i) == 2}
+
+
+def prune_listings(urls: list[str]) -> None:
+    """Delete the kept listings of links that are no longer in the list."""
+    keep = {f.name for u in urls for f in (listing_file(u), skipped_file(u))}
+    try:
+        files = list(LISTING_DIR.iterdir())
+    except OSError:
+        return
+    for path in files:
+        if path.suffix in (".json", ".tmp") and path.name not in keep:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def load_avatar_index() -> dict:
@@ -1095,10 +1251,39 @@ class FingerprinterApp:
                 "Tick only the links whose last run did not finish (incomplete, failed, "
                 "skipped or stopped) and those not run yet, to run them again.")
 
+        # Search: only the rows whose link, channel name or last result has
+        # every word typed (_apply_queue_filter). Hidden while the list is
+        # empty (_update_list_header).
+        self.queue_search_bar = ttk.Frame(box)
+        ttk.Label(self.queue_search_bar, text="Search:").pack(side="left", padx=(0, 6))
+        self.queue_search_var = tk.StringVar()
+        self.queue_search_entry = ttk.Entry(self.queue_search_bar, textvariable=self.queue_search_var)
+        self.queue_search_entry.pack(side="left", fill="x", expand=True)
+        self.queue_search_info = ttk.Label(self.queue_search_bar, foreground=self.HELP_GREY)
+        self.queue_search_info.pack(side="right", padx=(6, 0))
+        self._themed_labels.append((self.queue_search_info, "help"))
+        self.queue_search_clear_btn = ttk.Button(self.queue_search_bar, text="\u2715", width=3,
+                                                 style="Toolbutton", command=self._clear_queue_search)
+        Tooltip(self.queue_search_clear_btn, "Clear the search (Esc).")
+        Tooltip(self.queue_search_entry,
+                "Show only the links that have every word typed here: in the link, the "
+                "channel's name or @handle, or how its last run ended (done, failed, "
+                "skipped...). Ctrl+F in the list comes here; Esc clears it, Down goes "
+                "to the rows.")
+        self._queue_search_after: str | None = None
+        self.queue_search_var.trace_add("write", lambda *_a: self._queue_search_later())
+        self.queue_search_entry.bind("<Escape>", lambda _e: self._clear_queue_search(focus_list=True))
+        for key in ("<Down>", "<Return>", "<KP_Enter>"):
+            self.queue_search_entry.bind(key, lambda _e: self._queue_search_to_rows())
+        # Not the console's search, as Ctrl+F elsewhere.
+        for key in ("<Control-f>", "<Control-F>"):
+            self.queue_search_entry.bind(key, lambda _e: self._focus_queue_search())
+
         # Rows of widgets in a canvas (see _build_queue_row): a Listbox cannot
         # hold tick boxes. White and outlined, like a list box.
         frame = ttk.Frame(box)
         frame.pack(fill="both", expand=True)
+        self.queue_list_frame = frame
         self.queue_canvas = tk.Canvas(
             frame, bg=self.QROW_BG, highlightthickness=1,
             highlightbackground="#c8c8c8", highlightcolor="#c8c8c8",
@@ -1114,11 +1299,34 @@ class FingerprinterApp:
         self.queue_canvas.bind("<Configure>", lambda e: self.queue_canvas.itemconfigure(
             inner, width=e.width))
         self._wheel_targets.append(self.queue_canvas)
-        # Clicking a row gives the list the keyboard, for these.
-        self.queue_canvas.bind("<Delete>", lambda _e: self._queue_remove_selected())
-        self.queue_canvas.bind("<Control-a>", lambda _e: self._queue_select_all())
-        self.queue_canvas.bind("<Control-A>", lambda _e: self._queue_select_all())
-        self.queue_canvas.bind("<Escape>", lambda _e: self._queue_select_none())
+        # Clicking a row gives the list the keyboard, for these (the README
+        # lists them). Shift with the arrows, Home, End and the page keys
+        # selects from the row clicked last (_queue_key_move).
+        for keys, command in (
+            (("<Delete>",), self._queue_remove_selected),
+            (("<Control-a>", "<Control-A>"), self._queue_select_all),
+            (("<Escape>",), self._queue_select_none),
+            (("<Control-c>", "<Control-C>", "<Control-Insert>"), self._queue_copy_selected),
+            (("<Control-Shift-C>", "<Control-Shift-c>"), self._queue_copy_with_videos),
+            (("<Control-v>", "<Control-V>", "<Shift-Insert>"), self._queue_paste),
+            (("<Control-f>", "<Control-F>"), self._focus_queue_search),
+            (("<space>",), self._queue_toggle_ticks),
+            (("<Return>", "<KP_Enter>"), self._queue_open_selected),
+            (("<F5>",), self._queue_recount_selected),
+            (("<Shift-F10>", "<App>"), self._queue_menu_from_keys),
+            (("<Control-Up>",), lambda: self._queue_shift_rows(-1)),
+            (("<Control-Down>",), lambda: self._queue_shift_rows(1)),
+            (("<Control-Home>",), lambda: self._queue_shift_rows(-10 ** 6)),
+            (("<Control-End>",), lambda: self._queue_shift_rows(10 ** 6)),
+        ):
+            for key in keys:
+                self.queue_canvas.bind(key, lambda _e, c=command: c() or "break")
+        for key, step in (("Up", -1), ("Down", 1), ("Home", -10 ** 6), ("End", 10 ** 6),
+                          ("Prior", "page-up"), ("Next", "page-down")):
+            # Ctrl+Shift+End selects to the end, as elsewhere in Windows,
+            # rather than moving rows as Ctrl+End does.
+            for seq in (f"<{key}>", f"<Control-Shift-{key}>"):
+                self.queue_canvas.bind(seq, lambda e, s=step: self._queue_key_move(s, e))
 
         # Backing state. queue_urls holds the URLs; queue_checks holds a
         # BooleanVar per URL (checked = include in the run). queue_selected
@@ -1129,6 +1337,15 @@ class FingerprinterApp:
         self.queue_checks: list[tk.BooleanVar] = []
         self.queue_selected: set[str] = set()
         self._queue_anchor: str | None = None
+        # The row the arrow keys are on: the anchor, but for Shift+arrows,
+        # which move it and select from the anchor to it.
+        self._queue_cursor: str | None = None
+        # The Undo entry of the last moves by Ctrl+arrows, which a run of
+        # them shares (_queue_shift_rows); a move by other means ends it.
+        self._key_move_undo: dict | None = None
+        # The links the search shows; None while there is no search.
+        self._queue_shown: set[str] | None = None
+        self._queue_nomatch: tk.Label | None = None
         self.queue_rows: list[dict] = []
         self._queue_editable = True
         self._drag: dict | None = None
@@ -1146,6 +1363,13 @@ class FingerprinterApp:
         # (_run_pipeline). Its final count goes to _last_items for the result.
         self._item_progress: dict | None = None
         self._last_items: list[int] | None = None
+        # The items of the running link that were not fingerprinted, and why
+        # (_note_skipped), None until it has been listed; and those of the
+        # link run last, for its result (_set_link_result).
+        self._skipped_now: list[dict] | None = None
+        # Links of a saved list past QUEUE_MAX, until written out (_note_left_out).
+        self._queue_left_out: list[str] = []
+        self._last_skipped: list[dict] | None = None
         self._count_state: dict[str, dict] = {}
         self._count_queue: queue.Queue[str] = queue.Queue()
         self._count_pending: set[str] = set()
@@ -1153,6 +1377,9 @@ class FingerprinterApp:
         self._count_procs: list[subprocess.Popen] = []
         self._count_lock = threading.Lock()
         self._closing = False
+        # A Copy link and its videos waiting for links to be listed; a newer
+        # one replaces it (_queue_copy_with_videos).
+        self._copy_videos_job: object | None = None
         # Channel pictures (_request_avatars): what is known about whose
         # channel each link is, loaded here so the rows built next show the
         # pictures already fetched, without going online.
@@ -2566,6 +2793,9 @@ class FingerprinterApp:
         saved_queue = cfg.get("queue")
         if isinstance(saved_queue, list):
             self.queue_urls = [str(u) for u in saved_queue if u]
+            # Kept in config.json too while they cannot be written out.
+            self._queue_left_out = self.queue_urls[QUEUE_MAX:]
+            del self.queue_urls[QUEUE_MAX:]
             unticked = cfg.get("queue_unticked")
             unticked = set(unticked) if isinstance(unticked, list) else set()
             self.queue_checks = [self._new_check(u not in unticked) for u in self.queue_urls]
@@ -2585,6 +2815,9 @@ class FingerprinterApp:
                     and r.get("status") in self.RESULT_MARKS
                 }
             self._refresh_queue()
+            self._note_duplicate_rows()
+            self._note_left_out()
+            threading.Thread(target=prune_listings, args=(list(self.queue_urls),), daemon=True).start()
 
     @staticmethod
     def _safe_int(var: tk.IntVar, default: int, minimum: int = 1) -> int:
@@ -2643,7 +2876,7 @@ class FingerprinterApp:
             out[key] = "" if value and Path(value) == default else value
         # Persist the queue so it survives restarts.
         out["config_version"] = CONFIG_VERSION
-        out["queue"] = list(self.queue_urls)
+        out["queue"] = list(self.queue_urls) + self._queue_left_out
         out["queue_unticked"] = [u for u, v in zip(self.queue_urls, self.queue_checks) if not v.get()]
         out["queue_counts"] = {u: c for u, c in self.queue_counts.items() if u in self.queue_urls}
         out["queue_results"] = {u: r for u, r in self.queue_results.items() if u in self.queue_urls}
@@ -3368,17 +3601,28 @@ class FingerprinterApp:
     def _filter_entries(self, entries: list[dict]) -> list[dict]:
         """Leave out items outside the length limits and, when asked, items
         fingerprinted in an earlier run. Items whose length the listing did not
-        give are kept here; yt-dlp checks those itself (see _download_one)."""
+        give are kept here; yt-dlp checks those itself (see _download_one).
+        Those outside the limits are noted for the link's row (_note_skipped);
+        those fingerprinted before are not: they are done, not skipped."""
         shortest = self._safe_int(self.min_seconds_var, 0, minimum=0)
         longest = self._safe_int(self.max_minutes_var, 0, minimum=0) * 60
+        # Read first: an item fingerprinted before is done, not skipped, also
+        # when it is outside limits set since.
+        done = self._load_done() if self.skip_done_var.get() else set()
         kept: list[dict] = []
         short = long_ = 0
         for entry in entries:
             length = entry.get("duration")
             if length and shortest and length < shortest:
                 short += 1
+                if self._archive_key(entry) not in done:
+                    self._note_skipped(entry, f"shorter than {shortest} seconds (Settings, Downloads)",
+                                       "length")
             elif length and longest and length > longest:
                 long_ += 1
+                if self._archive_key(entry) not in done:
+                    self._note_skipped(entry, f"longer than {longest // 60} minutes (Settings, Downloads)",
+                                       "length")
             else:
                 kept.append(entry)
         if short:
@@ -3386,7 +3630,6 @@ class FingerprinterApp:
         if long_:
             self._log(f"[*] Leaving out {long_} item(s) longer than {longest // 60} minutes.")
         if self.skip_done_var.get():
-            done = self._load_done()
             before = len(kept)
             kept = [e for e in kept if self._archive_key(e) not in done]
             if before > len(kept):
@@ -3594,12 +3837,14 @@ class FingerprinterApp:
                      "any other site yt-dlp supports work.\n\n"
                      "Links run from top to bottom. Drag a row by ≡ to move it, "
                      "click a link to open it, Ctrl+click or Shift+click rows to "
-                     "select several, and right-click a row for more.",
+                     "select several, and right-click a row for more. With a row "
+                     "clicked, the keyboard works too: the arrow keys, Space to tick, "
+                     "Enter to open, Ctrl+C to copy, Ctrl+V to add what you copied, "
+                     "Delete to remove and Ctrl+F to search.",
             ).pack(fill="x", padx=8, pady=8)
         for url, var in zip(self.queue_urls, self.queue_checks):
             self.queue_rows.append(self._build_queue_row(url, var))
-        self._paint_queue_rows()
-        self._update_list_header()
+        self._apply_queue_filter(scroll=False)
 
     def _new_check(self, ticked: bool = True) -> tk.BooleanVar:
         """A row's tick box, ticked by default, keeping the list's header count
@@ -3629,7 +3874,23 @@ class FingerprinterApp:
             if ticked != n:
                 title += f", {ticked} ticked"
         self.list_title_var.set(title)
-        self.tick_all_btn.configure(text="Untick all" if n and ticked == n else "Tick all")
+        # Tick all ticks the rows the search shows.
+        shown = self._shown_indexes()
+        all_ticked = bool(shown) and all(self.queue_checks[i].get() for i in shown)
+        what = "shown" if self._queue_shown is not None else "all"
+        self.tick_all_btn.configure(text=f"Untick {what}" if all_ticked else f"Tick {what}")
+        # The search, while there is something to search (or a search to clear).
+        searching = bool(self.queue_search_var.get())
+        if (n or searching) and not self.queue_search_bar.winfo_manager():
+            self.queue_search_bar.pack(fill="x", pady=(0, 3), before=self.queue_list_frame)
+        elif not n and not searching and self.queue_search_bar.winfo_manager():
+            self.queue_search_bar.pack_forget()
+        if searching and not self.queue_search_clear_btn.winfo_manager():
+            self.queue_search_clear_btn.pack(side="left", padx=(4, 0))
+        elif not searching and self.queue_search_clear_btn.winfo_manager():
+            self.queue_search_clear_btn.pack_forget()
+        self.queue_search_info.configure(
+            text=f"{len(shown)} of {n} shown" if self._queue_shown is not None else "")
         # Tick unfinished, while some link's last run did not finish.
         unfinished = any(self.queue_results.get(u, {}).get("status") not in (None, "done")
                          for u in self.queue_urls if u != self._running_url)
@@ -3639,10 +3900,15 @@ class FingerprinterApp:
             self.tick_unfinished_btn.pack_forget()
 
     def _tick_all(self) -> None:
-        """Tick every link, or untick them all when they already are."""
-        value = not all(v.get() for v in self.queue_checks)
-        for var in self.queue_checks:
-            var.set(value)
+        """Tick every link, or untick them all when they already are. While
+        searching, only the links shown."""
+        shown = self._shown_indexes()
+        value = not all(self.queue_checks[i].get() for i in shown)
+        for i in shown:
+            self.queue_checks[i].set(value)
+        if self._queue_shown is not None:
+            self.status_var.set(f"{'Ticked' if value else 'Unticked'} the {len(shown)} link(s) "
+                                f"the search shows.")
 
     def _tick_unfinished(self) -> None:
         """Tick the links whose last run did not finish, and those not run yet;
@@ -3682,13 +3948,168 @@ class FingerprinterApp:
         when = f" (last run {result['time']})" if result.get("time") else ""
         return f"{self.RESULT_MARKS[result['status']][2]}{when}."
 
+    # How many skipped items a link keeps for its row, so a channel of
+    # thousands of short videos left out by length does not bloat config.json.
+    SKIPPED_KEPT = 500
+
+    def _note_skipped(self, entry: dict, why: str, kind: str) -> None:
+        """Pipeline thread: an item of the running link was not fingerprinted,
+        and why, for its row (_show_skipped). `kind` is "failed",
+        "unreadable" or "length": which to keep first (SKIPPED_KEPT)."""
+        if self._skipped_now is None:
+            return
+        self._skipped_now.append({"title": clean_text(entry.get("title") or entry.get("id") or "(untitled)")[:200],
+                                  "link": clean_text(entry_link(entry))[:500],
+                                  "why": clean_text(why)[:300], "kind": kind})
+
+    def _skipped_items(self, url: str) -> list[dict]:
+        """What the link's last run skipped (_note_skipped), as saved."""
+        items = (self.queue_results.get(url) or {}).get("skipped")
+        if not isinstance(items, list):
+            return []
+        return [i for i in items if isinstance(i, dict) and isinstance(i.get("title"), str)
+                and isinstance(i.get("why"), str) and isinstance(i.get("link", ""), str)]
+
+    @staticmethod
+    def _skipped_ranked(items: list[dict]) -> list[dict]:
+        """Skipped items, those that failed first, then those that could not
+        be read, then those left out by length; each in the order noted."""
+        rank = {"failed": 0, "unreadable": 1}
+        return sorted(items, key=lambda i: rank.get(i.get("kind"), 2))
+
+    def _skipped_info(self, url: str) -> tuple[list[dict], int, str]:
+        """What a link's run skipped: the items kept (SKIPPED_KEPT at most),
+        how many it skipped in all, and when that run was."""
+        result = self.queue_results.get(url) or {}
+        items = self._skipped_items(url)
+        n = result.get("skipped_n")
+        n = n if isinstance(n, int) and not isinstance(n, bool) and n >= len(items) else len(items)
+        when = result.get("skipped_time") or result.get("time") or "?"
+        return items, (n if items else 0), str(when)
+
+    def _show_skipped_label(self, row: dict) -> None:
+        """Show "N skipped" on a row while its last run skipped some."""
+        n = self._skipped_info(row["url"])[1]
+        label = row["skipped"]
+        if n:
+            p = PALETTES[getattr(self, "_theme_now", "light")]
+            label.config(text=f"{n:,} skipped", fg=p["tags"]["bat"])
+            if not label.winfo_manager():
+                label.pack(side="right", padx=(8, 0), after=row["count"])
+        elif label.winfo_manager():
+            label.pack_forget()
+
+    def _skipped_tip(self, url: str) -> str:
+        _items, n, when = self._skipped_info(url)
+        return (f"{n:,} of this link's {self._count_noun(url)}s were not fingerprinted in its "
+                f"run of {when}: left out by the length limits, or they failed to download "
+                f"or to be read. Click to see which, and why.")
+
+    def _show_skipped(self, url: str) -> None:
+        """A window listing what the link's last run skipped, grouped by why,
+        each with its link to open."""
+        items = self._skipped_items(url)
+        if not items:
+            return
+        p = PALETTES[self._theme_now]
+        dlg = tk.Toplevel(self.root)
+        dlg.withdraw()
+        dlg.transient(self.root)
+        dlg.configure(bg=p["bg"])
+        channel = self._avatar_channel(url)
+        with self._avatar_lock:
+            name = str((self._avatar_index["channels"].get(channel) or {}).get("name") or "") if channel else ""
+        dlg.title(f"Skipped · {name or url}")
+        _items, total, when = self._skipped_info(url)
+        noun = self._count_noun(url)
+        n = len(items)
+        head = (f"{total:,} {noun}{'' if total == 1 else 's'} of {url} {'was' if total == 1 else 'were'} "
+                f"not fingerprinted in its run of {when}.")
+        if total > n:
+            head += (f" The first {n:,} are listed here, those that failed before those left "
+                     f"out by length.")
+        ttk.Label(dlg, text=head + " Click a link to open it.",
+                  wraplength=620, justify="left").pack(fill="x", padx=12, pady=(12, 6))
+
+        frame = ttk.Frame(dlg)
+        frame.pack(fill="both", expand=True, padx=12)
+        text = tk.Text(frame, wrap="word", width=90, height=min(24, 2 * n + 4), relief="flat",
+                       bg=p["row_bg"], fg=p["fg"], highlightthickness=1,
+                       highlightbackground=p["border"], highlightcolor=p["border"],
+                       selectbackground=p["highlight"], selectforeground=p["highlight_fg"],
+                       padx=8, pady=6, cursor="arrow", font=tkfont.nametofont("TkDefaultFont"))
+        bar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=bar.set)
+        text.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        text.tag_configure("head", font=self._bold_font, spacing1=6, spacing3=2)
+        text.tag_configure("item", lmargin1=16, lmargin2=16)
+        text.tag_configure("link", foreground=p["link"], font=self._link_font)
+        text.tag_bind("link", "<Enter>", lambda _e: text.config(cursor="hand2"))
+        text.tag_bind("link", "<Leave>", lambda _e: text.config(cursor="arrow"))
+
+        groups: dict[str, list[dict]] = {}
+        for item in items:
+            groups.setdefault(item["why"], []).append(item)
+        plain = [f"Skipped in the run of {url} of {when} ({total:,} in all):"]
+        for k, (why, group) in enumerate(sorted(groups.items(), key=lambda g: -len(g[1]))):
+            text.insert("end", f"{why} · {len(group)}\n", "head")
+            plain.append(f"\n{why} ({len(group)}):")
+            for j, item in enumerate(group):
+                text.insert("end", item["title"], "item")
+                if item.get("link"):
+                    tag = f"link{k}_{j}"
+                    text.insert("end", "  ", "item")
+                    text.insert("end", item["link"], ("item", "link", tag))
+                    text.tag_bind(tag, "<Button-1>", lambda _e, u=item["link"]: self._open_link(u))
+                text.insert("end", "\n", "item")
+                plain.append(f"  {item['title']}  {item.get('link') or ''}".rstrip())
+        text.configure(state="disabled")
+
+        buttons = ttk.Frame(dlg)
+        buttons.pack(fill="x", padx=12, pady=12)
+        close = ttk.Button(buttons, text="Close", width=10, command=dlg.destroy, default="active")
+        close.pack(side="right")
+        copied = ttk.Label(buttons, foreground=p["help"])
+
+        def copy() -> None:
+            self._copy_text("\n".join(plain) + "\n")
+            copied.configure(text="Copied.")
+        ttk.Button(buttons, text="Copy the list", command=copy).pack(side="right", padx=(0, 6))
+        copied.pack(side="left")
+        for key in ("<Escape>", "<Return>", "<KP_Enter>"):
+            dlg.bind(key, lambda _e: dlg.destroy())
+        dlg.bind("<Map>", self._on_map_title_bar, add="+")
+
+        # Over the middle of the main window, on the screen in full.
+        dlg.update_idletasks()
+        w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        cx = self.root.winfo_rootx() + self.root.winfo_width() // 2
+        cy = self.root.winfo_rooty() + self.root.winfo_height() // 2
+        x, y = cx - w // 2, cy - h // 2
+        area = self._screen_area(cx, cy, nearest=True)
+        if area:
+            left, top, right, bottom = area
+            x, y = max(left, min(x, right - w - 16)), max(top, min(y, bottom - h - 40))
+        dlg.geometry(f"+{x}+{y}")
+        dlg.deiconify()
+        close.focus_set()
+
     def _set_link_result(self, url: str, status: str | None,
-                         items: list[int] | None = None) -> None:
+                         items: list[int] | None = None,
+                         skipped: list[dict] | None = None) -> None:
         """UI thread: a link starts ("running") or ends with `status`, and
         `items` [done, total, final] of its entries (_run_pipeline): final when
         the run made fingerprints, so its count replaces the last one; else
         the run added nothing, and the last count stands."""
         prev = (self.queue_results.get(url) or {}).get("items")
+        # What its last run skipped stays until a run that listed the link
+        # says anew (`skipped` not None), with how many and when.
+        old = self.queue_results.get(url) or {}
+        prev_skipped = {k: v for k, v in old.items() if k in ("skipped", "skipped_n", "skipped_time")}
+        if prev_skipped.get("skipped") and not prev_skipped.get("skipped_time") and old.get("time"):
+            # Saved before the time was kept apart: the run they came from.
+            prev_skipped["skipped_time"] = old["time"]
         if not (isinstance(prev, list) and len(prev) == 2
                 and all(isinstance(x, int) and x >= 0 for x in prev)):
             prev = None
@@ -3700,6 +4121,7 @@ class FingerprinterApp:
             self.queue_results[url] = {"status": "cancelled", "time": time.strftime("%Y-%m-%d %H:%M")}
             if prev:
                 self.queue_results[url]["items"] = prev
+            self.queue_results[url].update(prev_skipped)
             self._schedule_save()
         else:
             if self._running_url == url:
@@ -3714,11 +4136,23 @@ class FingerprinterApp:
                     items = prev
                 if items is not None:
                     self.queue_results[url]["items"] = list(items)
+                if skipped is None:
+                    self.queue_results[url].update(prev_skipped)
+                elif skipped:
+                    # Failures first: a channel can leave out thousands by
+                    # length, and those are the ones least worth a look.
+                    kept = self._skipped_ranked(skipped)[:self.SKIPPED_KEPT]
+                    when = time.strftime("%Y-%m-%d %H:%M")
+                    self.queue_results[url].update(skipped=kept, skipped_n=len(skipped), skipped_time=when)
+                    # The rest of them, for Copy link and its videos.
+                    save_skipped_links(url, when, skipped if len(skipped) > len(kept) else None)
+                else:
+                    save_skipped_links(url, "", None)
         for i, row in enumerate(self.queue_rows):
             if row["url"] == url:
-                mark, colour = self._result_mark(url)
-                row["mark"].config(text=mark, fg=colour)
+                self._set_row_mark(row)
                 row["count"].config(text=self._count_text(url))
+                self._show_skipped_label(row)
                 if status == "running":
                     self._scroll_to_row(i)
         self._update_list_header()
@@ -3727,7 +4161,7 @@ class FingerprinterApp:
 
     def _scroll_to_row(self, i: int) -> None:
         """Scroll the list so that row i is in view, if it is not already."""
-        if not 0 <= i < len(self.queue_rows):
+        if not 0 <= i < len(self.queue_rows) or not self._is_shown(self.queue_rows[i]["url"]):
             return
         self.queue_rows_frame.update_idletasks()
         frame = self.queue_rows[i]["frame"]
@@ -3750,16 +4184,10 @@ class FingerprinterApp:
         check.pack(side="left")
         num = tk.Label(frame, bg=bg, fg=self.QFG, width=3, anchor="e")
         num.pack(side="left")
-        # How the link's last run ended, or that it is running (RESULT_MARKS).
-        text, colour = self._result_mark(url)
-        mark = tk.Label(frame, text=text, bg=bg, fg=colour, width=2)
+        # How the link's last run ended, or that it is running (RESULT_MARKS),
+        # and the channel's picture (_set_row_mark).
+        mark = tk.Label(frame, bg=bg, bd=0, highlightthickness=0)
         mark.pack(side="left")
-        # The channel's picture, for YouTube links; a blank of the same size
-        # for the rest and until it has come, so the links stay in line.
-        avatar = tk.Label(frame, image=self._avatar_image_for(url), bg=bg, bd=0,
-                          padx=0, pady=0, highlightthickness=0)
-        if self.show_avatars_var.get():
-            avatar.pack(side="left", padx=(2, 0))
         # Packed from the right before the link, so a long link is cut short
         # rather than pushing them out of view.
         remove = tk.Label(frame, text="\u2715", bg=bg, fg=self.QMUTED_FG,
@@ -3767,6 +4195,9 @@ class FingerprinterApp:
         remove.pack(side="right")
         count = tk.Label(frame, text=self._count_text(url), bg=bg, fg=self.QMUTED_FG)
         count.pack(side="right", padx=(8, 0))
+        # "3 skipped": what its last run did not fingerprint; a click shows
+        # which, and why (_show_skipped). Packed only while there are some.
+        skipped = tk.Label(frame, bg=bg, cursor="hand2", font=self._link_font)
         # As wide as its text, not the row: only the link itself opens it, and
         # a click on the empty space beside it selects the row. A long link is
         # still cut short to the room left.
@@ -3775,16 +4206,19 @@ class FingerprinterApp:
         link.pack(side="left", padx=(4, 0))
 
         row = {"url": url, "frame": frame, "handle": handle, "check": check, "num": num,
-               "mark": mark, "avatar": avatar, "count": count, "link": link, "remove": remove}
+               "mark": mark, "count": count, "link": link, "remove": remove, "skipped": skipped}
+        self._set_row_mark(row)
+        self._show_skipped_label(row)
+        skipped.bind("<Button-1>", lambda _e: self._show_skipped(url))
         for widget, kind in ((frame, "row"), (handle, "row"), (num, "row"), (mark, "row"),
-                             (avatar, "row"), (count, "row"), (link, "link")):
+                             (count, "row"), (link, "link")):
             widget.bind("<ButtonPress-1>", lambda e, r=row, k=kind: self._queue_press(e, r, k))
             widget.bind("<B1-Motion>", self._queue_motion)
             widget.bind("<ButtonRelease-1>", self._queue_release)
-        for widget in (frame, handle, check, num, mark, avatar, count, link, remove):
+        for widget in (frame, handle, check, num, mark, count, link, remove, skipped):
             widget.bind("<Button-3>", lambda e, r=row: self._queue_menu(e, r))
-        Tooltip(mark, lambda: self._result_tip(url))
-        Tooltip(avatar, lambda: self._avatar_tip(url))
+        Tooltip(skipped, lambda: self._skipped_tip(url))
+        Tooltip(mark, lambda: self._mark_tip(row))
         remove.bind("<Button-1>", lambda _e, r=row: self._queue_remove_row(r))
         remove.bind("<Enter>", lambda e: e.widget.config(
             fg=self.QREMOVE_HOVER_FG if self._queue_editable else self.QMUTED_FG))
@@ -3795,12 +4229,37 @@ class FingerprinterApp:
         Tooltip(remove, "Remove from the list.")
         return row
 
+    def _set_row_mark(self, row: dict) -> None:
+        """A row's result mark and, with the pictures on, its channel's
+        picture to the right of it: for YouTube links, and a blank of the same
+        size for the rest and until it has come, so the links stay in line.
+        One label, as each is one of the windows Windows rations (QUEUE_MAX)."""
+        text, colour = self._result_mark(row["url"])
+        label = row["mark"]
+        if self.show_avatars_var.get():
+            # With a picture, the width is in pixels: two characters, a gap
+            # and the picture, which keeps to the right. No padding, which Tk
+            # leaves out without text and would shift the links of those rows.
+            label.config(text=f"{text} " if text else "", fg=colour, compound="right",
+                         image=self._avatar_image_for(row["url"]), anchor="e", padx=0, pady=0,
+                         width=2 * self._link_font.measure("0") + 4 + self._avatar_px)
+        else:
+            label.config(text=text, fg=colour, image="", anchor="center", padx=1, pady=1, width=2)
+
+    def _mark_tip(self, row: dict) -> str:
+        """The tooltip over a row's mark, or over the picture beside it."""
+        label = row["mark"]
+        over_picture = (self.show_avatars_var.get() and label.winfo_pointerx() - label.winfo_rootx()
+                        >= label.winfo_width() - self._avatar_px - 2)
+        return self._avatar_tip(row["url"]) if over_picture else self._result_tip(row["url"])
+
     def _paint_queue_rows(self) -> None:
         """Number the rows and colour the selected ones."""
         for i, row in enumerate(self.queue_rows):
             row["num"].config(text=f"{i + 1}.")
             bg = self.QROW_SELECTED if row["url"] in self.queue_selected else self.QROW_BG
-            for key in ("frame", "handle", "check", "num", "mark", "avatar", "count", "link", "remove"):
+            for key in ("frame", "handle", "check", "num", "mark", "count", "link", "remove",
+                        "skipped"):
                 row[key].config(bg=bg)
             row["check"].config(activebackground=bg)
 
@@ -3816,6 +4275,7 @@ class FingerprinterApp:
     @queue_active.setter
     def queue_active(self, index: int | None) -> None:
         self._queue_anchor = None if index is None else self.queue_urls[index]
+        self._queue_cursor = self._queue_anchor
         self.queue_selected = set() if index is None else {self._queue_anchor}
 
     def _selected_indexes(self) -> list[int]:
@@ -3823,14 +4283,395 @@ class FingerprinterApp:
         return [i for i, url in enumerate(self.queue_urls) if url in self.queue_selected]
 
     def _queue_select_all(self) -> str:
-        self.queue_selected = set(self.queue_urls)
+        """Ctrl+A: every row, or while searching every row shown."""
+        self.queue_selected = {u for u in self.queue_urls if self._is_shown(u)}
         self._paint_queue_rows()
         return "break"
 
     def _queue_select_none(self) -> str:
+        """Esc: select nothing; with nothing selected, clear the search."""
+        if not self.queue_selected and self._queue_shown is not None:
+            self._clear_queue_search()
+            return "break"
         self.queue_active = None
         self._paint_queue_rows()
         return "break"
+
+    # ---- searching the list ---------------------------------------------------
+
+    def _is_shown(self, url: str) -> bool:
+        return self._queue_shown is None or url in self._queue_shown
+
+    def _shown_indexes(self) -> list[int]:
+        """The rows the search shows (every row without one), top to bottom."""
+        return [i for i, u in enumerate(self.queue_urls) if self._is_shown(u)]
+
+    def _queue_row_text(self, url: str) -> str:
+        """What the search looks in for a link: the link, its channel's name
+        and @handle when the channel pictures know them, and how its last
+        run ended."""
+        parts = [url]
+        channel = self._avatar_channel(url)
+        if channel:
+            with self._avatar_lock:
+                info = dict(self._avatar_index["channels"].get(channel) or {})
+            parts += [str(info.get("name") or ""), str(info.get("handle") or "")]
+        status = "running" if url == self._running_url else (self.queue_results.get(url) or {}).get("status")
+        if status in self.RESULT_MARKS:
+            parts.append(self.RESULT_MARKS[status][2].split(":")[0].split(";")[0])
+        if self._skipped_items(url):
+            parts.append("skipped")
+        return " ".join(parts).casefold()
+
+    def _queue_search_later(self) -> None:
+        """The search box changed: filter once typing pauses."""
+        if self._queue_search_after is not None:
+            self.root.after_cancel(self._queue_search_after)
+        self._queue_search_after = self.root.after(150, self._apply_queue_filter)
+
+    def _apply_queue_filter(self, scroll: bool = True) -> None:
+        """Show the rows that have every word of the search (all of them
+        without one). Selected rows the search hides are no longer selected,
+        so Delete or Ctrl+C never acts on rows out of sight."""
+        if self._queue_search_after is not None:
+            # Setting the box in code (a search cleared) schedules one too.
+            self.root.after_cancel(self._queue_search_after)
+        self._queue_search_after = None
+        words = self.queue_search_var.get().casefold().split()
+        if words:
+            self._queue_shown = {u for u in self.queue_urls
+                                 if all(w in self._queue_row_text(u) for w in words)}
+            self.queue_selected &= self._queue_shown
+        else:
+            self._queue_shown = None
+        self._repack_queue_rows()
+        self._paint_queue_rows()
+        self._update_list_header()
+        if scroll:
+            self.queue_canvas.yview_moveto(0)
+
+    def _repack_queue_rows(self) -> None:
+        """Lay out the rows in order, leaving out those the search hides."""
+        if self._queue_nomatch is not None and self._queue_nomatch.winfo_exists():
+            self._queue_nomatch.destroy()
+        self._queue_nomatch = None
+        for row in self.queue_rows:
+            row["frame"].pack_forget()
+        shown = [row for row in self.queue_rows if self._is_shown(row["url"])]
+        for row in shown:
+            row["frame"].pack(fill="x")
+        if not shown and self.queue_rows:
+            self._queue_nomatch = tk.Label(
+                self.queue_rows_frame, bg=self.QROW_BG, fg=self.QMUTED_FG, anchor="w",
+                justify="left", wraplength=420,
+                text=f"No link in the list matches \u201c{self.queue_search_var.get().strip()}\u201d. "
+                     f"Esc clears the search.")
+            self._queue_nomatch.pack(fill="x", padx=8, pady=8)
+
+    def _clear_queue_search(self, focus_list: bool = False) -> str:
+        if self.queue_search_var.get():
+            self.queue_search_var.set("")
+            self._apply_queue_filter(scroll=False)
+            if self.queue_active is not None:
+                self._scroll_to_row(self.queue_active)
+        if focus_list:
+            self.queue_canvas.focus_set()
+        return "break"
+
+    def _focus_queue_search(self) -> str:
+        """Ctrl+F in the list: to its search box, its text selected to type over."""
+        self._update_list_header()
+        self.queue_search_entry.focus_set()
+        self.queue_search_entry.select_range(0, "end")
+        self.queue_search_entry.icursor("end")
+        return "break"
+
+    def _queue_search_to_rows(self) -> str:
+        """Down or Enter in the search box: to the rows, the first one shown
+        selected (unless a shown row already is)."""
+        if self._queue_search_after is not None:
+            self.root.after_cancel(self._queue_search_after)
+            self._apply_queue_filter()
+        shown = self._shown_indexes()
+        self.queue_canvas.focus_set()
+        if shown and not self.queue_selected:
+            self.queue_active = shown[0]
+            self._paint_queue_rows()
+            self._scroll_to_row(shown[0])
+        return "break"
+
+    # ---- the list's keyboard ---------------------------------------------------
+
+    def _queue_page_rows(self) -> int:
+        """How many rows fit in the list's view, for Page Up and Page Down."""
+        shown = [row for row in self.queue_rows if self._is_shown(row["url"])]
+        if not shown:
+            return 1
+        # A row never laid out (hidden by the search since it was built)
+        # reports a height of 1; what it asks for is right either way.
+        frame = shown[0]["frame"]
+        height = max(1, frame.winfo_height(), frame.winfo_reqheight())
+        return max(1, self.queue_canvas.winfo_height() // height - 1)
+
+    def _queue_key_move(self, step: int | str, event: tk.Event) -> str:
+        """Up, Down, Home, End, Page Up and Page Down: select the row there
+        (of those shown). With Shift, every row from the one clicked last."""
+        shown = self._shown_indexes()
+        if not shown:
+            return "break"
+        if step in ("page-up", "page-down"):
+            step = self._queue_page_rows() * (-1 if step == "page-up" else 1)
+        cursor = self._queue_cursor if self._queue_cursor in self.queue_selected else None
+        if cursor is None or not self._is_shown(cursor) or cursor not in self.queue_urls:
+            # Nothing selected yet: End goes to the last row, the rest to the first.
+            target = shown[-1] if step >= 10 ** 6 else shown[0]
+        else:
+            pos = shown.index(self.queue_urls.index(cursor))
+            target = shown[max(0, min(len(shown) - 1, pos + step))]
+        anchor = self._queue_anchor
+        if getattr(event, "state", 0) & 0x1 and anchor in self.queue_urls and self._is_shown(anchor):
+            a, b = sorted((self.queue_urls.index(anchor), target))
+            self.queue_selected = {self.queue_urls[i] for i in shown if a <= i <= b}
+            self._queue_cursor = self.queue_urls[target]
+        else:
+            self.queue_active = target
+        self._paint_queue_rows()
+        self._scroll_to_row(target)
+        return "break"
+
+    def _queue_selected_urls(self) -> list[str]:
+        """The selected links, top to bottom; with none selected, says how to."""
+        urls = [u for u in self.queue_urls if u in self.queue_selected]
+        if not urls:
+            self.status_var.set("Select a row first: click it, or use the arrow keys.")
+        return urls
+
+    def _queue_copy_selected(self) -> None:
+        """Ctrl+C: the selected links, one per line."""
+        urls = self._queue_selected_urls()
+        if urls:
+            self._copy_text("\n".join(urls))
+            self.status_var.set(f"Copied {len(urls)} link{'' if len(urls) == 1 else 's'}.")
+
+    def _queue_copy_with_videos(self, urls: list[str] | None = None) -> None:
+        """Right-click's Copy link and its videos, and Ctrl+Shift+C: each
+        link (the selected ones by default) followed by its videos, as its
+        last listing found them (_videos_text). Links with no listing kept
+        are listed first, in the background, as Count again does; the copy
+        follows once they have been."""
+        urls = [u for u in (urls if urls is not None else self._queue_selected_urls())
+                if u in self.queue_urls]
+        if not urls:
+            return
+        missing = [u for u in urls if load_listing(u) is None]
+        if not missing:
+            self._copy_videos_job = None
+            self._copy_videos_now(urls)
+            return
+        # Ahead of the daily counts. The running link is not counted: its
+        # run lists it, and keeps that listing (_run_pipeline).
+        self._request_counts([u for u in missing if u != self._running_url], force=True,
+                             pictures=False, first=True)
+        job = self._copy_videos_job = object()
+        before = self._clipboard_text()
+        many = len(missing)
+        self.status_var.set(f"Listing the videos of {many} link{'' if many == 1 else 's'} to copy "
+                            f"them; a large channel takes a minute or so...")
+
+        def listing_due(u: str) -> bool:
+            if u in self._count_pending:
+                return True
+            return u == self._running_url and self._stage == "listing" and load_listing(u) is None
+
+        def wait() -> None:
+            if self._copy_videos_job is not job or self._closing:
+                return          # a newer copy, another copy, or quitting
+            if any(listing_due(u) for u in missing):
+                self.root.after(500, wait)
+                return
+            self._copy_videos_job = None
+            if self._clipboard_text() != before:
+                # Something else was copied meanwhile, here or in another
+                # program: not to be overwritten minutes later.
+                self.status_var.set(f"The videos of {'the link' if len(urls) == 1 else 'the links'} "
+                                    f"are listed now; Copy link and its videos copies them at once.")
+                return
+            self._copy_videos_now(urls)
+        self.root.after(500, wait)
+
+    def _clipboard_text(self) -> object:
+        """Something that changes whenever the clipboard does: Windows' count
+        of its changes, which also sees a picture or files copied, else its
+        text."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                return ("seq", ctypes.windll.user32.GetClipboardSequenceNumber())
+            except (AttributeError, OSError):
+                pass
+        try:
+            return self.root.clipboard_get()
+        except tk.TclError:
+            return None
+
+    def _copy_videos_now(self, urls: list[str]) -> None:
+        text, videos, unlisted, partly = self._videos_text(urls)
+        self._copy_text(text)
+        n = len(urls)
+        said = (f"Copied {'the link' if n == 1 else f'{n} links'} and "
+                f"{'its' if n == 1 else 'their'} {videos:,} {'video' if videos == 1 else 'videos'}")
+        if unlisted:
+            said += (f"; {'it' if n == 1 else f'{len(unlisted)} of them'} could not be listed, "
+                     f"so {'it has' if n == 1 else 'those have'} none")
+            for url in unlisted:
+                self._log(f"[!] Could not list the videos of {url} to copy them.", tag="warning")
+        for url, kept, total in partly:
+            said += (f"; only {kept:,} of the {total:,} skipped of "
+                     f"{'it' if n == 1 else url} are marked")
+            self._log(f"[!] Only {kept:,} of the {total:,} videos its last run skipped are marked "
+                      f"in the copy of {url}: the list of the rest is gone from listings\\. Its "
+                      f"next run marks them all again.", tag="warning")
+        self.status_var.set(said + ".")
+
+    def _videos_text(self, urls: list[str]) -> tuple[str, int, list[str], list[tuple]]:
+        """The text Copy link and its videos copies: each link on a line of
+        its own, then a line per video, its title, a tab and its link (a tab
+        and why, too, when the link's last run skipped it; an empty title
+        when the site gave none), and a blank line between links. Also how
+        many videos, the links with no listing, and (link, marked, skipped)
+        for those whose skipped past the SKIPPED_KEPT are gone."""
+        lines: list[str] = []
+        videos = 0
+        unlisted: list[str] = []
+        partly: list[tuple] = []
+        for url in urls:
+            if lines:
+                lines.append("")
+            lines.append(url)
+            listing = load_listing(url)
+            if listing is None:
+                unlisted.append(url)
+                continue
+            items, total, when = self._skipped_info(url)
+            why = load_skipped_links(url, when) if total > len(items) else None
+            if not why:
+                if total > len(items):
+                    partly.append((url, len(items), total))
+                why = {link_key(i["link"]): i["why"] for i in items if i.get("link")}
+            for title, link in listing["entries"]:
+                # Without a title the line starts with its tab, so the link
+                # stays in the second column.
+                line = f"{title}\t{link}" if link else title
+                reason = why.get(link_key(link)) if link else None
+                if reason:
+                    line += f"\tskipped: {reason}"
+                lines.append(line)
+                videos += 1
+        return "\n".join(lines) + "\n", videos, unlisted, partly
+
+    def _queue_paste(self) -> None:
+        """Ctrl+V in the list: add the links on the clipboard, as Add does."""
+        if not self._queue_editable:
+            self.status_var.set("Links can be added once the job has finished.")
+            return
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if not text.strip():
+            self.status_var.set("There is no link on the clipboard to add.")
+            return
+        if len(text) > 10 * self.LINK_BOX_MAX:
+            self._link_box_too_long()
+            return
+        self._add_to_queue(text)
+
+    def _queue_toggle_ticks(self) -> None:
+        """Space: tick the selected rows, or untick them when all are ticked."""
+        urls = set(self._queue_selected_urls())
+        if not urls:
+            return
+        checks = [v for u, v in zip(self.queue_urls, self.queue_checks) if u in urls]
+        value = not all(v.get() for v in checks)
+        for var in checks:
+            var.set(value)
+
+    def _queue_open_selected(self) -> None:
+        """Enter: open the selected links in the browser, up to five at once."""
+        urls = self._queue_selected_urls()
+        if len(urls) > 5:
+            self.status_var.set(f"{len(urls)} rows are selected; Enter opens up to 5 at once.")
+            return
+        for url in urls:
+            self._open_link(url)
+
+    def _queue_recount_selected(self) -> None:
+        """F5: count the selected links again."""
+        urls = self._queue_selected_urls()
+        if urls:
+            self._request_counts(urls, force=True)
+            self.status_var.set(f"Counting {len(urls)} link{'' if len(urls) == 1 else 's'} again.")
+
+    def _queue_menu_from_keys(self) -> None:
+        """Shift+F10 or the menu key: the right-click menu of the row the
+        keys are on, below it."""
+        url = self._queue_cursor if self._queue_cursor in self.queue_selected else None
+        urls = [url] if url else self._queue_selected_urls()
+        if not urls or urls[0] not in self.queue_urls:
+            return
+        row = self.queue_rows[self.queue_urls.index(urls[0])]
+        self._scroll_to_row(self.queue_urls.index(urls[0]))
+        # The canvas moves its rows at idle: until then they report where
+        # they were before the scroll.
+        self.queue_canvas.update_idletasks()
+        frame = row["frame"]
+        top = self.queue_canvas.winfo_rooty()
+        y = frame.winfo_rooty() + frame.winfo_height()
+        y = max(top, min(y, top + self.queue_canvas.winfo_height()))
+        spot = type("Spot", (), {"x_root": frame.winfo_rootx() + 40, "y_root": y})()
+        self._queue_menu(spot, row)
+
+    def _queue_shift_rows(self, step: int) -> None:
+        """Ctrl+Up / Ctrl+Down: move the selected rows one place; Ctrl+Home /
+        Ctrl+End: to the top or the bottom."""
+        urls = self._queue_selected_urls()
+        if not urls:
+            return
+        if not self._queue_editable:
+            self.status_var.set("The list can be changed once the job has finished.")
+            return
+        to_end = abs(step) > 1
+        if self._queue_shown is not None and not to_end:
+            # One place up or down may be past rows the search hides.
+            self.status_var.set("Clear the search to move rows one place at a time.")
+            return
+        before = list(self.queue_urls)
+        n = len(urls)
+        if to_end:
+            moved = self._queue_place(urls, 0 if step < 0 else len(self.queue_urls) - n)
+            said = f"Moved {'the row' if n == 1 else f'{n} rows'} to the {'top' if step < 0 else 'bottom'}."
+        else:
+            # Each selected row one place, past the row next to it; one at
+            # the end, or behind another selected that cannot move, stays.
+            order = list(self.queue_urls)
+            chosen = set(urls)
+            span = range(1, len(order)) if step < 0 else range(len(order) - 2, -1, -1)
+            for i in span:
+                j = i + step
+                if order[i] in chosen and order[j] not in chosen:
+                    order[i], order[j] = order[j], order[i]
+            moved = self._queue_place(order, 0)
+            said = f"Moved {'the row' if n == 1 else f'{n} rows'} {'up' if step < 0 else 'down'}."
+        if moved:
+            self._schedule_save()
+            # One Undo for a run of presses: it puts back the order before
+            # the first of them.
+            if not (self._undo and self._undo[-1] is self._key_move_undo):
+                self._key_move_undo = {"order": before}
+                self._offer_undo(self._key_move_undo, said)
+            else:
+                self.status_var.set(said)
+        self._scroll_to_row(self.queue_urls.index(urls[0] if step < 0 else urls[-1]))
 
     def _queue_click(self, row: dict, shift: bool, ctrl: bool) -> None:
         """A click on a row that did not drag it: Ctrl toggles the row in the
@@ -3840,11 +4681,12 @@ class FingerprinterApp:
         anchor = self._queue_anchor if self._queue_anchor in self.queue_urls else None
         if shift and anchor is not None:
             a, b = sorted((self.queue_urls.index(anchor), self.queue_urls.index(url)))
-            span = set(self.queue_urls[a:b + 1])
+            span = {u for u in self.queue_urls[a:b + 1] if self._is_shown(u)}
             self.queue_selected = (self.queue_selected | span) if ctrl else span
+            self._queue_cursor = url
         elif ctrl or shift:
             self.queue_selected ^= {url}
-            self._queue_anchor = url
+            self._queue_anchor = self._queue_cursor = url
         elif self.queue_selected == {url}:
             self.queue_active = None
         else:
@@ -3865,6 +4707,12 @@ class FingerprinterApp:
             return
         if not drag["moved"]:
             if abs(event.y_root - drag["y"]) < 5:
+                return
+            if self._queue_shown is not None:
+                # Between rows the search hides, where a row lands is a guess.
+                if not drag.get("told"):
+                    drag["told"] = True
+                    self.status_var.set("Clear the search to drag rows.")
                 return
             drag["moved"] = True
             # A row of several selected takes the others along, gathered
@@ -3902,10 +4750,7 @@ class FingerprinterApp:
         self.queue_urls[:] = order
         self.queue_checks[:] = [rows[u][0] for u in order]
         self.queue_rows[:] = [rows[u][1] for u in order]
-        for row in self.queue_rows:
-            row["frame"].pack_forget()
-        for row in self.queue_rows:
-            row["frame"].pack(fill="x")
+        self._repack_queue_rows()
         self._paint_queue_rows()
         self.queue_rows_frame.update_idletasks()
         return True
@@ -3915,7 +4760,11 @@ class FingerprinterApp:
         if drag is None or drag["row"] not in self.queue_rows:
             return
         if drag["moved"]:
+            self._key_move_undo = None
             save_config(self._gather_config())
+        elif drag.get("told"):
+            # A drag refused while searching is not a click either.
+            return
         elif drag["shift"] or drag["ctrl"]:
             self._queue_click(drag["row"], drag["shift"], drag["ctrl"])
         elif drag["kind"] == "link":
@@ -3934,8 +4783,12 @@ class FingerprinterApp:
         many = [u for u in self.queue_urls if u in self.queue_selected]
         if len(many) > 1:
             n = len(many)
-            menu.add_command(label=f"Copy {n} links", command=lambda: self._copy_text("\n".join(many)))
-            menu.add_command(label="Count them again", command=lambda: self._request_counts(many, force=True))
+            menu.add_command(label=f"Copy {n} links", accelerator="Ctrl+C",
+                             command=lambda: self._copy_text("\n".join(many)))
+            menu.add_command(label=f"Copy {n} links and their videos", accelerator="Ctrl+Shift+C",
+                             command=lambda: self._queue_copy_with_videos(many))
+            menu.add_command(label="Count them again", accelerator="F5",
+                             command=lambda: self._request_counts(many, force=True))
             menu.add_separator()
             menu.add_command(label="Tick them", state=editable,
                              command=lambda: self._queue_tick_selected(True))
@@ -3943,16 +4796,23 @@ class FingerprinterApp:
                              command=lambda: self._queue_tick_selected(False))
             menu.add_separator()
         else:
-            menu.add_command(label="Open link", command=lambda: self._open_link(url))
-            menu.add_command(label="Copy link", command=lambda: self._copy_text(url))
-            menu.add_command(label="Count again", command=lambda: self._request_counts([url], force=True))
+            menu.add_command(label="Open link", accelerator="Enter", command=lambda: self._open_link(url))
+            menu.add_command(label="Copy link", accelerator="Ctrl+C", command=lambda: self._copy_text(url))
+            menu.add_command(label="Copy link and its videos", accelerator="Ctrl+Shift+C",
+                             command=lambda: self._queue_copy_with_videos([url]))
+            menu.add_command(label="Count again", accelerator="F5",
+                             command=lambda: self._request_counts([url], force=True))
+            skipped = self._skipped_info(url)[1]
+            if skipped:
+                menu.add_command(label=f"Show what was skipped ({skipped:,})...",
+                                 command=lambda: self._show_skipped(url))
             menu.add_separator()
-        menu.add_command(label="Move to top", state=editable,
+        menu.add_command(label="Move to top", state=editable, accelerator="Ctrl+Home",
                          command=lambda: self._queue_move_row(row, 0))
-        menu.add_command(label="Move to bottom", state=editable,
+        menu.add_command(label="Move to bottom", state=editable, accelerator="Ctrl+End",
                          command=lambda: self._queue_move_row(row, len(self.queue_rows) - 1))
         menu.add_command(label=f"Remove {len(many)} links from the list" if len(many) > 1
-                         else "Remove from the list", state=editable,
+                         else "Remove from the list", state=editable, accelerator="Del",
                          command=self._queue_remove_selected)
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -3976,6 +4836,9 @@ class FingerprinterApp:
         webbrowser.open(url if "://" in url else f"https://{url}")
 
     def _copy_text(self, text: str) -> None:
+        # A copy of a link and its videos still waiting for its listing would
+        # overwrite this when that comes (_queue_copy_with_videos).
+        self._copy_videos_job = None
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
 
@@ -4129,11 +4992,14 @@ class FingerprinterApp:
             if not self._undo:
                 self._hide_undo()
             return "break"
-        present = {link_key(u) for u in self.queue_urls}
-        back = 0
+        present = {self._entry_key(u) for u in self.queue_urls}
+        back = full = 0
         # In ascending order of place, so each goes back to where it was.
         for i, url, ticked, count, result in removed:
-            if link_key(url) in present:
+            if self._entry_key(url) in present:
+                continue
+            if len(self.queue_urls) >= QUEUE_MAX:
+                full += 1
                 continue
             i = min(i, len(self.queue_urls))
             self.queue_urls.insert(i, url)
@@ -4142,13 +5008,14 @@ class FingerprinterApp:
                 self.queue_counts[url] = count
             if result:
                 self.queue_results[url] = result
-            present.add(link_key(url))
             back += 1
         self.queue_active = None
         self._refresh_queue()
         save_config(self._gather_config())
-        self.status_var.set(f"Put {back} link{'' if back == 1 else 's'} back in the list."
-                            if back else "Those links are in the list again already.")
+        self.status_var.set((f"Put {back} link{'' if back == 1 else 's'} back in the list."
+                             if back else "Those links are in the list again already.")
+                            + (f" {full:,} did not fit: the list holds at most {QUEUE_MAX:,} links."
+                               if full else ""))
         if not self._undo:
             self._hide_undo()
         return "break"
@@ -4241,22 +5108,45 @@ class FingerprinterApp:
             if row["url"] == url:
                 row["count"].config(text=self._count_text(url))
 
-    def _request_counts(self, urls: list[str] | None = None, force: bool = False) -> None:
+    def _request_counts(self, urls: list[str] | None = None, force: bool = False,
+                        pictures: bool = True, first: bool = False) -> None:
         """Queue links to be counted: all of them by default, skipping any
-        counted today unless `force`."""
+        counted today unless `force`. `pictures`: their channel pictures too.
+        `first`: ahead of those waiting (Copy link and its videos)."""
         today = time.strftime("%Y-%m-%d")
+        ahead: list[tuple[str, bool]] = []
         for url in list(self.queue_urls) if urls is None else urls:
             saved = self.queue_counts.get(url)
-            if url in self._count_pending or (not force and saved and saved.get("date") == today):
+            if url in self._count_pending:
+                if first:
+                    ahead.append((url, False))
+                continue
+            if not force and saved and saved.get("date") == today:
                 continue
             self._count_pending.add(url)
-            self._count_queue.put(url)
+            if first:
+                ahead.append((url, True))
+            else:
+                self._count_queue.put(url)
+        # In reverse, so the first of them ends up first.
+        q = self._count_queue
+        for url, new in reversed(ahead):
+            with q.mutex:
+                if url in q.queue:
+                    q.queue.remove(url)
+                elif not new:
+                    continue                # being counted already
+                else:
+                    q.unfinished_tasks += 1
+                q.queue.appendleft(url)
+                q.not_empty.notify()
         while len(self._count_threads) < self.COUNT_WORKERS:
             t = threading.Thread(target=self._count_worker, daemon=True)
             self._count_threads.append(t)
             t.start()
         # Their channel pictures too, while they are being looked at.
-        self._request_avatars(urls, force)
+        if pictures:
+            self._request_avatars(urls, force)
 
     def _count_worker(self) -> None:
         while not self._closing:
@@ -4276,10 +5166,11 @@ class FingerprinterApp:
         state = {"status": "counting", "n": 0}
         self._count_state[url] = state
         self.root.after(0, self._update_count_label, url)
-        # JSON (j), so a line break in a playlist's title cannot count as an
-        # entry of its own; a missing title still prints as NA.
+        # One JSON object per entry, so a line break in a title cannot count
+        # as an entry of its own. Its title and link are kept for Copy link
+        # and its videos (save_listing); a field yt-dlp has not got is left out.
         cmd = [*self.ytdlp, *YTDLP_UTF8, "--js-runtimes", "node", "--flat-playlist", "--no-warnings",
-               "--print", "%(playlist_title)j", *self._extra_args(), url]
+               "--print", "%(.{playlist_title,title,id,url,webpage_url})j", *self._extra_args(), url]
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
@@ -4294,11 +5185,18 @@ class FingerprinterApp:
             return
         first = None
         last = 0.0
+        entries: list[dict] = []
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    entry = None
+                entry = entry if isinstance(entry, dict) else {}
                 if first is None:
-                    first = line.strip()
+                    first = entry
+                entries.append(entry)
                 state["n"] += 1
                 if time.monotonic() - last >= 0.5:
                     last = time.monotonic()
@@ -4316,8 +5214,11 @@ class FingerprinterApp:
             state["status"] = "failed"
             self.root.after(0, self._update_count_label, url)
         else:
-            # A single video has no playlist, which yt-dlp prints as NA.
-            single = state["n"] == 1 and first in ("NA", "", "null", '""')
+            # A single video has no playlist, which yt-dlp leaves out.
+            single = state["n"] == 1 and not (first or {}).get("playlist_title")
+            # Before the count is recorded, so a copy waiting for it
+            # (_queue_copy_with_videos) finds the listing there.
+            save_listing(url, entries, single)
             self.root.after(0, self._record_count, url, state["n"], single)
 
     def _record_count(self, url: str, n: int, single: bool) -> None:
@@ -4378,6 +5279,26 @@ class FingerprinterApp:
         """The channel a link is known to be from ("" if not known)."""
         with self._avatar_lock:
             return str((self._avatar_index["links"].get(link_key(url)) or {}).get("channel") or "")
+
+    def _entry_key(self, url: str) -> str:
+        """list_key, and two links to the same YouTube channel (and tab) are
+        one entry however they name it: a channel/UC... link by the ID in
+        it, an @handle (or /c/, /user/) link once the channel pictures have
+        found whose channel it is."""
+        key = list_key(url)
+        m = re.match(r"^youtube\.com/(?:@[^/?#]+|channel/UC[\w-]+|c/[^/?#]+|user/[^/?#]+)", key)
+        if not m or youtube_kind(url) != "channel":
+            return key
+        with self._avatar_lock:
+            links = self._avatar_index["links"]
+            # Any spelling of this entry looked up already: as written, the
+            # bare channel, or its Videos tab.
+            channel = next((str(links[k]["channel"]) for k in
+                            (link_key(url), m.group(0), m.group(0) + "/videos")
+                            if isinstance(links.get(k), dict) and links[k].get("channel")), "")
+            channel = channel or self._known_channel("https://www." + m.group(0),
+                                                     self._avatar_index["channels"])
+        return f"youtube channel {channel}{key[m.end():]}" if channel else key
 
     @staticmethod
     def _days_since(day: object) -> int:
@@ -4736,7 +5657,7 @@ class FingerprinterApp:
         self._avatar_images.pop(channel, None)
         for row in self.queue_rows:
             if self._avatar_channel(row["url"]) == channel:
-                row["avatar"].config(image=self._avatar_image_for(row["url"]))
+                self._set_row_mark(row)
 
     def _show_avatars_changed(self) -> None:
         """The setting was switched: show or hide the pictures, and fetch the
@@ -4762,19 +5683,23 @@ class FingerprinterApp:
     _LINK_SPLIT_RE = re.compile(
         r"\s+|[,;](?=\s*(?:https?://|@|UC[A-Za-z0-9_-]{22}|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}[/?#]))")
 
-    def _add_to_queue(self) -> None:
-        """Add what is in the link box: one link, or several pasted at once
-        (one per line, or separated by spaces, commas or semicolons), in any
-        form Import takes: links, links without https://, @handles and
-        channel IDs. A link already in the list, however it is written, is
-        not added again: its row is shown instead."""
-        text = self.url_var.get().strip()
-        if not text:
+    def _add_to_queue(self, text: str | None = None) -> None:
+        """Add what is in the link box, or `text` (Ctrl+V in the list): one
+        link, or several pasted at once (one per line, or separated by
+        spaces, commas or semicolons), in any form Import takes: links, links
+        without https://, @handles and channel IDs. A link already in the
+        list, however it is written, is not added again: its row is shown
+        instead."""
+        from_box = text is None
+        text = (self.url_var.get() if from_box else text).strip()
+        if not text or not self._queue_editable:
             return
         added: list[str] = []
         invalid: list[str] = []
         dupes: list[int] = []            # rows of links already in the list
-        keys = {link_key(u): i for i, u in enumerate(self.queue_urls)}
+        dupe_of: dict[int, str] = {}     # row -> the link given for it
+        full: list[str] = []             # not added: the list holds QUEUE_MAX
+        keys = {self._entry_key(u): i for i, u in enumerate(self.queue_urls)}
         handles = {youtube_handle(u): i for i, u in enumerate(self.queue_urls)}
         same_channel: list[tuple[str, int]] = []
         for token in self._LINK_SPLIT_RE.split(text):
@@ -4784,9 +5709,13 @@ class FingerprinterApp:
             if url is None:
                 invalid.append(token)
                 continue
-            key = link_key(url)
+            key = self._entry_key(url)
             if key in keys:
                 dupes.append(keys[key])
+                dupe_of[keys[key]] = url
+                continue
+            if len(self.queue_urls) >= QUEUE_MAX:
+                full.append(token)
                 continue
             handle = youtube_handle(url)
             if handle and handles.get(handle) is not None:
@@ -4798,15 +5727,26 @@ class FingerprinterApp:
             self.queue_results.pop(url, None)
             added.append(url)
 
+        if not added and not dupes and full:
+            MessageBox.showinfo(
+                "The list is full",
+                f"The list holds at most {QUEUE_MAX:,} links. Remove some, for example "
+                "those already fingerprinted, to add more.",
+                parent=self.root,
+            )
+            return
         if not added and not dupes:
             MessageBox.showerror(
                 "Invalid link",
-                "That doesn't look like a link.\n\n"
-                "Paste a link starting with https://, or a YouTube @handle. Several at "
+                ("That doesn't look like a link.\n\n" if from_box else
+                 "What is on the clipboard doesn't look like a link.\n\n")
+                + "Paste a link starting with https://, or a YouTube @handle. Several at "
                 "once work too, one per line.",
                 parent=self.root,
             )
             return
+        # A search would hide the new rows, or the row of the one already there.
+        self._clear_queue_search()
         if added:
             self._refresh_queue(active_index=len(self.queue_urls) - 1)
             self._request_counts(added)
@@ -4822,8 +5762,10 @@ class FingerprinterApp:
             self.queue_active = dupes[-1]
             self._paint_queue_rows()
             self._scroll_to_row(dupes[-1])
-        # What could not be read stays in the box, to correct.
-        self.url_var.set(" ".join(invalid))
+        # What could not be read stays in the box, to correct, and what did
+        # not fit, to add once there is room.
+        if from_box:
+            self.url_var.set(" ".join(invalid + full))
 
         said = []
         if added:
@@ -4834,14 +5776,77 @@ class FingerprinterApp:
                         + f" (row {rows})")
         if invalid:
             said.append(f"not a link: {', '.join(invalid)[:80]}")
+        if full:
+            said.append(f"{len(full):,} not added, as the list holds at most {QUEUE_MAX:,} links")
+            self._log(f"[!] The list is full ({QUEUE_MAX:,} links): {len(full):,} "
+                      f"link{'' if len(full) == 1 else 's'} not added"
+                      f"{', left in the link box' if from_box else ''}.", tag="warning")
         self.status_var.set("; ".join(said) + ".")
         for i in sorted(set(dupes)):
-            self._log(f"[!] Already in the list, row {i + 1}: {self.queue_urls[i]}")
+            self._log(f"[!] Already in the list, row {i + 1}: {self.queue_urls[i]}"
+                      + self._tab_note(self.queue_urls[i], dupe_of.get(i, "")))
         for url, i in same_channel:
             self._log(f"[!] {url} is the same YouTube channel as row {i + 1} "
                       f"({self.queue_urls[i]}); both are run.", tag="warning")
         for token in invalid:
-            self._log(f"[!] Not a link, left in the link box: {token}", tag="warning")
+            self._log(f"[!] Not a link{', left in the link box' if from_box else ''}: {token}",
+                      tag="warning")
+
+    @staticmethod
+    def _tab_note(there: str, given: str) -> str:
+        """What sets a channel's row apart from its Videos tab given (or the
+        other way round), which count as one entry (list_key) but do not run
+        the same: the bare channel runs its Shorts and Live too."""
+        if youtube_kind(there) != "channel" or link_key(there) == link_key(given):
+            return ""
+        if link_key(there).endswith("/videos") and not link_key(given).endswith("/videos"):
+            return (f". That row runs only the channel's Videos tab; for its Shorts and Live "
+                    f"too, remove it and add {given} again.")
+        if link_key(given).endswith("/videos") and not link_key(there).endswith("/videos"):
+            return ". That row runs the whole channel, its Videos tab with the rest."
+        return ""
+
+    def _note_left_out(self) -> None:
+        """At start: a saved list of more than QUEUE_MAX links keeps its
+        first ones; the rest go to LEFT_OUT_FILE, to Import later."""
+        left = self._queue_left_out
+        if not left:
+            return
+        many = len(self.queue_urls) + len(left)
+        said = (f"[!] The saved list had {many:,} links, and the list holds at most {QUEUE_MAX:,} "
+                f"(more would crash the program). The first {QUEUE_MAX:,} are in the list; ")
+        path = save_left_out_links(left)
+        if path is None:
+            self._log(said + f"the other {len(left):,} could not be written to {LEFT_OUT_FILE}, so "
+                      f"they stay in config.json, and it is tried again at the next start.",
+                      tag="error")
+            return
+        # Saved without them with the next change: not now, before the window
+        # is laid out, as its size and the console's would be saved wrong.
+        self._queue_left_out = []
+        self._log(said + f"the other {len(left):,} are in {path}. Import it to add them once "
+                  f"there is room.", tag="warning")
+
+    def _note_duplicate_rows(self) -> None:
+        """At start: say which rows of a saved list are the same entry
+        (_entry_key), as a list saved by an older version can hold
+        youtube.com/@x and youtube.com/@x/videos both."""
+        rows: dict[str, list[int]] = {}
+        for i, url in enumerate(self.queue_urls):
+            rows.setdefault(self._entry_key(url), []).append(i + 1)
+        for same in rows.values():
+            if len(same) > 1:
+                where = ", ".join(map(str, same[:-1])) + f" and {same[-1]}"
+                # A channel's bare link runs its Shorts and Live as well as
+                # the Videos tab: the one to keep, when some row has it.
+                whole = [i for i in same if youtube_kind(self.queue_urls[i - 1]) == "channel"
+                         and not link_key(self.queue_urls[i - 1]).endswith("/videos")]
+                keep = (f"Keep row {whole[0]}, which runs the whole channel (its Shorts and Live "
+                        f"too), and remove the other{'' if len(same) == 2 else 's'}."
+                        if whole and len(whole) < len(same) else "Remove all but one of them.")
+                self._log(f"[!] Rows {where} of the list are the same link "
+                          f"({self.queue_urls[same[0] - 1]}); it runs once for each. {keep}",
+                          tag="warning")
 
     # Recognizes a bare YouTube channel ID, e.g. UCxN0K3hMnvgtsoz9NN0Iq_Q.
     _CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
@@ -4894,10 +5899,11 @@ class FingerprinterApp:
 
         added = 0
         dupes = 0
+        full = 0
         invalid: list[str] = []
         new_urls: list[str] = []
-        # Duplicates however they are written (link_key), in the list or the file.
-        keys = {link_key(u) for u in self.queue_urls}
+        # Duplicates however they are written (_entry_key), in the list or the file.
+        keys = {self._entry_key(u) for u in self.queue_urls}
 
         for lineno, raw_line in enumerate(raw.splitlines(), start=1):
             line = raw_line.strip().strip("\"'")
@@ -4910,10 +5916,14 @@ class FingerprinterApp:
                 if url is None:
                     invalid.append(f"line {lineno}: {token!r}")
                     continue
-                if link_key(url) in keys:
+                key = self._entry_key(url)
+                if key in keys:
                     dupes += 1
                     continue
-                keys.add(link_key(url))
+                if len(self.queue_urls) >= QUEUE_MAX:
+                    full += 1
+                    continue
+                keys.add(key)
                 self.queue_urls.append(url)
                 self.queue_checks.append(self._new_check())
                 self.queue_results.pop(url, None)
@@ -4921,6 +5931,7 @@ class FingerprinterApp:
                 added += 1
 
         if added:
+            self._clear_queue_search()
             self._refresh_queue(active_index=len(self.queue_urls) - 1)
             save_config(self._gather_config())
             self._request_counts(new_urls)
@@ -4935,7 +5946,11 @@ class FingerprinterApp:
             self._log(f"    not recognized - {entry}", tag="warning")
         if len(invalid) > 20:
             self._log(f"    ...and {len(invalid) - 20} more.", tag="warning")
-        if not added and not invalid and not dupes:
+        if full:
+            self._log(f"[!] {full:,} link(s) not imported: the list holds at most {QUEUE_MAX:,}. "
+                      f"Import the file again once there is room; the links already in the "
+                      f"list are passed over.", tag="warning")
+        if not added and not invalid and not dupes and not full:
             self._log("[!] File was empty; nothing imported.", tag="warning")
 
     def _queue_remove(self) -> None:
@@ -4985,6 +6000,7 @@ class FingerprinterApp:
             block = [url]
         others = len(self.queue_urls) - len(block)
         if self._queue_place(block, 0 if target <= 0 else min(target, others)):
+            self._key_move_undo = None
             save_config(self._gather_config())
 
     SORTS = (("most", "Most videos first"), ("fewest", "Fewest videos first"),
@@ -5178,6 +6194,7 @@ class FingerprinterApp:
         `resume`, this is that continuation: `urls` are the links left, and the
         one it stopped in starts over from scratch."""
         results: list[tuple[str, str]] = []  # (url, status)
+        skipped_links: list[tuple[str, list[dict], bool]] = []  # (url, items, taken off the list)
         state = resume or {"links": list(urls), "finished": {}}
         state = {"links": list(state["links"]), "finished": dict(state.get("finished", {})),
                  "current": state.get("current")}
@@ -5237,6 +6254,10 @@ class FingerprinterApp:
                     self._log(f"[X] Link failed with error: {e!r}")
                     status = "failed"
                 items, self._last_items = self._last_items, None
+                skipped, self._last_skipped = self._last_skipped, None
+                if skipped:
+                    removed = (status or "done") == "done" and self.remove_finished_var.get()
+                    skipped_links.append((url, skipped, removed))
                 results.append((url, status or "done"))
                 # A link Stop cut short stays "current": continuing starts it
                 # over. That includes one that failed because Stop killed its
@@ -5244,7 +6265,7 @@ class FingerprinterApp:
                 # as finished, like a skipped one.
                 cut_by_stop = self.cancel_flag.is_set() and status in ("cancelled", "failed")
                 self.root.after(0, self._set_link_result, url,
-                                "cancelled" if cut_by_stop else status or "done", items)
+                                "cancelled" if cut_by_stop else status or "done", items, skipped)
                 if not cut_by_stop:
                     state["finished"][url] = status or "done"
                     state["current"] = None
@@ -5270,6 +6291,19 @@ class FingerprinterApp:
             if any(s in ("failed", "skipped", "incomplete") for _, s in results):
                 self._log("    Tick unfinished, above the list, ticks just the links that did "
                           "not finish, to run them again.")
+            for u, items, removed in skipped_links:
+                n = len(items)
+                if not removed:
+                    self._log(f"    {n} item(s) of {u} were skipped: \"{n} skipped\" on its row "
+                              f"shows which, and why.")
+                    continue
+                # Its row is gone (Remove links from the list once
+                # fingerprinted), so they are said here.
+                self._log(f"    {n} item(s) of {u} were skipped (the link is off the list now):")
+                for item in self._skipped_ranked(items)[:20]:
+                    self._log(f"      {item['title']}: {item['why']}")
+                if n > 20:
+                    self._log(f"      ...and {n - 20} more.")
             self._log("=" * 60)
             self._set_status(f"List done: {done}/{total} completed.")
             self.root.after(0, self._notify_done)
@@ -6345,6 +7379,7 @@ class FingerprinterApp:
         link's leftover download folder still appears but auto-resolves via its
         2-minute timer."""
         qp = f"[{queue_position[0]}/{queue_position[1]}] " if queue_position else ""
+        self._skipped_now = None
 
         def stopped() -> str | None:
             """Return a status if we should bail, else None."""
@@ -6397,6 +7432,7 @@ class FingerprinterApp:
             # The listing just done is a fresh count for the list.
             if not cut_short:
                 self.root.after(0, self._record_count, url, len(entries), single)
+                save_listing(url, entries, single)
 
             self._log(f"[+] Source: {channel_name_raw}  ({len(entries)} item(s))")
             if (s := stopped()):
@@ -6404,6 +7440,7 @@ class FingerprinterApp:
             listed = len(entries)
             # Settings, Downloads: items outside the length limits, and items
             # fingerprinted in an earlier run, are left out here.
+            self._skipped_now = []
             entries = self._filter_entries(entries)
             if queue_mode:
                 # The row's counter: what was left out has nothing left to do;
@@ -6483,6 +7520,13 @@ class FingerprinterApp:
             self._set_status(f"{qp}Downloading 0/{len(entries)} ({workers} at once)...")
             ok, fail = self._download_parallel(entries, initial_folder, workers)
             self._log(f"[+] Downloads finished: {ok} OK, {fail} failed.")
+            # For the row: what failed, and what yt-dlp left out by length.
+            # Items Stop or Skip link kept from starting are neither.
+            for entry in entries:
+                if entry.get("_fail_why"):
+                    self._note_skipped(entry, entry["_fail_why"], "failed")
+                elif entry.get("_left_out"):
+                    self._note_skipped(entry, "outside the length limits (Settings, Downloads)", "length")
 
             if (s := stopped()):
                 return s
@@ -6544,6 +7588,12 @@ class FingerprinterApp:
                 # files that DID succeed are worth keeping and renaming below.
                 self._log("[!] Fingerprinting did not complete cleanly - see the failures above.")
             unreadable = list(self._fp_unreadable)
+            names = [os.path.basename(path) for path in unreadable]
+            for entry in self._downloaded_ok:
+                item_id = str(entry.get("id") or "")
+                if item_id and any(f"[{item_id}]" in n or (len(item_id) >= 8 and item_id in n)
+                                   for n in names):
+                    self._note_skipped(entry, "its audio could not be read for fingerprinting", "unreadable")
 
             # The counter: what downloaded is fingerprinted now, but for the
             # unreadable files; with batches failed it cannot say which items
@@ -6615,6 +7665,7 @@ class FingerprinterApp:
             prog, self._item_progress = self._item_progress, None
             if prog is not None:
                 self._last_items = [prog.get("final", prog["base"]), prog["total"], "final" in prog]
+            self._last_skipped, self._skipped_now = self._skipped_now, None
             # In queue mode the queue runner owns the button state; only reset
             # here for standalone (non-queue) runs.
             if not queue_mode:
@@ -7832,6 +8883,7 @@ class FingerprinterApp:
         self._fail_reasons = {}
         for entry in entries:
             entry.pop("_fail_reason", None)
+            entry.pop("_fail_why", None)
 
         # Number of visible slots = min(workers, total)
         slot_count = max(1, min(workers, total))
@@ -8102,10 +9154,13 @@ class FingerprinterApp:
             entry["_fail_reason"] = reason              # see RETRY_LATER
             errors = [ln for ln in err_lines if not ln.lower().startswith("warning")]
             if reason:
-                head = f"  ! Skipped '{title}': {reason}"
+                entry["_fail_why"] = reason
             elif errors or err_lines:
-                head = f"  ! Skipped '{title}': {self._ytdlp_message((errors or err_lines)[-1])}"
+                entry["_fail_why"] = self._ytdlp_message((errors or err_lines)[-1])
             else:
+                entry["_fail_why"] = f"yt-dlp exited with code {proc.returncode} and gave no reason"
+            head = f"  ! Skipped '{title}': {entry['_fail_why']}"
+            if not reason and not (errors or err_lines):
                 head = (f"  ! Skipped '{title}' (yt-dlp exited with code {proc.returncode} and "
                         f"gave no reason).")
             # yt-dlp's own words: the label above is only the kind of failure.

@@ -112,7 +112,22 @@ extra top-level folder, so check that the file is not one level too deep.
 
 A link already in the list is not added twice, however it is written: tracking
 parameters such as `?si=` from the YouTube app, `www.`, `m.` and a trailing `/`
-make no difference. The program shows the row it is in instead.
+make no difference, and a YouTube channel's Videos tab is the channel itself
+(`youtube.com/@name` and `www.youtube.com/@name/videos` are one link; its
+Shorts, Live or Home tab is a link of its own). A `channel/UC...` link and the
+`@name` of the same channel are one link too, once the channel pictures have
+found whose channel the `@name` is. The program shows the row it is in
+instead. The bare channel runs its Shorts and Live as well as its Videos, so
+when the row there is the Videos tab, the console says how to get the rest. A
+list saved by an earlier version that holds the same link twice is named in
+the console at start.
+
+The list holds at most 1,000 links: each row takes some of the windows Windows
+lets a program have, and more would crash it. Adding or importing past that
+says how many did not fit. A list saved by an earlier version with more keeps
+its first 1,000, and the rest are written to `links-left-out.txt` in the
+program folder, to **Import** once there is room (the links already in the
+list are passed over).
 
 The folders are already set: audio downloads to `downloads\` and
 finished fingerprints are kept in `pklz-files\`, both in the program folder.
@@ -123,8 +138,8 @@ The window has three panels, and the dividers between them can be dragged:
 
 - **Your list**, on the left. Drag a row by its `≡` handle to move it, click a
   link to open it in your browser, untick a row to skip it, and click **✕** to
-  remove it. Right-click a row to open or copy the link, count again, move it
-  to the top or bottom, or remove it. Each row shows how many videos the
+  remove it. Right-click a row to open or copy the link, copy the link and its
+  videos, count again, move it to the top or bottom, or remove it. Each row shows how many videos the
   channel or playlist has; the program counts them in the background when a
   link is added, and again once a day, five links at a time, and a large
   channel takes a minute or so. Once a link has run, its row shows how many of
@@ -141,6 +156,40 @@ The window has three panels, and the dividers between them can be dragged:
   the list clicked to select them all. Dragging one of them moves them all,
   and right-click works on all of them: copy, count again, tick, untick, move
   to the top or bottom, or remove. Delete removes them; Esc clears the selection.
+- **Keyboard:** with a row clicked, the list takes these keys:
+
+  | Key | Does |
+  | --- | --- |
+  | ↑ ↓, Page Up, Page Down, Home, End | Select the row there; with Shift (or Ctrl+Shift), every row from the one clicked last |
+  | Ctrl+C | Copy the selected links, one per line |
+  | Ctrl+Shift+C | Copy the selected links and their videos (see below) |
+  | Ctrl+V | Add the links on the clipboard, as **Add** does |
+  | Space | Tick the selected rows, or untick them if all are ticked |
+  | Enter | Open the selected links in your browser (up to five) |
+  | Delete | Remove the selected rows (Ctrl+Z puts them back) |
+  | Ctrl+↑ Ctrl+↓, Ctrl+Home, Ctrl+End | Move the selected rows up or down one, or to the top or bottom (Undo puts them back) |
+  | F5 | Count the selected links again |
+  | Ctrl+A, Esc | Select every row; select none |
+  | Ctrl+F | Search the list |
+  | Shift+F10 or the menu key | The right-click menu |
+- **Copy link and its videos** (right-click, or Ctrl+Shift+C) copies the link
+  and, below it, every video it holds, one per line: the title, a tab and the
+  video's link, so it pastes into a spreadsheet as two columns (sites that
+  list no titles, such as SoundCloud, leave the first empty). A video the
+  link's last run skipped has a third column saying why. With several rows
+  selected, each link is followed by its videos, with a blank line between
+  them. The videos are as the link's last count or run found them; a link not
+  listed yet (or since this version) is listed first, which takes a moment
+  for a large channel, and the status bar says when it is copied. If you copy
+  something else in the meantime, that is not overwritten: the status bar
+  says the videos are listed, and copying again copies them at once.
+- **Search**, above the list, shows only the links that have every word typed:
+  in the link, the channel's name or `@handle`, or how the last run ended
+  (`failed`, `incomplete`, `skipped`...). The search bar says how many are
+  shown. **Tick all** and Ctrl+A then work on the links shown. Dragging rows and
+  Ctrl+↑/↓ wait until the search is cleared (Esc, or **✕**), as rows hidden by
+  it would be in the way; Move to top or bottom (and Ctrl+Home/End) and **Sort**
+  still work, on the whole list. Adding a link clears the search.
 - **Sort ▾** puts the list in order once: most or fewest videos first (links
   not counted yet go last), or by the link, A to Z or Z to A (`https://` and
   `www.` don't count). Undo puts the old order back.
@@ -149,6 +198,16 @@ The window has three panels, and the dividers between them can be dragged:
   running it again fetches the rest), **!** failed, **»** skipped, **■**
   stopped. Hover over it for when. **Tick unfinished**, shown above the list
   while some link did not finish, ticks just those, to run them again.
+- **`3 skipped`**, beside the count, when the link's last run left videos
+  out: shorter or longer than the limits in Settings, failed to download, or
+  could not be read for fingerprinting. A run that ends before it has listed
+  the link keeps the ones before, and hovering says which run they are from.
+  Up to 500 are kept per link, those that failed first. Click it (or right-click the row,
+  **Show what was skipped**) for which ones and why, grouped by reason, each
+  with its link; **Copy the list** copies them as text. Videos fingerprinted in
+  an earlier run are done, not skipped, and are not in it. With **Remove links
+  from the list once fingerprinted** on, the row of a finished link is gone, so
+  the summary at the end of the list names its skipped videos instead.
 - **Undo**, in the status bar after links are removed (or Ctrl+Z), puts them
   back where they were. **Remove ticked** asks first when it would empty the
   list or take more than five links.
@@ -409,6 +468,7 @@ service, whose account has no browser profile.
   nothing of yours.
 - **Estimates are rough.** Size and time depend on bitrate, length and your
   connection.
+- **At most 1,000 links in the list.** For more, run them in batches.
 
 ## Files and folders
 
@@ -428,6 +488,8 @@ service, whose account has no browser profile.
 | `audio\` | The default place for kept downloads, when **Keep downloaded audio** is on, in a folder per channel. |
 | `work\` | The program's scratch space: file lists for audfprint and unfinished `.pklz` files. |
 | `avatars\` | The channel pictures shown in the list, and `index.json`, which link is whose channel. Safe to delete; they are fetched again. |
+| `listings\` | The videos of each link in the list, as its last count or run found them, for **Copy link and its videos**, and every video a link's run skipped when there were more than the 500 kept with the list. Those of links no longer in the list are deleted at start. Safe to delete: the videos are listed again, but until a link runs again, a copy marks only the 500 skipped videos kept with the list. |
+| `links-left-out.txt` | Only when a saved list had more than 1,000 links: the ones past the first 1,000, to **Import** once there is room. |
 | `config.json`, `recent_urls.json` | Your settings, list and recent links. |
 | `unfinished-list.json` | Where a list that stopped part-way got to, while it can be continued. |
 | `fingerprinted-items.txt` | Items already fingerprinted, when that setting is on. The format of yt-dlp's `--download-archive`. |

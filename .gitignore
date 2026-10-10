@@ -4,6 +4,7 @@ recent_urls.json
 fingerprinted-items.txt
 unfinished-list.json
 unfinished-list.tmp
+links-left-out.tmp
 # The shortcut setup makes; it holds this computer's paths.
 Fingerprinter.lnk
 *.txt
@@ -17,6 +18,7 @@ pklz-files/
 work/
 texts/
 avatars/
+listings/
 logs/
 console_logs/
 

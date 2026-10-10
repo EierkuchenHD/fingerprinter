@@ -3,6 +3,57 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.0.0] - 2026-10-10
+
+The first full release.
+
+### Added
+
+- **See which videos were skipped:** a row whose last run left videos out
+  shows `N skipped` beside its count. Click it, or right-click the row, for
+  which ones and why (outside the length limits, failed to download, or
+  could not be read for fingerprinting), grouped by reason, each with its
+  link, and a button to copy the list. The summary at the end of a list says
+  which links have some, and names them for a link taken off the list once
+  fingerprinted.
+- **Search the list:** a box above the list shows only the links with every
+  word typed, in the link, the channel's name or `@handle`, or how the last
+  run ended. Ctrl+F in the list goes there, Esc clears it. Tick all and
+  Ctrl+A work on the links shown.
+- **Copy link and its videos**, in a row's right-click menu (and
+  Ctrl+Shift+C): the link, then each of its videos on a line of its own,
+  title and link separated by a tab, and why when its last run skipped it.
+  With several rows selected, each link with its videos. The background
+  count now keeps what it lists, in `listings\`, so the copy is instant; a
+  link not listed yet is listed first, ahead of the daily counts, and what
+  you copy meanwhile is not overwritten.
+- **Keyboard shortcuts in the list:** Ctrl+C copies the selected links, Ctrl+V
+  adds the links on the clipboard, the arrow keys, Page Up/Down, Home and End
+  select rows (with Shift, a range), Space ticks or unticks, Enter opens,
+  Ctrl+Up/Down/Home/End move the selected rows (Undo puts a move to the top
+  or bottom back), F5 counts them again, and Shift+F10 opens the right-click
+  menu. The right-click menu shows the keys.
+
+### Fixed
+
+- **The same channel could be added twice:** `youtube.com/@name` and
+  `www.youtube.com/@name/videos` counted as two links. They are one now, while
+  the Shorts, Live and Home tabs stay links of their own; as the bare channel
+  runs its Shorts and Live too, the console says how to get those when the row
+  already there is the Videos tab. A `channel/UC...` link and the `@name` of the
+  same channel count as one too, once the channel pictures know whose channel
+  the `@name` is. A saved list that already holds a link twice is named in the
+  console at start.
+- **The program crashed with a very long list:** each row takes some of the
+  10,000 windows Windows lets a program have. The list now holds at most 1,000
+  links; Add, Ctrl+V, Import and Undo say how many did not fit. A saved list
+  of more keeps its first 1,000 and writes the rest to `links-left-out.txt`,
+  to import once there is room. A row also takes one window fewer than
+  before: the channel picture now shares its label with the result mark.
+- **Copy link and its videos** says when it can mark only some of a link's
+  skipped videos (its list of them was deleted), instead of marking fewer
+  without a word.
+
 ## [1.0.0-beta.9] - 2026-10-06
 
 ### Changed
@@ -461,6 +512,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.0.0]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0
 [1.0.0-beta.9]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.9
 [1.0.0-beta.8]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.8
 [1.0.0-beta.7]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.7
