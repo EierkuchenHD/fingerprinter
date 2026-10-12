@@ -155,6 +155,7 @@ offers to install or repair whatever is missing or not working.
 | `setup.bat` says Python was not found | Install Python from [python.org](https://www.python.org/downloads/windows/) with **Add python.exe to PATH** ticked, then run `setup.bat` again. |
 | `setup.bat`: "Organization policies are preventing installation" | That PC (often a work or school one) does not allow the installation. `setup.bat` offers other ways, such as Python from the Microsoft Store. |
 | Many downloads fail with HTTP 429 or 403 | The site is limiting you. Lower **Downloads at once**, or try again later. |
+| "Cloudflare anti-bot check" (audio.com, for example) | Add `--extractor-args "generic:impersonate"` under **Extra download options** (Settings, Downloads), so yt-dlp impersonates a browser. If the log says yt-dlp cannot impersonate one, press **Check setup** first: it installs curl_cffi, which yt-dlp needs for that. |
 | "YouTube asked to confirm you are not a bot" | Choose your browser under **Sign in with cookies from** (Settings, Downloads), lower **Downloads at once**, or wait a while. |
 | Private, members-only or age-restricted videos fail | Choose your browser under **Sign in with cookies from** (Settings, Downloads) and close that browser before starting; Firefox works most reliably. |
 | "yt-dlp may be out of date" | Press **Check setup** to update it once the job has finished, then run the link again. |

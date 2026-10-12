@@ -66,7 +66,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -987,6 +987,13 @@ class FingerprinterApp:
         # When yt-dlp was last checked for a newer release at start
         # (_update_ytdlp_at_start), as YYYY-MM-DD.
         self._ytdlp_checked = ""
+        # The yt-dlp version that start-up last tried to add curl_cffi to
+        # (_update_ytdlp_at_start), so a Python it cannot be had for is not
+        # asked again every day.
+        self._impersonate_tried = ""
+        # dependencies.describe_impersonation() for the yt-dlp in use, once
+        # asked (_failure_advice); None until then, and again after a change.
+        self._impersonate_note: str | None = None
 
         self._build_ui()
         self._apply_config(load_config())
@@ -2868,6 +2875,7 @@ class FingerprinterApp:
             except (TypeError, ValueError):
                 setattr(self, attr, conv(0))
         self._ytdlp_checked = str(cfg.get("ytdlp_checked") or "")
+        self._impersonate_tried = str(cfg.get("impersonate_tried") or "")
         self._restore_window(cfg.get("window"))
         pos = cfg.get("settings_window")
         if (isinstance(pos, list) and len(pos) == 2
@@ -2976,6 +2984,8 @@ class FingerprinterApp:
             out["settings_window"] = list(settings_pos)
         if self._ytdlp_checked:
             out["ytdlp_checked"] = self._ytdlp_checked
+        if self._impersonate_tried:
+            out["impersonate_tried"] = self._impersonate_tried
         # Follow as the user left it: a search that turned it off meanwhile
         # (_console_show_match) does not keep it off after a restart.
         if self._find_paused_follow:
@@ -3418,8 +3428,31 @@ class FingerprinterApp:
         """After a link's downloads: one line of advice per kind of failure
         that has one, rather than leaving it to be read from each item."""
         for reason, n in self._fail_reasons.items():
-            if reason in self.FAILURE_ADVICE:
-                self._log(f"[!] {n} download(s) failed: {self.FAILURE_ADVICE[reason]}", tag="warning")
+            if (advice := self._failure_advice(reason)):
+                self._log(f"[!] {n} download(s) failed: {advice}", tag="warning")
+
+    def _failure_advice(self, reason: str | None) -> str | None:
+        """FAILURE_ADVICE's line for `reason`. For Cloudflare's check, one
+        that depends on whether this yt-dlp can impersonate a browser, which
+        it cannot say itself here: --no-warnings hides its warning."""
+        if reason != "Cloudflare anti-bot check":
+            return self.FAILURE_ADVICE.get(reason)
+        if self._impersonate_note is None:
+            self._impersonate_note = dependencies.describe_impersonation(self.ytdlp)
+        option = '--extractor-args "generic:impersonate"'
+        if self._impersonate_note:
+            return (f"The site lets only browsers in (Cloudflare's anti-bot check), and this "
+                    f"yt-dlp {self._impersonate_note} Then add {option} under Extra download "
+                    f"options (Settings, Downloads), and run the link again.")
+        if any("impersonate" in arg for arg in self._extra_args(quiet=True)):
+            # yt-dlp names Cloudflare only when it did not impersonate one;
+            # turned away while impersonating, it says HTTP 403 and no more.
+            return (f"The site lets only browsers in (Cloudflare's anti-bot check), and yt-dlp "
+                    f"did not impersonate one, though Extra download options (Settings, "
+                    f"Downloads) seem to ask for it: check they say exactly {option}.")
+        return (f"The site lets only browsers in (Cloudflare's anti-bot check). Add {option} "
+                f"under Extra download options (Settings, Downloads), so yt-dlp impersonates "
+                f"one, and run the link again.")
 
     def _select_subset(self, entries: list[dict]) -> list[dict] | None:
         """Show a checklist of video titles and return the subset the user kept.
@@ -6770,6 +6803,7 @@ class FingerprinterApp:
     def _refresh_ytdlp(self) -> None:
         """Re-resolve how to run yt-dlp (after a check or an install)."""
         self.ytdlp = dependencies.ytdlp_command() or ["yt-dlp"]
+        self._impersonate_note = None
 
     def _startup_check(self, bat_dir: str) -> None:
         """Worker thread, at launch: check the components (offering to install
@@ -6861,17 +6895,28 @@ class FingerprinterApp:
         Check setup did this before, and nothing did in between, while sites
         change often. Held like a job, so no download starts while pip
         replaces yt-dlp's files. Offline, it tries again at the next start."""
+        if not self.auto_update_ytdlp_var.get():
+            return
         today = time.strftime("%Y-%m-%d")
-        if not self.auto_update_ytdlp_var.get() or self._ytdlp_checked == today:
+        # A copy pip installed without curl_cffi, as the Fingerprinter did
+        # before 1.1.1, gets it added, also on a day yt-dlp was looked at
+        # already (by the 1.1.0 that told of this version, say): once per
+        # yt-dlp version, so where it cannot be had, only the next release
+        # tries again. The check just before found the answer (cached).
+        add_to = ""
+        if dependencies.impersonation_missing(self.ytdlp):
+            add_to = dependencies.ytdlp_version(self.ytdlp)
+            if add_to == self._impersonate_tried:
+                add_to = ""
+        if self._ytdlp_checked == today and not add_to:
             return
         try:
             update = dependencies.ytdlp_update_available()
         except OSError:
             return
         self._ytdlp_checked = today
-        if update is None:
+        if update is None and not add_to:
             return
-        installed, newest = update
         if self.worker_thread is not None and self.worker_thread.is_alive():
             return      # a job started meanwhile; tomorrow, or Check setup
         self._job_kind = "setup"
@@ -6879,12 +6924,20 @@ class FingerprinterApp:
         self.root.after(0, self._lock_for_job)
         try:
             self._set_status("Updating yt-dlp...")
-            self._log(f"[*] yt-dlp {newest} is out (this PC has {installed or 'none'}); updating it.")
+            if update is None:
+                self._log("[*] yt-dlp cannot impersonate a browser, as some sites (such as "
+                          "audio.com) need; adding curl_cffi.")
+            else:
+                installed, newest = update
+                self._log(f"[*] yt-dlp {newest} is out (this PC has {installed or 'none'}); updating it.")
             if dependencies.update_ytdlp(lambda line: self._log("    " + line.strip())):
                 self._refresh_ytdlp()
             else:
                 self._log("[!] yt-dlp could not be updated now; Check setup can try again.",
                           tag="warning")
+            if add_to:
+                # Tried for the yt-dlp now in place, whichever way it went.
+                self._impersonate_tried = dependencies.ytdlp_version(self.ytdlp) or add_to
             self._set_status("Ready.")
         finally:
             # This start-up thread goes on to other checks; it is no job now.
@@ -7307,7 +7360,8 @@ class FingerprinterApp:
     # yt-dlp will not mend by waiting, so those wait for the user.
 
     BACKOFF_REASONS = {None, "network error", "HTTP 403 forbidden", "HTTP 429 rate-limited",
-                       "YouTube bot check", "disk full", "yt-dlp may be out of date"}
+                       "YouTube bot check", "disk full", "yt-dlp may be out of date",
+                       "Cloudflare anti-bot check"}
     BACKOFF_STREAK = 10
     AUTO_RESUME_MINUTES = (10, 20, 40, 60)
 
@@ -7337,6 +7391,7 @@ class FingerprinterApp:
             None: "for reasons yt-dlp did not name",
             "network error": "the connection failed",
             "HTTP 403 forbidden": "the site refused them (HTTP 403)",
+            "Cloudflare anti-bot check": "the site let only browsers in (Cloudflare's anti-bot check)",
             "HTTP 429 rate-limited": "the site is limiting how fast you download (HTTP 429)",
             "YouTube bot check": "YouTube asked to confirm you are not a bot",
             "disk full": "the disk is full",
@@ -8950,8 +9005,8 @@ class FingerprinterApp:
                       + (f" ({reason})" if reason else "") + ":", tag="warning")
             for ln in errors[-3:] or ["(it said nothing about why)"]:
                 self._log(f"    {ln[:400]}", tag="warning")
-            if reason in self.FAILURE_ADVICE:
-                self._log(f"    {self.FAILURE_ADVICE[reason]}", tag="warning")
+            if (advice := self._failure_advice(reason)):
+                self._log(f"    {advice}", tag="warning")
             return None
 
         if unreadable and not entries:
@@ -9373,7 +9428,8 @@ class FingerprinterApp:
     RETRY_LATER = {None, "network error", "HTTP 403 forbidden", "HTTP 429 rate-limited",
                    "not found (HTTP 404)",
                    "scheduled livestream (not started)", "scheduled premiere (not aired)",
-                   "YouTube bot check", "disk full", "yt-dlp may be out of date"}
+                   "YouTube bot check", "disk full", "yt-dlp may be out of date",
+                   "Cloudflare anti-bot check"}
 
     @staticmethod
     def _classify_yt_dlp_error(text: str) -> str | None:
@@ -9418,7 +9474,9 @@ class FingerprinterApp:
             *((p, "yt-dlp may be out of date") for p in FingerprinterApp.SOLVER_WARNINGS),
             ("requested format is not available", "no audio format available"),
             # Before "unable to download webpage", which a 429 or 403 on the
-            # page itself also says.
+            # page itself also says. "Got HTTP Error 403 caused by Cloudflare
+            # anti-bot challenge; try again with --extractor-args ..." first.
+            ("cloudflare anti-bot", "Cloudflare anti-bot check"),
             ("http error 403", "HTTP 403 forbidden"),
             ("http error 429", "HTTP 429 rate-limited"),
             ("http error 404", "not found (HTTP 404)"),

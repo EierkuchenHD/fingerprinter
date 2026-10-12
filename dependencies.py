@@ -267,6 +267,110 @@ def _version_key(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", version))
 
 
+# yt-dlp as its own install guide recommends: with its default extras (among
+# them yt-dlp-ejs, its YouTube challenge solver, kept at the matching version)
+# and curl_cffi, which lets it impersonate a browser (--impersonate,
+# --extractor-args "generic:impersonate") for sites behind Cloudflare's
+# anti-bot check, such as audio.com. The standalone yt-dlp.exe has all of it
+# built in; plain `pip install yt-dlp` has none of it.
+YTDLP_PACKAGE = "yt-dlp[default,curl-cffi]"
+
+
+# What _pip_ytdlp tries, in turn. One extra that cannot be had for this
+# Python must cost only itself: brotli (in "default") has no build yet for
+# every Python, such as a brand-new version or ARM64, and curl_cffi none for
+# 32-bit Python; pip then fails the whole install rather than leave it out.
+_YTDLP_SPECS = (YTDLP_PACKAGE, "yt-dlp[curl-cffi]", "yt-dlp[default]", "yt-dlp")
+
+_DIST_PROBE = """
+import importlib.metadata, json
+print(json.dumps(sorted({d.metadata["Name"] or "" for d in importlib.metadata.distributions()})))
+"""
+
+
+def _installed_distributions() -> set[str] | None:
+    """The names of the packages installed in this Python, normalised as pip
+    does (curl_cffi -> curl-cffi); None when that cannot be found out."""
+    _, out = _run([console_python(), "-c", _DIST_PROBE], timeout=120)
+    for line in reversed(out.splitlines()):
+        if line.startswith("["):
+            try:
+                return {re.sub(r"[-_.]+", "-", n).lower() for n in json.loads(line) if n}
+            except ValueError:
+                break
+    return None
+
+
+def _pip_ytdlp(args: list[str], log: Log) -> bool:
+    """pip install yt-dlp with its extras (YTDLP_PACKAGE), with `args` such
+    as --upgrade; when that fails, with fewer of them (_YTDLP_SPECS), down to
+    plain yt-dlp: an extra must never hold yt-dlp back. Whatever this
+    installs that was not there before is recorded for uninstall.bat."""
+    before = _installed_distributions()
+    ok = False
+    for i, spec in enumerate(_YTDLP_SPECS):
+        if i:
+            if not _newest_ytdlp_on_pypi():
+                break           # offline: the rest would only fail the same way
+            log(f"    Trying {spec} instead...")
+        if _pip([*args, spec], log):
+            ok = True
+            break
+    _impersonate_cache.clear()
+    after = _installed_distributions() if before is not None else None
+    new = sorted(after - before) if after is not None else []
+    if new:
+        _record_packages(new)
+    if "curl-cffi" in new:
+        log("    curl_cffi installed: yt-dlp can now impersonate a browser.")
+    if ok and spec != YTDLP_PACKAGE:
+        log(f"    Installed {spec}, without the extras pip could not install here.")
+    return ok
+
+
+# ytdlp_can_impersonate's answers, by command: asking takes a yt-dlp run, and
+# the answer only changes when pip installs something (_pip_ytdlp).
+_impersonate_cache: dict[tuple[str, ...], bool | None] = {}
+
+
+def ytdlp_can_impersonate(cmd: list[str] | None = None) -> bool | None:
+    """Whether the yt-dlp the program runs can impersonate a browser, as some
+    sites need; None when yt-dlp cannot say (none found, or one too old to
+    know --list-impersonate-targets). Asks yt-dlp itself, which lists the
+    targets it lacks the means for as "(unavailable)", or "(not available)"
+    up to 2025. Only its output is read: it warns on the error stream, under
+    an old Python or when it is out of date, and that is no target."""
+    cmd = cmd or ytdlp_command()
+    if not cmd:
+        return None
+    key = tuple(cmd)
+    if key not in _impersonate_cache:
+        try:
+            proc = subprocess.run(
+                [*cmd, "--list-impersonate-targets"], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                timeout=30, creationflags=_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None             # not remembered: it may answer next time
+        answer = None
+        lines = (proc.stdout or "").splitlines() if proc.returncode == 0 else []
+        rule = next((i for i, line in enumerate(lines) if line.startswith("---")), None)
+        if rule is not None:
+            answer = any(line.strip() and not re.search(r"\((?:un|not )available\)", line)
+                         for line in lines[rule + 1:])
+        _impersonate_cache[key] = answer
+    return _impersonate_cache[key]
+
+
+def impersonation_missing(cmd: list[str] | None = None) -> bool:
+    """True when the yt-dlp the program runs (`cmd`) is the copy pip
+    installed into this Python and cannot impersonate a browser: that is the
+    one pip can fix, by adding curl_cffi (update_ytdlp)."""
+    cmd = cmd or ytdlp_command()
+    return bool(cmd) and len(cmd) > 1 and ytdlp_can_impersonate(cmd) is False
+
+
 def update_ytdlp(log: Log) -> bool:
     """Install the newest yt-dlp release into this Python, whatever version is
     there now. Sites change what they send all the time, and an old yt-dlp is
@@ -275,11 +379,14 @@ def update_ytdlp(log: Log) -> bool:
 
     PyPI is asked for the newest version number first, because pip cannot be
     taken at its word: with no connection it still says "Requirement already
-    satisfied" and succeeds, which would read as "already the newest"."""
+    satisfied" and succeeds, which would read as "already the newest".
+
+    It comes with its extras (YTDLP_PACKAGE), so this also adds curl_cffi to
+    a copy installed without it."""
     before = _ytdlp_module_version()
     newest = _newest_ytdlp_on_pypi()
     log("Updating yt-dlp to the newest release" + (f" (now {before})..." if before else "..."))
-    if not _pip(["--upgrade", "yt-dlp"], log):
+    if not _pip_ytdlp(["--upgrade"], log):
         log("    ! yt-dlp could not be updated" +
             (f"; version {before} stays in use." if before else "."))
         return False
@@ -310,6 +417,15 @@ def ytdlp_command() -> list[str] | None:
     return _find_ytdlp()[0]
 
 
+def ytdlp_version(cmd: list[str] | None = None) -> str:
+    """The version of the yt-dlp the program runs (or of `cmd`), or "" when
+    there is none."""
+    if not cmd:
+        return _find_ytdlp()[1]
+    code, out = _run([*cmd, "--version"], timeout=30)
+    return _last_line(out) if code == 0 else ""
+
+
 def ytdlp_update_available() -> tuple[str, str] | None:
     """(version in use, newest release) when PyPI has a newer yt-dlp than the
     one the program runs, or none is installed; None when it is the newest.
@@ -324,23 +440,44 @@ def ytdlp_update_available() -> tuple[str, str] | None:
     return installed, newest
 
 
+def describe_impersonation(cmd: list[str] | None = None) -> str:
+    """"" when yt-dlp can impersonate a browser (or cannot say), else a note
+    on why it cannot and what fixes it, for check_ytdlp and the program's
+    hint after a Cloudflare error."""
+    cmd = cmd or ytdlp_command()
+    if not cmd or ytdlp_can_impersonate(cmd) is not False:
+        return ""
+    if len(cmd) > 1:
+        return ("cannot impersonate a browser, as some sites (such as audio.com) need: "
+                "curl_cffi is missing, which Check setup installs.")
+    return (f"cannot impersonate a browser, as some sites (such as audio.com) need: "
+            f"curl_cffi is missing from {cmd[0]}. Install the standalone yt-dlp.exe from "
+            f"github.com/yt-dlp/yt-dlp, which has it built in, or run: "
+            f"pip install \"{YTDLP_PACKAGE}\".")
+
+
 def check_ytdlp() -> Status:
     why = "downloads the audio"
     cmd, version = _find_ytdlp()
     if cmd:
         where = "on PATH" if len(cmd) == 1 else "Python module"
-        return Status("yt-dlp", "yt-dlp", why, True, "ok", f"{version} ({where})")
+        # Still ok without impersonation, which only some sites need: offering
+        # it at every start would nag. update_ytdlp adds it.
+        note = describe_impersonation(cmd)
+        return Status("yt-dlp", "yt-dlp", why, True, "ok",
+                      f"{version} ({where})" + (f"; {note}" if note else ""))
     exe = shutil.which("yt-dlp")
     if exe:
         _, out = _run([exe, "--version"], timeout=30)
         return Status(
             "yt-dlp", "yt-dlp", why, False, "not working", f"{exe}: {_last_line(out)}",
-            fix="pip install --force-reinstall yt-dlp (from PyPI); the program then uses that copy",
-            manual="pip install --force-reinstall yt-dlp",
+            fix=f"pip install --force-reinstall {YTDLP_PACKAGE} (from PyPI); "
+                f"the program then uses that copy",
+            manual=f"pip install --force-reinstall \"{YTDLP_PACKAGE}\"",
         )
     return Status(
         "yt-dlp", "yt-dlp", why, False, "missing", "not found",
-        fix="pip install yt-dlp (from PyPI)", manual="pip install yt-dlp",
+        fix=f"pip install {YTDLP_PACKAGE} (from PyPI)", manual=f"pip install \"{YTDLP_PACKAGE}\"",
     )
 
 
@@ -577,7 +714,10 @@ def install_packages(status: Status, log: Log) -> bool:
 
 def install_ytdlp(status: Status, log: Log) -> bool:
     had_module = bool(_ytdlp_module_version())
-    ok = _pip(["--force-reinstall", "yt-dlp"] if status.state == "not working" else ["yt-dlp"], log)
+    # A repair reinstalls yt-dlp alone: --force-reinstall with the extras
+    # would reinstall every package they bring, which other programs share.
+    ok = status.state != "not working" or _pip(["--force-reinstall", "--no-deps", "yt-dlp"], log)
+    ok = _pip_ytdlp([], log) and ok
     if ok and not had_module:
         _record_packages(["yt-dlp"])
     return ok

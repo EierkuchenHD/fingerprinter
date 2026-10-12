@@ -3,6 +3,27 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.1.1] - 2026-10-12
+
+### Fixed
+
+- **`--extractor-args "generic:impersonate"` in Extra download options did
+  nothing**, so sites behind Cloudflare's anti-bot check, such as audio.com,
+  still failed with HTTP 403, while the standalone yt-dlp.exe got through.
+  Impersonating a browser needs curl_cffi, which plain `pip install yt-dlp`
+  leaves out, and yt-dlp's warning about it was hidden. setup.bat, Check
+  setup and the daily yt-dlp update now install yt-dlp as its own guide
+  recommends, `yt-dlp[default,curl-cffi]`, which also brings yt-dlp-ejs, its
+  YouTube challenge solver. Where one of those extras has no build for the
+  Python in use (a brand-new Python version, ARM64 or 32-bit), the rest are
+  still installed, down to plain yt-dlp as before. A copy installed before
+  gets curl_cffi at the next start, also on a day yt-dlp was already updated
+  (with Keep yt-dlp up to date on, as it is by default), once per yt-dlp
+  version. Check setup says when yt-dlp cannot impersonate a browser, and a
+  failure of Cloudflare's check is now named as such, with what to do about
+  it. uninstall.bat also removes the packages the extras brought, where
+  setup installed them.
+
 ## [1.1.0] - 2026-10-10
 
 ### Added
@@ -533,6 +554,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.1.1]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.1.1
 [1.1.0]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.1.0
 [1.0.0]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0
 [1.0.0-beta.9]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.9
