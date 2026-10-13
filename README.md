@@ -13,9 +13,10 @@ songs with [WerZatSong](https://github.com/Nel80s/WerZatSong) and
 
 Give it links to channels, playlists or single pages on YouTube, Archive.org,
 Mixcloud, SoundCloud or [any other site yt-dlp
-supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md). It
-downloads the audio, splits long recordings, and fingerprints everything in
-batches with WerZatSong's version of audfprint.
+supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md), or
+to folders on a web server ("Index of /…" pages). It downloads the audio,
+splits long recordings, and fingerprints everything in batches with
+WerZatSong's version of audfprint.
 
 ![The Fingerprinter window](screenshot.png)
 
@@ -111,6 +112,20 @@ Downloads), and the next run of a channel only downloads what is new. To get
 only recent uploads, turn on **Only items published on or after** and enter a
 date.
 
+### Folders on a web server
+
+A link to a web server's folder listing, a page titled "Index of /Music" or
+similar that just lists files and folders, works like a channel: the program
+reads the folder and every folder inside it and fingerprints the audio files it
+finds (`.mp3`, `.m4a`, `.mp4`, `.flac`, `.wav`, `.ogg`, `.opus`, `.aac`, `.wma`,
+`.webm`). Other files, and links that lead out of the folder, are left alone.
+The dates the listing shows count for **Only items published on or after**.
+
+If the site turns the program away (many sit behind Cloudflare's check), its
+pages are read through yt-dlp impersonating a browser, and so are the
+downloads; that needs curl_cffi, which setup installs. Reading a folder takes
+about a second a page that way, a few seconds with a standalone `yt-dlp.exe`.
+
 ### Audio you already have
 
 The **Audio on disk** menu fingerprints audio files that are already in the
@@ -156,6 +171,7 @@ offers to install or repair whatever is missing or not working.
 | `setup.bat`: "Organization policies are preventing installation" | That PC (often a work or school one) does not allow the installation. `setup.bat` offers other ways, such as Python from the Microsoft Store. |
 | Many downloads fail with HTTP 429 or 403 | The site is limiting you. Lower **Downloads at once**, or try again later. |
 | "Cloudflare anti-bot check" (audio.com, for example) | Add `--extractor-args "generic:impersonate"` under **Extra download options** (Settings, Downloads), so yt-dlp impersonates a browser. If the log says yt-dlp cannot impersonate one, press **Check setup** first: it installs curl_cffi, which yt-dlp needs for that. |
+| A folder listing "could not be read" | If the log names Cloudflare, press **Check setup** so yt-dlp can impersonate a browser. A folder that needs a login or is a site's own file browser (not a plain "Index of" page) cannot be read. |
 | "YouTube asked to confirm you are not a bot" | Choose your browser under **Sign in with cookies from** (Settings, Downloads), lower **Downloads at once**, or wait a while. |
 | Private, members-only or age-restricted videos fail | Choose your browser under **Sign in with cookies from** (Settings, Downloads) and close that browser before starting; Firefox works most reliably. |
 | "yt-dlp may be out of date" | Press **Check setup** to update it once the job has finished, then run the link again. |
@@ -169,6 +185,9 @@ offers to install or repair whatever is missing or not working.
 - **Keep nothing of your own in the working folder** (`downloads\`): the
   program deletes the audio there once it is fingerprinted.
 - **Size and time estimates are rough.**
+- **Web folders: plain listings only**, at most 5,000 folders and 25 levels
+  deep per link. A site's own file browser, or a folder behind a login, is not
+  read.
 
 ## Files and folders
 

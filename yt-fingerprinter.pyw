@@ -37,10 +37,12 @@ import base64
 import bisect
 import datetime
 import hashlib
+import html.parser
 import http.client
 import json
 import math
 import os
+import posixpath
 import queue
 import re
 import shutil
@@ -51,13 +53,14 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.error
 import urllib.request
 import webbrowser
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import dependencies
 
@@ -66,7 +69,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -353,6 +356,580 @@ def published_date(info: dict) -> str | None:
         except (KeyError, TypeError, ValueError, OverflowError, OSError):
             pass
     return None
+
+
+# ---- Folders on a web server ------------------------------------------------
+# A link yt-dlp has no extractor for may be a web server's folder listing
+# ("Index of /Music/": Apache's, nginx's or another server's own page for a
+# folder). The program then reads it itself: the audio files in it and in its
+# subfolders, each downloaded by its own link (FingerprinterApp.
+# _list_web_folder). Only the file types the fingerprint scan takes
+# (FingerprinterApp.AUDIO_EXTENSIONS); other files are left alone.
+
+# What a listing's title or first heading starts with: Apache, nginx,
+# lighttpd and LiteSpeed say "Index of", Python's own server "Directory
+# listing for". IIS has neither, but its parent link says "[To Parent
+# Directory]".
+WEB_FOLDER_TITLE_RE = re.compile(r"^\s*(?:index of|directory listing for)(?:\s|$)", re.I)
+WEB_FOLDER_PARENT_TEXT = "[to parent directory]"
+
+# How far it goes, so that a server whose folders link round in a circle (a
+# folder that links to itself under a longer name) cannot keep it reading.
+WEB_FOLDER_MAX_FOLDERS = 5000
+WEB_FOLDER_MAX_DEPTH = 25
+# The largest page read: a folder of 100,000 files is about 20 MB of listing.
+WEB_FOLDER_MAX_PAGE = 32 * 1024 * 1024
+
+# The date beside a file: Apache "2012-04-30 15:52", nginx and older Apache
+# "30-Apr-2012 15:52".
+_ISO_DATE_RE = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
+_DMY_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})-([A-Za-z]{3})-(\d{4})(?!\d)")
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
+class WebFolderError(Exception):
+    """A page of a folder listing could not be read; the message says why."""
+
+
+class PausableTimer:
+    """threading.Timer that does not count the time `paused()` is true: a
+    process Pause has suspended is not late, only waiting."""
+
+    def __init__(self, seconds: float, action: Callable[[], object],
+                 paused: Callable[[], bool] = lambda: False) -> None:
+        self._left = seconds
+        self._action = action
+        self._paused = paused
+        self._done = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        last = time.monotonic()
+        while not self._done.wait(0.5):
+            now = time.monotonic()
+            if not self._paused():
+                self._left -= now - last
+            last = now
+            if self._left <= 0:
+                self._done.set()
+                self._action()
+
+    def cancel(self) -> None:
+        self._done.set()
+
+
+class _FolderPage(html.parser.HTMLParser):
+    """What a folder listing is told by and holds: the page's title, its first
+    heading, and each link with its text, the text after it up to the next
+    link or table row, where Apache and nginx put the file's date, and the
+    text before it back to the last link, where IIS does."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self.heading = ""
+        self.links: list[list[str]] = []        # [href, its text, after it, before it]
+        self._inside = ""                       # "title" or "h1" while in one
+        self._done: set[str] = set()
+        self._in_link = False
+        self._after = False
+        self._before = ""
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in ("title", "h1") and tag not in self._done:
+            self._inside = tag
+        elif tag == "a":
+            href = dict(attrs).get("href")
+            self._after = False
+            if href:
+                self.links.append([href, "", "", self._before])
+                self._in_link = True
+            self._before = ""
+        elif tag == "tr":
+            self._after = False
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == self._inside:
+            self._done.add(tag)
+            self._inside = ""
+        elif tag == "a" and self._in_link:
+            self._in_link = False
+            self._after = True
+        elif tag == "tr":
+            self._after = False
+
+    def handle_data(self, data: str) -> None:
+        if self._inside == "title":
+            self.title += data
+        elif self._inside == "h1":
+            self.heading += data
+        if self._in_link and self.links:
+            self.links[-1][1] += data
+            return
+        if self._after and self.links:
+            self.links[-1][2] += data
+        self._before += data
+
+
+def listing_date(text: str) -> str | None:
+    """The date in the text beside a file in a listing, YYYYMMDD; None if
+    there is none. The server's time of the file's last change: what yt-dlp
+    takes as its upload date (Last-Modified), give or take a day near
+    midnight, as the listing shows the server's local time."""
+    m = _ISO_DATE_RE.search(text)
+    if m:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = _DMY_DATE_RE.search(text)
+        if not m or m.group(2).lower() not in _MONTHS:
+            return None
+        year, month, day = int(m.group(3)), _MONTHS[m.group(2).lower()], int(m.group(1))
+    try:
+        return datetime.date(year, month, day).strftime("%Y%m%d")
+    except ValueError:
+        return None
+
+
+def web_url(url: str) -> str | None:
+    """`url` as a link that can be fetched as it is: http(s) only, no
+    #fragment, and its path percent-encoded where a server left spaces,
+    accented letters or a bare % in it (its %XX kept as they are). None for
+    anything else (mailto:, javascript: and the like)."""
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return None
+    path = re.sub(r"%(?![0-9A-Fa-f]{2})", "%25", parts.path or "/")
+    path = quote(path, safe="/%:@!$&'()*+,;=~")
+    return urlunsplit((parts.scheme.lower(), parts.netloc, path, parts.query, ""))
+
+
+def folder_url(url: str) -> str:
+    """A folder's link, ending in "/" so that the names in it join onto it."""
+    parts = urlsplit(url)
+    if parts.path.endswith("/"):
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, parts.path + "/", parts.query, ""))
+
+
+def read_folder_page(text: str, base: str) -> dict | None:
+    """What the folder listing `text`, found at `base` (its address after
+    redirects), holds: {"files": [(link, YYYYMMDD or None)], "folders":
+    [link]}, each in the order the page lists them, only files and folders
+    inside it (not its parent, nor the "?C=M;O=A" links that sort it again);
+    None when the page is no folder listing."""
+    page = _FolderPage()
+    try:
+        page.feed(text)
+        page.close()
+    except Exception:  # noqa: BLE001 - html.parser seldom raises, but a page is any text
+        return None
+    iis = any(link[1].strip().lower() == WEB_FOLDER_PARENT_TEXT for link in page.links)
+    if not (WEB_FOLDER_TITLE_RE.match(page.title) or WEB_FOLDER_TITLE_RE.match(page.heading) or iis):
+        return None
+    here = urlsplit(folder_url(web_url(base) or base))
+    files: list[tuple[str, str | None]] = []
+    folders: list[str] = []
+    seen: set[str] = set()
+    for href, _text, after, before in page.links:
+        href = href.strip()
+        if not href or href.startswith(("?", "#")):
+            continue
+        try:
+            link = web_url(urljoin(urlunsplit(here), href))
+        except ValueError:      # a link even urljoin cannot make out ("http://[x/")
+            continue
+        if link is None or link in seen:
+            continue
+        parts = urlsplit(link)
+        if (parts.query or parts.netloc.lower() != here.netloc.lower()
+                or not parts.path.startswith(here.path) or parts.path == here.path
+                # "%2e%2e/", which urljoin leaves and a server takes as "../"
+                or any(seg in (".", "..") for seg in unquote(parts.path).split("/"))):
+            continue
+        seen.add(link)
+        if parts.path.endswith("/"):
+            folders.append(link)
+        elif posixpath.splitext(unquote(parts.path))[1].lower() in FingerprinterApp.AUDIO_EXTENSIONS:
+            # IIS puts a file's date before its link, the others after it.
+            files.append((link, listing_date(before if iis else after)))
+    # What the folder holds, to tell it again under another name (a link that
+    # leads back up, "self -> ."): its links and what the page says of them.
+    names = ([(posixpath.basename(urlsplit(f).path), date) for f, date in files],
+             [posixpath.basename(urlsplit(f).path.rstrip("/")) for f in folders])
+    signature = hashlib.sha1(repr(names).encode("utf-8", "surrogatepass")).hexdigest()
+    return {"files": files, "folders": folders, "signature": signature}
+
+
+def web_file_entry(link: str, published: str | None) -> dict:
+    """A listing entry for one file of a folder listing, for the rest of the
+    program as yt-dlp's are. Its id is the site's name and a hash of the
+    file's address: one per file, the same on every run (the done list keeps
+    it, _archive_key), and made of letters, digits, dots and dashes only, so
+    the file name keeps it exactly as it is (_items_fingerprinted looks for
+    "[id]" there). yt-dlp's own id for a file is its name, the same for
+    "01 Intro.mp3" in every album's folder and on every site; the download
+    gives yt-dlp this one instead (_download_one)."""
+    parts = urlsplit(link)
+    name = unquote(posixpath.basename(parts.path.rstrip("/")))
+    host = parts.netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    site = re.sub(r"[^a-z0-9.-]+", "-", host.rsplit("@", 1)[-1].split(":", 1)[0]).strip("-.")[:40] or "web"
+    digest = hashlib.sha1(f"{host}{unquote(parts.path)}".encode("utf-8", "surrogatepass")).hexdigest()[:10]
+    return {
+        "id": f"{site}-{digest}",
+        "title": posixpath.splitext(name)[0] or name,
+        "url": link,
+        "webpage_url": link,
+        "extractor": "generic",
+        "published": published,
+        "duration": None,
+        "_direct": True,
+    }
+
+
+def web_folder_label(link: str) -> str:
+    """A folder listing's name for the console and the file names: the site
+    and the folder's path, "meltingpotblog.com/Music"."""
+    parts = urlsplit(link)
+    host = parts.netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    return (host + unquote(parts.path).rstrip("/")) or "web folder"
+
+
+def crawl_web_folder(start: str, fetch: Callable[[str], tuple[str, str]], *,
+                     stop: Callable[[], bool] = lambda: False,
+                     found: Callable[[int, int], None] | None = None,
+                     max_folders: int = WEB_FOLDER_MAX_FOLDERS,
+                     max_depth: int = WEB_FOLDER_MAX_DEPTH) -> dict | None:
+    """Read the folder listing at `start` and every folder inside it, the
+    way a person would open each one: the files of a folder, then its
+    folders in the order the page lists them. `fetch(link)` gives a page's
+    text and its address after redirects, or raises WebFolderError. `found`
+    hears (files, folders) after each folder. None when `start` is no
+    folder listing; its first page failing raises. Otherwise {"label",
+    "entries", "folders": the number read, "failed": [(link, why)],
+    "capped": whether a limit cut it short, "stopped"}."""
+    text, final = fetch(web_url(start) or start)
+    page = read_folder_page(text, final)
+    if page is None:
+        return None
+    root = folder_url(web_url(final) or final)
+    root_path = urlsplit(root).path
+    root_host = urlsplit(root).netloc.lower()
+    result = {"label": web_folder_label(root), "entries": [], "folders": 1, "failed": [],
+              "capped": False, "stopped": False}
+    seen_folders = {root}
+    seen_files: set[str] = set()
+    # Depth first, in the listing's order: a stack of the folders still to
+    # read, the next one on top, each with the signatures of the folders it
+    # is in, so that one which is one of them again is not read (a link that
+    # leads back up, which the server shows as a folder).
+    stack: list[tuple[dict, int, tuple[str, ...]]] = [(page, 0, ())]
+    pending: list[tuple[str, int, tuple[str, ...]]] = []
+    while stack or pending:
+        if stack:
+            page, depth, above = stack.pop()
+            if page["signature"] in above:
+                result["loops"] = result.get("loops", 0) + 1
+                continue
+            above = (*above, page["signature"])
+            for link, date in page["files"]:
+                if link not in seen_files:
+                    seen_files.add(link)
+                    result["entries"].append(web_file_entry(link, date))
+            if found:
+                found(len(result["entries"]), result["folders"])
+            pending.extend(reversed([(f, depth + 1, above) for f in page["folders"]]))
+            continue
+        link, depth, above = pending.pop()
+        if link in seen_folders:
+            continue
+        if stop():
+            result["stopped"] = True
+            break
+        if depth > max_depth or result["folders"] >= max_folders:
+            result["capped"] = True
+            continue
+        seen_folders.add(link)
+        try:
+            text, final = fetch(link)
+        except WebFolderError as e:
+            result["failed"].append((link, str(e)))
+            continue
+        final = folder_url(web_url(final) or final)
+        if urlsplit(final).netloc.lower() != root_host or not urlsplit(final).path.startswith(root_path):
+            result["failed"].append((link, "it leads out of the folder"))
+            continue
+        if final in seen_folders and final != link:
+            continue
+        sub = read_folder_page(text, final)
+        if sub is None:
+            result["failed"].append((link, "not a folder listing"))
+            continue
+        seen_folders.add(final)
+        result["folders"] += 1
+        stack.append((sub, depth, above))
+    return result
+
+
+def decode_page(data: bytes, charset: str | None = None) -> str:
+    """A web page's text: in the character set its server or its own <meta>
+    names, else UTF-8, else Windows' Western one (what an old server with
+    no word about it most likely sends)."""
+    names = [charset] if charset else []
+    m = re.search(rb"""<meta[^>]+charset=["']?([\w-]+)""", data[:4096], re.I)
+    if m:
+        names.append(m.group(1).decode("ascii", "replace"))
+    for name in [*names, "utf-8"]:
+        try:
+            return data.decode(name)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("cp1252", "replace")
+
+
+# The program the kept-open yt-dlp runs (WebFolderReader._read_with_helper):
+# yt-dlp as a library, set up from Extra download options and the sign-in
+# browser as on the command line (parse_options), fetching one page for each
+# line it is sent: {"url", "impersonate"} in, {"url" (after redirects),
+# "charset", "data" (base64)} or {"error", "status"} out.
+_WEB_PAGE_HELPER = r"""
+import base64, json, sys
+try:
+    import yt_dlp
+    from yt_dlp.networking import Request
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+    opts = yt_dlp.parse_options(sys.argv[2:]).ydl_opts
+except BaseException as e:
+    print(json.dumps({"fatal": type(e).__name__ + ": " + str(e)}), flush=True)
+    raise SystemExit(0)
+opts.update(quiet=True, no_warnings=True, noprogress=True)
+limit = int(sys.argv[1])
+with yt_dlp.YoutubeDL(opts) as ydl:
+    print(json.dumps({"ready": True}), flush=True)
+    for line in sys.stdin:
+        try:
+            ask = json.loads(line)
+            ext = {"impersonate": ImpersonateTarget()} if ask.get("impersonate") else {}
+            req = Request(ask["url"], headers={"Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"},
+                          extensions=ext)
+            with ydl.urlopen(req) as r:
+                kind = (r.headers.get("Content-Type") or "").split(";")
+                if kind[0].strip().lower() not in ("text/html", "application/xhtml+xml", ""):
+                    out = {"error": "not a web page (" + kind[0].strip() + ")"}
+                else:
+                    charset = next((p.split("=", 1)[1].strip().strip(chr(39) + chr(34)) for p in kind[1:]
+                                    if p.strip().lower().startswith("charset=")), None)
+                    out = {"url": r.url, "charset": charset,
+                           "data": base64.b64encode(r.read(limit + 1)).decode("ascii")}
+        except Exception as e:
+            out = {"error": str(e), "status": getattr(e, "status", None)}
+        print(json.dumps(out), flush=True)
+"""
+
+
+class _HelperBroken(Exception):
+    """The kept-open yt-dlp cannot be used (it would not start, does not
+    take an option, or died); the page is read the slower way."""
+
+
+class WebFolderReader:
+    """fetch(link) for crawl_web_folder: a folder listing's pages, read with
+    urllib, which is quick, and through yt-dlp from the first page the server
+    turns that away (Cloudflare's check, mostly): yt-dlp goes through the
+    sign-in browser and Extra download options as downloads do, and it is
+    asked to impersonate a browser (curl_cffi) where it can, which is what
+    such a site wants. Once yt-dlp was needed, the rest of the folder goes
+    that way too, and `impersonated` tells the downloads to impersonate too.
+
+    yt-dlp installed in Python (python -m yt_dlp, as setup does) is kept
+    open for the whole folder and asked for one page after another, about
+    a second each (_read_with_helper); a yt-dlp.exe, or that failing, is
+    run once a page, about five (_read_with_ytdlp). `spawn(cmd)` starts the
+    kept-open one (a Popen with stdin and stdout, Stop ending it), or gives
+    None; `release(proc)` ends it. close() when done with the folder.
+
+    `run(cmd, timeout, enough)` runs yt-dlp and gives (exit code, stdout,
+    stderr), or None when it could not run or was ended; it ends yt-dlp once
+    enough(the stdout lines so far) is true. `opener` is urllib going
+    yt-dlp's way (its proxy), or None to go through yt-dlp from the start."""
+
+    TIMEOUT = 20
+    STATUSES_FOR_YTDLP = (401, 403, 429, 503)
+    IMPERSONATE = ["--extractor-args", "generic:impersonate"]
+
+    def __init__(self, ytdlp: list[str], extra: list[str],
+                 opener: urllib.request.OpenerDirector | None,
+                 run: Callable[[list[str], int, Callable[[list[str]], bool]],
+                               tuple[int, str, str] | None],
+                 can_impersonate: Callable[[], bool], user_agent: str,
+                 spawn: Callable[[list[str]], subprocess.Popen | None] | None = None,
+                 release: Callable[[subprocess.Popen], None] | None = None,
+                 stopped: Callable[[], bool] = lambda: False,
+                 paused: Callable[[], bool] = lambda: False) -> None:
+        self.ytdlp = list(ytdlp)
+        self.extra = list(extra)
+        self.opener = opener
+        self.run = run
+        self.can_impersonate = can_impersonate
+        self.user_agent = user_agent
+        self.via_ytdlp = opener is None
+        self.impersonated = False
+        self.spawn, self.release = spawn, release
+        self.stopped, self.paused = stopped, paused
+        self.helper: subprocess.Popen | None = None
+        self.helper_broken = not (spawn and release and len(self.ytdlp) == 3
+                                  and self.ytdlp[1:] == ["-m", "yt_dlp"])
+        self._impersonate: bool | None = None
+
+    def close(self) -> None:
+        helper, self.helper = self.helper, None
+        if helper is not None and self.release:
+            self.release(helper)
+
+    def _wants_impersonation(self) -> bool:
+        if self._impersonate is None:
+            self._impersonate = bool(self.can_impersonate())
+        return self._impersonate
+
+    def __call__(self, link: str) -> tuple[str, str]:
+        link = web_url(link) or link
+        if self.via_ytdlp:
+            return self._read_through_ytdlp(link)
+        try:
+            return self._read(link)
+        except urllib.error.HTTPError as e:
+            if e.code not in self.STATUSES_FOR_YTDLP:
+                raise WebFolderError(f"HTTP {e.code} {e.reason}") from None
+            why = f"HTTP {e.code} {e.reason}"
+        except WebFolderError:
+            raise
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            # A certificate urllib does not take (yt-dlp may be told to with
+            # --no-check-certificates), a SOCKS proxy, and the like.
+            why = str(getattr(e, "reason", "") or e)
+        # Turned away: yt-dlp may get in. If it does, it reads the rest too;
+        # if not, the next folder is tried the quick way again.
+        try:
+            page = self._read_through_ytdlp(link)
+        except WebFolderError as e:
+            raise WebFolderError(f"{why}; through yt-dlp: {e}") from None
+        self.via_ytdlp = True
+        return page
+
+    def _read_through_ytdlp(self, link: str) -> tuple[str, str]:
+        if self.stopped():
+            raise WebFolderError("stopped")
+        if not self.helper_broken:
+            try:
+                return self._read_with_helper(link)
+            except _HelperBroken:
+                self.close()
+                if self.stopped():      # Stop or Skip ended it: no yt-dlp after that
+                    raise WebFolderError("stopped") from None
+                self.helper_broken = True
+        return self._read_with_ytdlp(link)
+
+    def _helper_line(self, line: str | None) -> dict:
+        """Send the kept-open yt-dlp a line (None: none) and give its answer,
+        within TIMEOUT and a bit; it is ended if it takes longer."""
+        helper = self.helper
+        assert helper is not None and helper.stdin is not None and helper.stdout is not None
+        timer = PausableTimer(self.TIMEOUT + 30, lambda: self.release and self.release(helper), self.paused)
+        try:
+            if line is not None:
+                helper.stdin.write(line + "\n")
+                helper.stdin.flush()
+            answer = helper.stdout.readline()
+        except (OSError, ValueError):
+            answer = ""
+        finally:
+            timer.cancel()
+        try:
+            reply = json.loads(answer)
+        except ValueError:
+            raise _HelperBroken(answer.strip()[:200] or "it stopped") from None
+        if not isinstance(reply, dict) or "fatal" in reply:
+            raise _HelperBroken(str(reply.get("fatal") if isinstance(reply, dict) else reply))
+        return reply
+
+    def _read_with_helper(self, link: str) -> tuple[str, str]:
+        if self.helper is None:
+            assert self.spawn is not None
+            self.helper = self.spawn([self.ytdlp[0], "-c", _WEB_PAGE_HELPER, str(WEB_FOLDER_MAX_PAGE),
+                                      *self.extra])
+            if self.helper is None:
+                raise _HelperBroken("it would not start")
+            self._helper_line(None)                         # {"ready": true}
+        impersonate = self._wants_impersonation()
+        reply = self._helper_line(json.dumps({"url": link, "impersonate": impersonate}))
+        if "error" in reply:
+            raise WebFolderError(str(reply["error"])[:300])
+        try:
+            data = base64.b64decode(str(reply["data"]))
+        except (KeyError, ValueError):
+            raise _HelperBroken("an answer it could not read") from None
+        if len(data) > WEB_FOLDER_MAX_PAGE:
+            raise WebFolderError("the page is too big")
+        self.impersonated = self.impersonated or impersonate
+        return decode_page(data, reply.get("charset")), str(reply.get("url") or link)
+
+    def _read(self, link: str) -> tuple[str, str]:
+        assert self.opener is not None
+        request = urllib.request.Request(link, headers={
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"})
+        with self.opener.open(request, timeout=self.TIMEOUT) as response:
+            kind = response.headers.get_content_type()
+            if kind not in ("text/html", "application/xhtml+xml"):
+                # Not read: a file (the link was an .mp3 yt-dlp failed on).
+                raise WebFolderError(f"not a web page ({kind})")
+            data = response.read(WEB_FOLDER_MAX_PAGE + 1)
+            charset = response.headers.get_content_charset()
+            final = response.geturl()
+        if len(data) > WEB_FOLDER_MAX_PAGE:
+            raise WebFolderError("the page is too big")
+        return decode_page(data, charset), final
+
+    @staticmethod
+    def _page_printed(lines: list[str]) -> bool:
+        return len(lines) >= 2 and "Dumping request to " in lines[-2]
+
+    def _read_with_ytdlp(self, link: str) -> tuple[str, str]:
+        """yt-dlp's generic extractor fetches the page and, asked to with
+        --dump-pages, prints it (base64, after "Dumping request to <its
+        address>"). It is ended there: what it does next, looking through
+        the page for any of its 1,700 sites' players to find nothing, takes
+        twice as long as the rest."""
+        extra = list(self.extra)
+        impersonate = (not any("impersonate" in arg for arg in extra)) and self._wants_impersonation()
+        if impersonate:
+            extra += self.IMPERSONATE
+        result = self.run([*self.ytdlp, *YTDLP_UTF8, "--dump-pages", "--simulate", "--flat-playlist",
+                           "--no-warnings", *extra, link], 120, self._page_printed)
+        if result is None:
+            raise WebFolderError("yt-dlp did not finish")
+        _code, out, err = result
+        lines = out.splitlines()
+        final = page = None
+        for i, line in enumerate(lines[:-1]):
+            m = re.search(r"Dumping request to (\S+)", line)
+            if m:
+                final, page = m.group(1), lines[i + 1].strip()
+        if page is None:
+            errors = [ln for ln in err.splitlines() if ln.startswith("ERROR")]
+            raise WebFolderError(re.sub(r"^ERROR:\s*", "", errors[-1]) if errors
+                                 else "yt-dlp could not read the page")
+        try:
+            data = base64.b64decode(page)
+        except ValueError:
+            raise WebFolderError("yt-dlp's copy of the page could not be read") from None
+        self.impersonated = self.impersonated or impersonate
+        return decode_page(data), final
 
 
 _dates_lock = threading.Lock()
@@ -5321,7 +5898,7 @@ class FingerprinterApp:
                "--print", "%(.{playlist_title,title,id,url,webpage_url})j", *self._extra_args(), url]
         try:
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 encoding="utf-8", errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -5331,6 +5908,17 @@ class FingerprinterApp:
             return
         if not self._register_count_proc(proc):
             return
+        # Its errors, read on a thread so a full pipe cannot stall it: they
+        # tell a folder listing (_may_be_web_folder).
+        errors: list[str] = []
+
+        def drain() -> None:
+            for line in proc.stderr or ():
+                if line.startswith("ERROR"):
+                    errors[:] = [*errors[-4:], line.strip()]
+
+        drainer = threading.Thread(target=drain, daemon=True)
+        drainer.start()
         first = None
         last = 0.0
         entries: list[dict] = []
@@ -5354,8 +5942,19 @@ class FingerprinterApp:
             with self._count_lock:
                 if proc in self._count_procs:
                     self._count_procs.remove(proc)
+        drainer.join(timeout=5)
         if self._closing:
             return
+        if (state["n"] == 0 or proc.returncode != 0) and self._may_be_web_folder(url, " ".join(errors)):
+            state["n"] = 0
+            entries = self._count_web_folder(url, state)
+            if self._closing:
+                return
+            if entries is not None:
+                save_listing(url, entries, False)
+                self.root.after(0, self._record_count, url, len(entries), False)
+                return
+            state["n"] = 0
         if state["n"] == 0 or proc.returncode != 0:
             # Nothing, or a listing that stopped part-way (a 429 on page 30):
             # the last good count stays rather than a short one.
@@ -5612,24 +6211,31 @@ class FingerprinterApp:
 
     def _avatar_connection(self, ytdlp: list[str], extra: list[str]) -> urllib.request.OpenerDirector | None:
         """Worker thread: urllib, going the way yt-dlp goes, for oEmbed and
-        the pictures: through the proxy yt-dlp uses, whether it comes from
-        Extra download options or from yt-dlp's own config file. None when
-        that cannot be matched (a SOCKS proxy, or yt-dlp not saying): then
-        nothing is fetched, rather than going round the proxy."""
+        the pictures (_proxy_opener). None when that cannot be matched (a
+        SOCKS proxy, or yt-dlp not saying): then nothing is fetched, rather
+        than going round the proxy."""
+        opener, why = self._proxy_opener(ytdlp, extra)
+        if opener is None and why != self._avatar_proxy_said:
+            self._avatar_proxy_said = why
+            self._log(f"[!] Channel pictures are not fetched: {why}")
+        return opener
+
+    def _proxy_opener(self, ytdlp: list[str], extra: list[str]) -> tuple[urllib.request.OpenerDirector | None, str]:
+        """Worker thread: urllib through the proxy yt-dlp uses, whether it
+        comes from Extra download options or from yt-dlp's own config file,
+        or None and why not. What yt-dlp said is kept for a while
+        (AVATAR_PROXY_SECONDS): asking it takes a yt-dlp run."""
         # The sign-in browser plays no part in the proxy, and is left out.
         args = [a for i, a in enumerate(extra) if a != "--cookies-from-browser"
                 and not (i and extra[i - 1] == "--cookies-from-browser")]
         key = (tuple(ytdlp), tuple(args))
         cached = self._avatar_proxy
         if cached and cached[0] == key and time.monotonic() - cached[1] < self.AVATAR_PROXY_SECONDS:
-            return cached[2]
+            return cached[2], cached[3]
         proxies = self._ytdlp_proxies(ytdlp, args)
         opener, why = self._opener_for(proxies)
-        self._avatar_proxy = (key, time.monotonic(), opener)
-        if opener is None and why != self._avatar_proxy_said:
-            self._avatar_proxy_said = why
-            self._log(f"[!] Channel pictures are not fetched: {why}")
-        return opener
+        self._avatar_proxy = (key, time.monotonic(), opener, why)
+        return opener, why
 
     def _ytdlp_proxies(self, ytdlp: list[str], args: list[str]) -> dict | None:
         """Worker thread: the proxies yt-dlp uses with these options and its
@@ -5660,8 +6266,8 @@ class FingerprinterApp:
             if "://" not in proxy:
                 proxy = "http://" + proxy   # as yt-dlp reads host:port
             if not re.match(r"^https?://", proxy, re.I):
-                return None, (f"yt-dlp goes through the proxy {proxy}, which the picture "
-                              "downloads cannot use (only http and https proxies).")
+                return None, (f"yt-dlp goes through the proxy {proxy}, which the program's "
+                              "own downloads cannot use (only http and https proxies).")
             chosen[scheme] = proxy
         if not proxies:
             # No proxy of yt-dlp's own: both use the system's (environment,
@@ -7602,6 +8208,10 @@ class FingerprinterApp:
             # Handle for naming pklz files — prefer the @handle from the URL,
             # fall back to the channel name yt-dlp reported.
             pklz_prefix = extract_handle(url, fallback=channel_name_raw)
+            if info.get("web_folder"):
+                # Not a handle from the address: a folder named "c" or "@x" on
+                # a web server is none.
+                pklz_prefix = channel_name
             entries = [e for e in (info.get("entries") or []) if e]
             # A single video lists as one entry with no playlist title.
             single = not entries or (len(entries) == 1 and not info.get("title"))
@@ -7820,7 +8430,15 @@ class FingerprinterApp:
                 if retry_later:
                     self._log(f"[!] {qp}{retry_later} item(s) could not be downloaded this time "
                               f"(see above); running the link again fetches them.", tag="warning")
-                if cut_short:
+                if cut_short and info.get("web_folder_capped"):
+                    self._log(f"[!] {qp}Not all of this folder listing was read (more than "
+                              f"{WEB_FOLDER_MAX_FOLDERS:,} folders or {WEB_FOLDER_MAX_DEPTH} levels): "
+                              f"add the folders further in as links of their own.", tag="warning")
+                elif cut_short and info.get("web_folder"):
+                    self._log(f"[!] {qp}{info.get('web_folder_failed') or 'Some'} folder(s) of this "
+                              f"folder listing could not be read (see above); running the link "
+                              f"again tries them again.", tag="warning")
+                elif cut_short:
                     self._log(f"[!] {qp}yt-dlp stopped listing this link part-way, so not every "
                               f"item was seen; running the link again lists it in full.",
                               tag="warning")
@@ -9000,6 +9618,10 @@ class FingerprinterApp:
         # The lines that say what went wrong; yt-dlp's warnings come first.
         errors = [ln for ln in stderr_tail if ln.startswith("ERROR")] or stderr_tail[-3:]
         reason = self._classify_yt_dlp_error(" ".join(errors))
+        if proc.returncode != 0 and not entries and self._may_be_web_folder(url, " ".join(errors)):
+            listing = self._list_web_folder(url)
+            if listing is not None or self.cancel_flag.is_set() or self.skip_flag.is_set():
+                return listing or None      # False: a folder listing with nothing in it
         if proc.returncode != 0 and not entries:
             self._log(f"[X] yt-dlp could not list this link"
                       + (f" ({reason})" if reason else "") + ":", tag="warning")
@@ -9047,6 +9669,236 @@ class FingerprinterApp:
         meta["entries"] = entries
         meta["cut_short"] = cut_short
         return meta
+
+    # ---- Folders on a web server ----------------------------------------------
+    # crawl_web_folder and WebFolderReader (module level) do the reading; these
+    # give them the program's yt-dlp, options, proxy and Stop.
+
+    # Between two pages of a folder listing, to go easy on the server.
+    WEB_FOLDER_PAUSE = 0.25
+
+    @staticmethod
+    def _may_be_web_folder(url: str, errors: str) -> bool:
+        """Whether a link yt-dlp could not list may be a folder listing: a
+        page on a site yt-dlp has no extractor for ("Unsupported URL"), or
+        one that turned its generic extractor away (Cloudflare's check, HTTP
+        403); not a site of its own, nor a link to a file."""
+        if not re.match(r"^https?://", url, re.I) or youtube_kind(url) is not None:
+            return False
+        path = unquote(urlsplit(url).path).lower()
+        if posixpath.splitext(path)[1] in FingerprinterApp.AUDIO_EXTENSIONS:
+            return False
+        text = errors.lower()
+        return "unsupported url" in text or ("[generic]" in text and (
+            "cloudflare anti-bot" in text or "http error 403" in text))
+
+    def _web_folder_reader(self, extra: list[str], counting: bool,
+                           stopped: Callable[[], bool]) -> WebFolderReader:
+        """Worker thread: a reader for a folder listing's pages, through
+        yt-dlp's proxy; its yt-dlp runs end with Stop and Skip (a run's) or
+        when the program quits (a count's)."""
+        ytdlp = list(self.ytdlp)
+        opener, _why = self._proxy_opener(ytdlp, extra)
+        return WebFolderReader(
+            ytdlp, extra, opener,
+            lambda cmd, timeout, enough: self._run_captured(cmd, timeout, counting, enough),
+            lambda: dependencies.ytdlp_can_impersonate(ytdlp) is True,
+            self.AVATAR_USER_AGENT,
+            spawn=lambda cmd: self._spawn_kept(cmd, counting),
+            release=lambda proc: self._release_kept(proc, counting),
+            stopped=stopped,
+            paused=(lambda: False) if counting else self.pause_flag.is_set)
+
+    def _spawn_kept(self, cmd: list[str], counting: bool) -> subprocess.Popen | None:
+        """Worker thread: start a process that is kept open and talked to by
+        lines (WebFolderReader's yt-dlp), as _run_captured's are watched."""
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            return None
+        if counting:
+            if not self._register_count_proc(proc):
+                return None
+        else:
+            self._track_proc(proc)
+            if self.cancel_flag.is_set() or self.skip_flag.is_set():
+                self._release_kept(proc, counting)     # Stop's kill pass may be over
+                return None
+        return proc
+
+    def _release_kept(self, proc: subprocess.Popen, counting: bool) -> None:
+        self._kill_tree(proc)
+        if counting:
+            with self._count_lock:
+                if proc in self._count_procs:
+                    self._count_procs.remove(proc)
+        else:
+            self._untrack_proc(proc)
+
+    def _list_web_folder(self, url: str) -> dict | bool | None:
+        """Worker thread, when yt-dlp could not list `url`: read it as a
+        folder listing on a web server, with its subfolders. The info dict
+        _extract_info gives; None when it is no folder listing (or its first
+        page could not be read, or Stop or Skip came), and False when it is
+        one with no audio file in it, which is said here."""
+        stop = lambda: self.cancel_flag.is_set() or self.skip_flag.is_set()  # noqa: E731
+        reader = self._web_folder_reader(self._extra_args(quiet=True), counting=False, stopped=stop)
+        last = [0.0]
+
+        def fetch(link: str) -> tuple[str, str]:
+            self._wait_if_paused()
+            if stop():
+                raise WebFolderError("stopped")
+            if last[0]:
+                time.sleep(self.WEB_FOLDER_PAUSE)
+            last[0] = time.monotonic()
+            return reader(link)
+
+        said = [False]
+
+        def found(files: int, folders: int) -> None:
+            if not said[0]:
+                said[0] = True
+                self._log("[*] This link is a folder listing on a web server, which yt-dlp does not "
+                          "read: reading it and its subfolders here.")
+            self._set_status(f"Reading folders ({folders:,} read, {files:,} audio files)...")
+            self._set_progress(f"Reading folders: {files:,} audio files in {folders:,}")
+
+        try:
+            result = crawl_web_folder(url, fetch, stop=stop, found=found)
+        except WebFolderError:
+            return None             # not readable either: yt-dlp's own error is said
+        except Exception as e:  # noqa: BLE001 - a page is any text; the link fails, the list goes on
+            self._log(f"[!] The folder listing could not be read: {e!r}", tag="warning")
+            return None
+        finally:
+            reader.close()
+        if result is None or result["stopped"] or stop():
+            return None
+        entries = result["entries"]
+        if reader.impersonated:
+            for entry in entries:
+                entry["_impersonate"] = True
+        failed, capped = result["failed"], result["capped"]
+        self._log(f"[*] Done reading the folder listing: {len(entries):,} audio files in "
+                  f"{result['folders']:,} folder(s)"
+                  + (", read impersonating a browser" if reader.impersonated else "") + ".")
+        if result.get("loops"):
+            self._log(f"    {result['loops']:,} folder(s) were the folder they are in again (a link "
+                      f"back up) and were not read twice.")
+        if failed:
+            self._log(f"[!] {len(failed):,} folder(s) could not be read"
+                      + (", so their files are left out this time:" if entries else ":"), tag="warning")
+            for link, why in failed[:3]:
+                self._log(f"    {unquote(link)}: {why[:200]}", tag="warning")
+        if capped:
+            self._log(f"[!] Only the first {WEB_FOLDER_MAX_FOLDERS:,} folders, at most "
+                      f"{WEB_FOLDER_MAX_DEPTH} deep, are read. Add the folders further in as "
+                      f"links of their own.", tag="warning")
+        if not entries:
+            if failed or capped:
+                self._log("[X] No audio file was found in the folders that could be read.",
+                          tag="warning")
+            else:
+                self._log("[X] There is no audio file (" + ", ".join(sorted(self.AUDIO_EXTENSIONS))
+                          + ") in this folder listing or its subfolders.", tag="warning")
+            return False
+        return {"channel": result["label"], "uploader": None, "title": result["label"],
+                "entries": entries, "cut_short": bool(failed or capped), "web_folder": True,
+                "web_folder_capped": capped, "web_folder_failed": len(failed)}
+
+    def _count_web_folder(self, url: str, state: dict) -> list[dict] | None:
+        """Worker thread, counting: the files of the folder listing at `url`,
+        with its subfolders; None when it is none, or it could not all be
+        read (a short count is no count), or the link left the list."""
+        stop = lambda: self._closing or url not in self.queue_urls  # noqa: E731
+        reader = self._web_folder_reader(self._extra_args(quiet=True), counting=True, stopped=stop)
+        last = [0.0, 0.0]
+
+        def fetch(link: str) -> tuple[str, str]:
+            if stop():
+                raise WebFolderError("stopped")
+            if last[0]:
+                time.sleep(self.WEB_FOLDER_PAUSE)
+            last[0] = time.monotonic()
+            return reader(link)
+
+        def found(files: int, _folders: int) -> None:
+            state["n"] = files
+            if time.monotonic() - last[1] >= 0.5:
+                last[1] = time.monotonic()
+                self.root.after(0, self._update_count_label, url)
+
+        try:
+            result = crawl_web_folder(url, fetch, stop=stop, found=found)
+        except Exception:  # noqa: BLE001 - WebFolderError, or a page nothing could make out
+            return None
+        finally:
+            reader.close()
+        if (result is None or result["stopped"] or result["failed"] or result["capped"]
+                or not result["entries"]):
+            return None
+        return result["entries"]
+
+    def _run_captured(self, cmd: list[str], timeout: int, counting: bool,
+                      enough: Callable[[list[str]], bool] | None = None) -> tuple[int, str, str] | None:
+        """Worker thread: run a quiet yt-dlp and give (exit code, stdout,
+        stderr); None when it could not run, took longer than `timeout` or
+        was ended. It is ended as soon as enough(its stdout lines so far) is
+        true. A run's goes with Stop, Skip and Pause (_track_proc); a count's
+        ends when the program quits (_register_count_proc)."""
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            return None
+        if counting:
+            if not self._register_count_proc(proc):
+                return None
+        else:
+            self._track_proc(proc)
+            if self.cancel_flag.is_set() or self.skip_flag.is_set():
+                self._kill_tree(proc)               # Stop's kill pass may be over
+                self._untrack_proc(proc)
+                return None
+        err: list[str] = []
+        drain = threading.Thread(target=lambda: err.extend(proc.stderr or ()), daemon=True)
+        drain.start()
+        late = threading.Event()
+
+        def too_late() -> None:
+            late.set()
+            self._kill_tree(proc)
+
+        # Pause suspends a run's processes; that time is not counted.
+        timer = PausableTimer(timeout, too_late, (lambda: False) if counting else self.pause_flag.is_set)
+        out: list[str] = []
+        try:
+            for line in proc.stdout or ():
+                out.append(line.rstrip("\n"))
+                if enough is not None and enough(out):
+                    self._kill_tree(proc)
+                    break
+            proc.wait()
+        finally:
+            timer.cancel()
+            if counting:
+                with self._count_lock:
+                    if proc in self._count_procs:
+                        self._count_procs.remove(proc)
+            else:
+                self._untrack_proc(proc)
+        drain.join(timeout=5)
+        if late.is_set():
+            return None
+        return proc.returncode, "\n".join(out), "".join(err)
 
     def _download_parallel(
         self,
@@ -9187,7 +10039,12 @@ class FingerprinterApp:
             # known to have sound: a silent video would otherwise come as its
             # video alone, fail in -x, and fail on every run.
             "-f", ("bestaudio[ext=m4a]/bestaudio/best[ext=mp4][acodec!=none][height<=?480]"
-                   "/best[ext=mp4][acodec!=none]"),
+                   "/best[ext=mp4][acodec!=none]"
+                   # A file from a folder listing whose server does not say
+                   # it is audio (application/octet-stream, as nginx sends for
+                   # .flac and .opus, or video/mp4): yt-dlp then knows neither
+                   # codec, and every choice above passes it over.
+                   + ("/best[vcodec=?none][acodec!=?none]" if entry.get("_direct") else "")),
             "--remux-video", "webm>opus",
             # Copies the sound out of an mp4 into an .m4a and deletes the mp4;
             # AAC, which is what YouTube and nearly every site put in an mp4,
@@ -9216,7 +10073,19 @@ class FingerprinterApp:
             # in range"), one with no date downloaded. Its date is printed
             # first either way, to remember it (DATES_FILE).
             cmd += ["--dateafter", after, "--print", f"pre_process:{self.DATE_MARK}%(upload_date)s"]
-        cmd.extend(self._extra_args())
+        extra = self._extra_args()
+        cmd.extend(extra)
+        if entry.get("_direct"):
+            # A file from a folder listing (web_file_entry): named with the
+            # listing's id, one per file, rather than yt-dlp's, which is the
+            # file's name and so the same for "01 Intro.mp3" in every folder.
+            cmd += ["--parse-metadata", f"{entry['id']}:%(id)s"]
+            if entry.get("_impersonate") and "--impersonate" not in extra:
+                # Its pages had to be read impersonating a browser; the files
+                # are behind the same check. yt-dlp's own --impersonate (""
+                # is any browser it can) for every request: generic:impersonate
+                # would cover only the first look at the file, not its download.
+                cmd += ["--impersonate", ""]
         cmd.append(video_url)
 
         try:

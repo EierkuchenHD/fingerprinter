@@ -3,6 +3,23 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.2.0] - 2026-10-13
+
+### Added
+
+- **Folders on a web server.** A link to a folder listing ("Index of /Music",
+  as Apache, nginx, IIS and other servers show a folder), which yt-dlp has no
+  extractor for, now works like a channel: the program reads the folder and
+  every folder inside it, the way you would open each one, and downloads and
+  fingerprints the audio files it finds, each by its own link. Other files,
+  the parent folder and the links that sort the listing are left out; the
+  listing's dates count for **Only items published on or after**, and each
+  file has its own place in the list of items already fingerprinted. The list
+  counts the files, and **Copy link and its videos** copies their links.
+  Sites that turn the program away, as Cloudflare's check does, are read
+  through yt-dlp impersonating a browser, and their files downloaded the same
+  way. A folder that could not all be read leaves the link incomplete.
+
 ## [1.1.1] - 2026-10-12
 
 ### Fixed
@@ -554,6 +571,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.2.0]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.2.0
 [1.1.1]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.1.1
 [1.1.0]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.1.0
 [1.0.0]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0
